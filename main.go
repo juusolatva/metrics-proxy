@@ -174,7 +174,7 @@ type MetricsData struct {
 
 // parseResponse extracts metrics from the response body
 func parseResponse(body []byte, startTime time.Time) MetricsData {
-	duration := startTime.Sub(time.Now())
+	duration := time.Since(startTime)
 
 	metrics := MetricsData{
 		Duration: duration,
@@ -184,7 +184,7 @@ func parseResponse(body []byte, startTime time.Time) MetricsData {
 
 	// Check for common LM Studio JSON response patterns
 	if strings.Contains(bodyStr, `"total_tokens"`) ||
-	   strings.Contains(bodyStr, `"generated_tokens"`) {
+	strings.Contains(bodyStr, `"generated_tokens"`) {
 
 		totalTokens := extractInt(bodyStr, "total_tokens")
 		if totalTokens > 0 {
@@ -222,10 +222,10 @@ func updateGlobalMetrics(startTime time.Time, data MetricsData) {
 
 	// Calculate average time per query
 	if metrics.QueryCount > 1 {
-		totalDuration := metrics.AvgTimePerQuery * time.Duration(metrics.QueryCount-1) + startTime.Sub(time.Now())
+		totalDuration := metrics.AvgTimePerQuery * time.Duration(metrics.QueryCount-1) + time.Since(startTime)
 		metrics.AvgTimePerQuery = totalDuration / time.Duration(metrics.QueryCount)
 	} else {
-		metrics.AvgTimePerQuery = startTime.Sub(time.Now())
+		metrics.AvgTimePerQuery = time.Since(startTime)
 	}
 
 	// Add to history
@@ -233,7 +233,7 @@ func updateGlobalMetrics(startTime time.Time, data MetricsData) {
 		Timestamp:    time.Now(),
 		TokensPerSec: data.TokensPerSecond,
 		TotalTokens:  data.TotalTokens,
-		Duration:     startTime.Sub(time.Now()),
+		Duration:     time.Since(startTime),
 	}
 
 	metrics.History = append(metrics.History, historyPoint)
