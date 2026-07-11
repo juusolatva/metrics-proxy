@@ -1,0 +1,30 @@
+# LM Studio Metrics Proxy Configuration
+
+# Port the proxy server listens on (default: 8080)
+proxy_port: 8080
+
+# LM Studio connection settings
+lm_studio:
+  # Host and port of LM Studio instance (default: localhost:1234)
+  host: "localhost"
+  port: 1234
+
+# API endpoint patterns to intercept (requests matching these will be forwarded to LM Studio)
+api_endpoints:
+  - "/api/v1/*"
+
+# Metrics display settings
+metrics:
+  # Display mode: "realtime" for continuous updates, "periodic" for snapshots
+  mode: "realtime"
+
+  # Refresh interval in milliseconds (only used in periodic mode)
+  refresh_interval_ms: 1000
+
+  # Number of historical data points to keep for averaging
+  history_points: 10
+
+# Logging settings
+logging:
+  # Enable debug logging
+  debug: false
