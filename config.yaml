@@ -9,9 +9,11 @@ lm_studio:
   host: "localhost"
   port: 1234
 
-# API endpoint patterns to intercept (requests matching these will be forwarded to LM Studio)
+# API endpoint patterns to intercept (requests matching these will be forwarded to LM Studio).
+# Patterns are path prefixes; a trailing "*" is optional.
 api_endpoints:
-  - "/api/v1/*"
+  - "/api/v1/*"  # LM Studio native REST API
+  - "/v1/*"      # OpenAI-compatible API
 
 # Metrics display settings
 metrics:
@@ -21,7 +23,7 @@ metrics:
   # Refresh interval in milliseconds (only used in periodic mode)
   refresh_interval_ms: 1000
 
-  # Number of historical data points to keep for averaging
+  # Number of recent queries to average tokens/sec over (default: 10)
   history_points: 10
 
 # Logging settings
