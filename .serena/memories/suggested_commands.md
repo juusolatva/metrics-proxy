@@ -1,7 +1,7 @@
 # Commands (run from repo root)
 
 - Run: `go run .` — must run from repo root; `config.yaml` is loaded from CWD.
-- Build: `go build -o metrics_proxy .` — `.gitignore` only lists `metrics_proxy.exe`; don't commit the Linux binary (or build to a temp dir).
+- Build: `go build -o metrics_proxy .` — output (`/metrics_proxy`, `metrics_proxy.exe`) is gitignored.
 - Test: `go test -v ./...`; race: `go test -race -v ./...`
 - Format: `gofmt -s -w .`; check: `gofmt -l .`
 - Vet: `go vet ./...`
