@@ -5,7 +5,8 @@ proxy_port: 8080
 
 # LM Studio connection settings
 lm_studio:
-  # Host and port of LM Studio instance (default: localhost:1234)
+  # Host and port of LM Studio instance (default: localhost:1234).
+  # Any OpenAI-compatible server works here, e.g. Ollama on localhost:11434.
   host: "localhost"
   port: 1234
 
@@ -14,6 +15,7 @@ lm_studio:
 api_endpoints:
   - "/api/v1/*"  # LM Studio native REST API
   - "/v1/*"      # OpenAI-compatible API
+  # - "/api/*"   # Ollama native API (/api/chat, /api/generate)
 
 # Metrics display settings
 metrics:

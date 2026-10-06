@@ -6,7 +6,7 @@ This document serves as the guide for AI agents and developers working on the `m
 
 ## 1. Project Overview
 
-`metrics_proxy` is a lightweight HTTP reverse proxy written in Go (1.21+). It sits between an LLM client (such as an API client, IDE extension, or web UI) and a local LLM instance (primarily targeted at LM Studio, or compatible OpenAI-like HTTP backends).
+`metrics_proxy` is a lightweight HTTP reverse proxy written in Go (1.21+). It sits between an LLM client (such as an API client, IDE extension, or web UI) and a local LLM instance (primarily LM Studio; Ollama and other OpenAI-compatible HTTP backends are also targets, see `testdata/`).
 
 Its primary responsibilities are:
 - Forwarding matching API requests from clients to the local LLM server.
@@ -29,7 +29,14 @@ metrics_proxy/
 ├── LICENSE            # MIT License
 ├── main.go            # Complete application source (proxy, metrics, config)
 ├── main_test.go       # httptest-based tests (proxying, streaming, parsing, concurrency)
-└── README.md          # Minimal project overview
+├── README.md          # Minimal project overview
+├── CLAUDE.md          # Includes this file (`@AGENTS.md`)
+├── testdata/          # Real responses captured from LM Studio (lm_*) and Ollama (ol_*)
+│   ├── lm_v1_chat.json, lm_v1_chat_stream.sse   # LM Studio native /api/v1/chat
+│   ├── lm_oai.json, lm_oai_stream.sse           # LM Studio OpenAI-compatible /v1/chat/completions
+│   ├── ol_chat.json, ol_chat_stream.ndjson      # Ollama native /api/chat
+│   └── ol_oai_stream.sse                        # Ollama OpenAI-compatible /v1/chat/completions
+└── .serena/           # Serena project config + memories (committed); cache/ and project.local.yml are gitignored
 ```
 
 ---
@@ -48,7 +55,9 @@ metrics_proxy/
   *Note: The application expects `config.yaml` to reside in the current working directory from which the command is executed.*
 
 ### Testing
-Tests live in `main_test.go`. They start a fake LM Studio upstream and the proxy with `httptest`, and reset the global state (`cfg`, `metrics`, `proxy`, `out`) per test via `startProxy()`. Metrics are recorded on the proxy's goroutine, so tests wait for them with `waitFor`/`waitForQueries` instead of asserting immediately.
+Tests live in `main_test.go`. They start a fake upstream and the proxy with `httptest`, and reset the global state (`cfg`, `metrics`, `proxy`, `out`) per test via `startProxy()`. Metrics are recorded on the proxy's goroutine, so tests wait for them with `waitFor`/`waitForQueries` instead of asserting immediately.
+
+Parser tests should use the captured payloads in `testdata/` rather than hand-written JSON where possible, and feed them both whole and in 1-byte chunks to exercise chunk boundaries (`TestCaptureFixtures`). When adding support for a new upstream or endpoint, capture a real response (JSON and streamed) into `testdata/` with a `<upstream>_<api>[_stream].<ext>` name.
 - **Run tests**:
   ```bash
   go test -v ./...
@@ -117,6 +126,7 @@ logging:
 - `loadConfig()` hardcodes the relative path `"config.yaml"`. Changing directories before starting the process will cause a file read error.
 - `parseConfig()` applies defaults for unset fields: `proxy_port` 8080, `lm_studio` `localhost:1234`, `history_points` 10.
 - Several configuration fields (`metrics.mode`, `metrics.refresh_interval_ms`, and `logging.debug`) are defined in the structs and parsed from YAML, but do not yet have corresponding runtime behavior implemented in `main.go`.
+- The `lm_studio` key names the upstream regardless of server type; to front Ollama, point it at `localhost:11434` and add `"/api/*"` (Ollama native `/api/chat`, `/api/generate`) to `api_endpoints`. Keep the key name for backward compatibility; an alias (e.g. `upstream`) would have to fall back to it.
 
 ---
 
@@ -145,10 +155,10 @@ All application logic is currently contained in `main.go`:
    - `FlushInterval: -1` flushes every write, so streamed tokens reach the client immediately.
    - `ErrorHandler` (`proxyError`) logs and returns `502 Bad Gateway`.
 4. **Metrics Capture (`meterResponse` → `meteredBody`)**:
-   - `ModifyResponse` wraps the upstream body in a `meteredBody` (except `101` upgrades). As the proxy copies the body to the client, each chunk is also written to a `capture` chosen by Content-Type: `jsonCapture` (buffers, parses at end) or `sseCapture` (parses event by event). Other content types are not inspected. Captures are bounded by `maxCaptureBytes`.
-   - On EOF or `Close` (e.g. client disconnect), `finish()` runs once: gets `MetricsData` from the capture, sets the duration, and fills totals/TPS the upstream didn't report (`completeDerived`).
+   - `ModifyResponse` wraps the upstream body in a `meteredBody` (except `101` upgrades). As the proxy copies the body to the client, each chunk is also written to a `capture` chosen by Content-Type (`newCapture`): `jsonCapture` (buffers, parses at end), `sseCapture` (`text/event-stream`, parses event by event) or `ndjsonCapture` (`application/x-ndjson`, Ollama native streaming, parses line by line). The streaming captures share a `lineSplitter`. Other content types are not inspected. Captures are bounded by `maxCaptureBytes` (16 MiB); oversized bodies/lines are proxied but not parsed.
+   - On EOF or `Close` (e.g. client disconnect), `finish()` runs once: gets `MetricsData` from the capture, sets the duration, and fills totals/TPS the upstream didn't report (`completeDerived`; for streamed captures the first-to-last-byte time is used as generation time).
 5. **Payload Parsing (`llmPayload`, `MetricsData.merge`)**:
-   - `encoding/json` into a struct covering OpenAI-compatible responses (`model`, `usage.*`), LM Studio API v0 (`usage`, `stats.tokens_per_second`, `stats.time_to_first_token`) and v1 (`model_instance_id`, `stats.input_tokens`, `stats.total_output_tokens`, `stats.tokens_per_second`, `stats.time_to_first_token_seconds`). Wrapped payloads in `result` (v1 `chat.end` SSE event) and `response` (OpenAI Responses API events) are merged recursively. Later SSE events override earlier fields.
+   - `encoding/json` into a struct covering OpenAI-compatible responses (`model`, `usage.*`; Ollama adds `timings.predicted_per_second`), Ollama native (`prompt_eval_count`, `eval_count`, `eval_duration` in ns → TPS = `eval_count / eval_duration`), LM Studio API v0 (`usage`, `stats.tokens_per_second`, `stats.time_to_first_token`) and v1 (`model_instance_id`, `stats.input_tokens`, `stats.total_output_tokens`, `stats.tokens_per_second`, `stats.time_to_first_token_seconds`). Wrapped payloads in `result` (v1 `chat.end` SSE event) and `response` (OpenAI Responses API events) are merged recursively. Later SSE events / NDJSON lines override earlier fields. Non-object payloads are ignored; a field of unexpected type (`json.UnmarshalTypeError`) is skipped without discarding the others.
 6. **State Update & Display (`recordQuery`)**:
    - Responses without inference data (no model, tokens or TPS, e.g. `/v1/models`, errors) are logged with a `[Proxy]` line and not counted.
    - Otherwise `updateGlobalMetrics()` locks `metrics.mu`, updates count, cumulative tokens, running average time, latest model/TPS, appends to `History` (newest last, bounded to `cfg.Metrics.HistoryPoints`), and returns a `metricsSnapshot` (incl. average TPS over `History`).
@@ -169,7 +179,9 @@ All application logic is currently contained in `main.go`:
 5. **Abrupt shutdown**:
    - `setupSignalHandling()` calls `os.Exit(0)` immediately; in-flight requests are dropped.
 6. **Go version**:
-   - `go.mod` declares Go 1.21. Avoid standard library APIs newer than 1.21 (e.g. `http.ServeMux` method/wildcard patterns from 1.22) unless the `go` directive is bumped.
+   - `go.mod` declares Go 1.21. Avoid standard library APIs newer than 1.21 (e.g. `http.ServeMux` method/wildcard patterns from 1.22) unless the `go` directive is bumped. The `min`/`max` builtins (1.21) are fine.
+7. **Single upstream, no auth/TLS options**:
+   - The upstream is always `http://host:port`; there is no HTTPS upstream, API key injection, or per-endpoint routing.
 
 ---
 
@@ -180,3 +192,5 @@ All application logic is currently contained in `main.go`:
 - **Preserve Configuration Compatibility**: Keep `config.yaml` schema backward-compatible when adding new features or configurations.
 - **Testing**: Whenever fixing bugs or adding features, write corresponding unit tests using `net/http/httptest` to verify proxying, metrics parsing, and concurrent safety.
 - **Git Hygiene**: Do not commit build artifacts (`metrics_proxy`, `.exe`) or temporary files.
+- **Merges**: Before committing a merge, run `git diff --check` and `go build ./... && go test -race ./...`; conflict markers have been committed to `main` before (merge `6a83ff7`, fixed afterwards).
+- **Keep docs in sync**: Behavior, config or limitation changes must update this file, `config.yaml` comments, and the affected `.serena/memories/` (committed, reviewed like code).

@@ -5,4 +5,5 @@
 3. `go build ./...` succeeds.
 4. `go test -race -v ./...` passes; new behavior covered by tests.
 5. If behavior, config schema, or known limitations changed: update `AGENTS.md` (architecture §5, limitations §6, config reference §4), `config.yaml` comments, and any affected `.serena/memories/` (they are committed and must not go stale).
-6. No build artifacts staged; `.serena/cache/` and `.serena/project.local.yml` must stay untracked.
+6. After merges/rebases: `git diff --check` and `grep -rn '^<<<<<<<\|^>>>>>>>' --include='*.go' .` print nothing (conflict markers were once committed to `main`).
+7. No build artifacts staged; `.serena/cache/` and `.serena/project.local.yml` must stay untracked.

@@ -4,10 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-<<<<<<< HEAD
 	"errors"
-=======
->>>>>>> 484980e56ac795e6acc7ad29eb8333853f4c3959
 	"fmt"
 	"io"
 	"mime"
@@ -96,14 +93,9 @@ const maxCaptureBytes = 16 << 20
 // Global config and metrics
 var (
 	cfg     Config
-<<<<<<< HEAD
-	lmProxy *httputil.ReverseProxy
-	metrics Metrics
-=======
 	proxy   *httputil.ReverseProxy
 	metrics Metrics
 	out     io.Writer = os.Stdout // destination for per-request status lines
->>>>>>> 484980e56ac795e6acc7ad29eb8333853f4c3959
 )
 
 func main() {
@@ -115,16 +107,8 @@ func main() {
 		os.Exit(1)
 	}
 
-<<<<<<< HEAD
-	// Initialize reverse proxy to LM Studio
-	lmProxy = newProxy(&url.URL{
-		Scheme: "http",
-		Host:   net.JoinHostPort(cfg.LmStudio.Host, strconv.Itoa(cfg.LmStudio.Port)),
-	})
-=======
 	target := upstreamURL()
 	proxy = newReverseProxy(target)
->>>>>>> 484980e56ac795e6acc7ad29eb8333853f4c3959
 
 	// Setup signal handling for graceful shutdown
 	go setupSignalHandling()
@@ -198,15 +182,10 @@ func runProxy() error {
 	server := &http.Server{
 		Addr:    fmt.Sprintf(":%d", cfg.ProxyPort),
 		Handler: http.HandlerFunc(handleRequest),
-<<<<<<< HEAD
-		// No read/write timeouts: generations can stream for minutes
-		ReadHeaderTimeout: 10 * time.Second,
-=======
 		// No ReadTimeout/WriteTimeout: generations can take minutes, and an
 		// expiring ReadTimeout cancels the request context mid-response.
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
->>>>>>> 484980e56ac795e6acc7ad29eb8333853f4c3959
 	}
 
 	fmt.Println("Press Ctrl+C to stop")
@@ -214,11 +193,7 @@ func runProxy() error {
 }
 
 // isAPIEndpoint checks if the request path matches an API endpoint pattern.
-<<<<<<< HEAD
-// Patterns are path prefixes; a trailing "*" is optional ("/api/v1/*" == "/api/v1/").
-=======
 // A trailing "*" in a pattern is ignored; patterns match as path prefixes.
->>>>>>> 484980e56ac795e6acc7ad29eb8333853f4c3959
 func isAPIEndpoint(path string) bool {
 	for _, pattern := range cfg.APIEndpoints {
 		if strings.HasPrefix(path, strings.TrimSuffix(pattern, "*")) {
@@ -228,229 +203,16 @@ func isAPIEndpoint(path string) bool {
 	return false
 }
 
-<<<<<<< HEAD
-// startTimeKey is the request context key holding the time a request arrived
-type startTimeKey struct{}
-
-// newProxy creates a reverse proxy that forwards requests to LM Studio and
-// collects metrics from the responses as they stream back to the client
-func newProxy(target *url.URL) *httputil.ReverseProxy {
-	return &httputil.ReverseProxy{
-		Rewrite: func(pr *httputil.ProxyRequest) {
-			pr.SetURL(target)
-			// Let the transport negotiate (and transparently decode) compression
-			// so the metrics parser always sees plain text
-			pr.Out.Header.Del("Accept-Encoding")
-			fmt.Printf("[LM Studio] %s %s\n", pr.Out.Method, pr.Out.URL)
-		},
-		ModifyResponse: func(resp *http.Response) error {
-			start, _ := resp.Request.Context().Value(startTimeKey{}).(time.Time)
-			mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
-			resp.Body = &meteredBody{
-				ReadCloser: resp.Body,
-				status:     resp.StatusCode,
-				start:      start,
-				parser: responseParser{
-					streamed: mediaType == "text/event-stream" || mediaType == "application/x-ndjson",
-				},
-			}
-			return nil
-		},
-		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			fmt.Printf("[ERROR] Failed to forward request: %v\n", err)
-			http.Error(w, "Failed to connect to LM Studio", http.StatusBadGateway)
-		},
-	}
-}
-
-// meteredBody wraps a response body, feeding everything read through it to a
-// parser and recording metrics once the body is fully consumed or closed
-type meteredBody struct {
-	io.ReadCloser
-	status int
-	start  time.Time
-	parser responseParser
-	once   sync.Once
-}
-
-func (b *meteredBody) Read(p []byte) (int, error) {
-	n, err := b.ReadCloser.Read(p)
-	b.parser.Write(p[:n])
-	if err == io.EOF {
-		b.finish()
-	}
-	return n, err
-}
-
-func (b *meteredBody) Close() error {
-	err := b.ReadCloser.Close()
-	b.finish()
-	return err
-}
-
-func (b *meteredBody) finish() {
-	b.once.Do(func() {
-		data := b.parser.Result()
-		data.Duration = time.Since(b.start)
-
-		fmt.Printf("[LM Studio] Response: %d tokens=%d tps=%.2f\n",
-			b.status, data.TotalTokens, data.TokensPerSecond)
-
-		updateGlobalMetrics(data)
-		displayMetrics()
-	})
-=======
 // requestInfo describes an incoming request; it travels to the response
 // side of the proxy via the request context.
 type requestInfo struct {
 	start  time.Time
 	method string
 	path   string
->>>>>>> 484980e56ac795e6acc7ad29eb8333853f4c3959
 }
 
 type requestInfoKey struct{}
 
-<<<<<<< HEAD
-// maxParseBytes caps how much of a response (or of a single stream line) is
-// buffered for metrics parsing; larger bodies are still proxied in full
-const maxParseBytes = 4 << 20
-
-// responseParser incrementally extracts metrics from a response body, which is
-// either a single JSON document or a stream of SSE / NDJSON lines
-type responseParser struct {
-	streamed bool
-	buf      []byte
-	overflow bool
-	data     MetricsData
-}
-
-// Write consumes the next chunk of the response body
-func (p *responseParser) Write(b []byte) {
-	if !p.streamed {
-		p.buffer(b)
-		return
-	}
-	for {
-		i := bytes.IndexByte(b, '\n')
-		if i < 0 {
-			p.buffer(b)
-			return
-		}
-		p.buffer(b[:i])
-		p.endLine()
-		b = b[i+1:]
-	}
-}
-
-// Result returns the metrics found in the body consumed so far
-func (p *responseParser) Result() MetricsData {
-	if p.streamed {
-		p.endLine()
-	} else if !p.overflow {
-		p.parsePayload(p.buf)
-	}
-	return p.data
-}
-
-func (p *responseParser) buffer(b []byte) {
-	if p.overflow {
-		return
-	}
-	if len(p.buf)+len(b) > maxParseBytes {
-		p.overflow = true
-		p.buf = nil
-		return
-	}
-	p.buf = append(p.buf, b...)
-}
-
-// endLine parses one complete stream line: an SSE "data:" field or an NDJSON object
-func (p *responseParser) endLine() {
-	if !p.overflow {
-		line := bytes.TrimSpace(p.buf)
-		if payload, ok := bytes.CutPrefix(line, []byte("data:")); ok {
-			p.parsePayload(bytes.TrimSpace(payload))
-		} else if bytes.HasPrefix(line, []byte("{")) {
-			p.parsePayload(line)
-		}
-	}
-	p.buf = p.buf[:0]
-	p.overflow = false
-}
-
-// lmPayload covers the response shapes of LM Studio's native API (/api/v1),
-// Ollama's native API (/api/*) and their OpenAI-compatible APIs (/v1/*)
-type lmPayload struct {
-	Model           string `json:"model"`             // OpenAI, Ollama
-	ModelInstanceID string `json:"model_instance_id"` // LM Studio
-	Usage           *struct {
-		TotalTokens int `json:"total_tokens"`
-	} `json:"usage"` // OpenAI
-	Stats *struct {
-		InputTokens       int     `json:"input_tokens"`
-		TotalOutputTokens int     `json:"total_output_tokens"`
-		TokensPerSecond   float64 `json:"tokens_per_second"`
-	} `json:"stats"` // LM Studio
-	Timings *struct {
-		PredictedPerSecond float64 `json:"predicted_per_second"`
-	} `json:"timings"` // Ollama OpenAI-compatible
-	PromptEvalCount int        `json:"prompt_eval_count"` // Ollama
-	EvalCount       int        `json:"eval_count"`        // Ollama
-	EvalDuration    int64      `json:"eval_duration"`     // Ollama, nanoseconds
-	Result          *lmPayload `json:"result"`            // LM Studio "chat.end" stream event
-}
-
-// parsePayload merges metrics from one JSON document; later values override earlier ones
-func (p *responseParser) parsePayload(raw []byte) {
-	if len(raw) == 0 || bytes.Equal(raw, []byte("[DONE]")) {
-		return
-	}
-	var pl lmPayload
-	// A type mismatch in one field still leaves the others decoded
-	var typeErr *json.UnmarshalTypeError
-	if err := json.Unmarshal(raw, &pl); err != nil && !errors.As(err, &typeErr) {
-		return
-	}
-	p.apply(&pl)
-}
-
-func (p *responseParser) apply(pl *lmPayload) {
-	if pl.ModelInstanceID != "" {
-		p.data.ModelName = pl.ModelInstanceID
-	} else if pl.Model != "" {
-		p.data.ModelName = pl.Model
-	}
-
-	if pl.Usage != nil && pl.Usage.TotalTokens > 0 {
-		p.data.TotalTokens = pl.Usage.TotalTokens
-	}
-	if pl.Stats != nil {
-		if total := pl.Stats.InputTokens + pl.Stats.TotalOutputTokens; total > 0 {
-			p.data.TotalTokens = total
-		}
-		if pl.Stats.TokensPerSecond > 0 {
-			p.data.TokensPerSecond = pl.Stats.TokensPerSecond
-		}
-	}
-	if pl.Timings != nil && pl.Timings.PredictedPerSecond > 0 {
-		p.data.TokensPerSecond = pl.Timings.PredictedPerSecond
-	}
-	if total := pl.PromptEvalCount + pl.EvalCount; total > 0 {
-		p.data.TotalTokens = total
-	}
-	if pl.EvalCount > 0 && pl.EvalDuration > 0 {
-		p.data.TokensPerSecond = float64(pl.EvalCount) / time.Duration(pl.EvalDuration).Seconds()
-	}
-
-	if pl.Result != nil {
-		p.apply(pl.Result)
-	}
-}
-
-// updateGlobalMetrics updates the global metrics store
-func updateGlobalMetrics(data MetricsData) {
-=======
 // handleRequest processes incoming requests
 func handleRequest(w http.ResponseWriter, r *http.Request) {
 	if !isAPIEndpoint(r.URL.Path) {
@@ -552,8 +314,11 @@ func (b *meteredBody) finish() {
 		if b.capture != nil {
 			data = b.capture.finish()
 		}
-		if _, ok := b.capture.(*sseCapture); ok && !b.firstByte.IsZero() {
-			streamTime = end.Sub(b.firstByte)
+		switch b.capture.(type) {
+		case *sseCapture, *ndjsonCapture:
+			if !b.firstByte.IsZero() {
+				streamTime = end.Sub(b.firstByte)
+			}
 		}
 		data.Duration = end.Sub(b.info.start)
 		data.completeDerived(streamTime)
@@ -589,6 +354,8 @@ func newCapture(contentType string) capture {
 	switch {
 	case mediaType == "text/event-stream":
 		return &sseCapture{}
+	case mediaType == "application/x-ndjson":
+		return &ndjsonCapture{}
 	case mediaType == "application/json" || strings.HasSuffix(mediaType, "+json"):
 		return &jsonCapture{}
 	}
@@ -621,43 +388,65 @@ func (c *jsonCapture) finish() MetricsData {
 	return d
 }
 
+// lineSplitter splits a body written in arbitrary chunks into lines and
+// passes each line, without its "\n" or "\r\n" terminator, to emit. Lines
+// longer than maxCaptureBytes are discarded.
+type lineSplitter struct {
+	line     []byte // incomplete line carried over between writes
+	skipLine bool   // current line exceeds maxCaptureBytes and is discarded
+}
+
+func (s *lineSplitter) write(p []byte, emit func(line []byte)) {
+	for len(p) > 0 {
+		i := bytes.IndexByte(p, '\n')
+		if i < 0 {
+			s.appendLine(p)
+			return
+		}
+		s.appendLine(p[:i])
+		s.endLine(emit)
+		p = p[i+1:]
+	}
+}
+
+// flush emits an unterminated last line, if any, at the end of the body.
+func (s *lineSplitter) flush(emit func(line []byte)) {
+	if len(s.line) > 0 {
+		s.endLine(emit)
+	}
+}
+
+// endLine emits the current line (which may be empty) and starts a new one.
+func (s *lineSplitter) endLine(emit func(line []byte)) {
+	if !s.skipLine {
+		emit(bytes.TrimSuffix(s.line, []byte("\r")))
+	}
+	s.line, s.skipLine = s.line[:0], false
+}
+
+func (s *lineSplitter) appendLine(p []byte) {
+	if s.skipLine {
+		return
+	}
+	if len(s.line)+len(p) > maxCaptureBytes {
+		s.line, s.skipLine = s.line[:0], true
+		return
+	}
+	s.line = append(s.line, p...)
+}
+
 // sseCapture parses a text/event-stream body event by event, so memory use
 // is bounded by the largest event rather than the whole stream. Metrics from
 // later events override earlier ones.
 type sseCapture struct {
-	line     []byte // incomplete line carried over between writes
-	data     []byte // data field of the event being assembled
-	skipLine bool   // current line exceeds maxCaptureBytes and is discarded
-	metrics  MetricsData
+	lines   lineSplitter
+	data    []byte // data field of the event being assembled
+	metrics MetricsData
 }
 
 func (c *sseCapture) Write(p []byte) (int, error) {
-	n := len(p)
-	for len(p) > 0 {
-		i := bytes.IndexByte(p, '\n')
-		if i < 0 {
-			c.appendLine(p)
-			break
-		}
-		c.appendLine(p[:i])
-		if !c.skipLine {
-			c.processLine(bytes.TrimSuffix(c.line, []byte("\r")))
-		}
-		c.line, c.skipLine = c.line[:0], false
-		p = p[i+1:]
-	}
-	return n, nil
-}
-
-func (c *sseCapture) appendLine(p []byte) {
-	if c.skipLine {
-		return
-	}
-	if len(c.line)+len(p) > maxCaptureBytes {
-		c.line, c.skipLine = c.line[:0], true
-		return
-	}
-	c.line = append(c.line, p...)
+	c.lines.write(p, c.processLine)
+	return len(p), nil
 }
 
 func (c *sseCapture) processLine(line []byte) {
@@ -687,16 +476,33 @@ func (c *sseCapture) dispatch() {
 }
 
 func (c *sseCapture) finish() MetricsData {
-	if len(c.line) > 0 && !c.skipLine {
-		c.processLine(bytes.TrimSuffix(c.line, []byte("\r")))
-	}
+	c.lines.flush(c.processLine)
 	c.dispatch()
 	return c.metrics
 }
 
+// ndjsonCapture parses a newline-delimited JSON body (Ollama's native
+// streaming format) line by line. Metrics from later lines override earlier
+// ones; Ollama reports its stats in the final "done" line.
+type ndjsonCapture struct {
+	lines   lineSplitter
+	metrics MetricsData
+}
+
+func (c *ndjsonCapture) Write(p []byte) (int, error) {
+	c.lines.write(p, c.metrics.mergeJSON)
+	return len(p), nil
+}
+
+func (c *ndjsonCapture) finish() MetricsData {
+	c.lines.flush(c.metrics.mergeJSON)
+	return c.metrics
+}
+
 // llmPayload is the subset of upstream response fields used for metrics. It
-// covers OpenAI-compatible responses (/v1/*) and LM Studio's native REST API
-// v0 (/api/v0/*) and v1 (/api/v1/*), both as JSON bodies and as SSE events.
+// covers OpenAI-compatible responses (/v1/*), LM Studio's native REST API
+// v0 (/api/v0/*) and v1 (/api/v1/*), and Ollama's native API (/api/*), as
+// JSON bodies, SSE events and NDJSON lines.
 type llmPayload struct {
 	Model           string `json:"model"`             // OpenAI-compatible, API v0
 	ModelInstanceID string `json:"model_instance_id"` // API v1
@@ -714,6 +520,12 @@ type llmPayload struct {
 		InputTokens             int     `json:"input_tokens"`                // API v1
 		TotalOutputTokens       int     `json:"total_output_tokens"`         // API v1
 	} `json:"stats"`
+	Timings *struct {
+		PredictedPerSecond float64 `json:"predicted_per_second"`
+	} `json:"timings"` // Ollama OpenAI-compatible
+	PromptEvalCount int   `json:"prompt_eval_count"` // Ollama native
+	EvalCount       int   `json:"eval_count"`        // Ollama native
+	EvalDuration    int64 `json:"eval_duration"`     // Ollama native, nanoseconds
 	// Wrapped payloads: the API v1 "chat.end" SSE event carries the response
 	// in "result", OpenAI Responses API events in "response". Kept raw so an
 	// unrelated field of the same name doesn't fail the whole parse.
@@ -722,10 +534,12 @@ type llmPayload struct {
 }
 
 // mergeJSON applies the metrics found in a JSON document to d. Documents
-// that are not JSON objects of the expected shape are ignored.
+// that are not JSON objects are ignored; a field of unexpected type is
+// skipped without discarding the others.
 func (d *MetricsData) mergeJSON(raw []byte) {
 	var p llmPayload
-	if json.Unmarshal(raw, &p) == nil {
+	var typeErr *json.UnmarshalTypeError
+	if err := json.Unmarshal(raw, &p); err == nil || errors.As(err, &typeErr) {
 		d.merge(&p)
 	}
 }
@@ -754,10 +568,17 @@ func (d *MetricsData) merge(p *llmPayload) {
 		setFirstPositive(&d.PromptTokens, s.InputTokens)
 		setFirstPositive(&d.CompletionTokens, s.TotalOutputTokens)
 	}
+	if t := p.Timings; t != nil && t.PredictedPerSecond > 0 {
+		d.TokensPerSecond = t.PredictedPerSecond
+	}
+	setFirstPositive(&d.PromptTokens, p.PromptEvalCount)
+	setFirstPositive(&d.CompletionTokens, p.EvalCount)
+	if p.EvalCount > 0 && p.EvalDuration > 0 {
+		d.TokensPerSecond = float64(p.EvalCount) / time.Duration(p.EvalDuration).Seconds()
+	}
 	for _, raw := range []json.RawMessage{p.Result, p.Response} {
-		var inner llmPayload
-		if len(raw) > 0 && json.Unmarshal(raw, &inner) == nil {
-			d.merge(&inner)
+		if len(raw) > 0 {
+			d.mergeJSON(raw)
 		}
 	}
 }
@@ -806,28 +627,17 @@ func (d MetricsData) hasInference() bool {
 // updateGlobalMetrics updates the global metrics store and returns a snapshot
 // of the aggregates including this query.
 func updateGlobalMetrics(data MetricsData) metricsSnapshot {
->>>>>>> 484980e56ac795e6acc7ad29eb8333853f4c3959
 	metrics.mu.Lock()
 	defer metrics.mu.Unlock()
 
 	metrics.QueryCount++
 	metrics.TotalTokens += data.TotalTokens
-<<<<<<< HEAD
-	if data.TokensPerSecond > 0 {
-		metrics.TokensPerSecond = data.TokensPerSecond
-	}
-=======
 	metrics.TokensPerSecond = data.TokensPerSecond
->>>>>>> 484980e56ac795e6acc7ad29eb8333853f4c3959
 	if data.ModelName != "" {
 		metrics.ModelName = data.ModelName
 	}
 
-<<<<<<< HEAD
-	// Running average time per query
-=======
 	// Running average of time per query
->>>>>>> 484980e56ac795e6acc7ad29eb8333853f4c3959
 	metrics.AvgTimePerQuery += (data.Duration - metrics.AvgTimePerQuery) / time.Duration(metrics.QueryCount)
 
 	// Add to history
@@ -839,30 +649,10 @@ func updateGlobalMetrics(data MetricsData) metricsSnapshot {
 	})
 
 	// Keep only the last N points
-	if n := cfg.Metrics.HistoryPoints; n > 0 && len(metrics.History) > n {
-		metrics.History = metrics.History[len(metrics.History)-n:]
+	if len(metrics.History) > cfg.Metrics.HistoryPoints {
+		metrics.History = metrics.History[len(metrics.History)-cfg.Metrics.HistoryPoints:]
 	}
 
-<<<<<<< HEAD
-// handleRequest processes incoming requests
-func handleRequest(w http.ResponseWriter, r *http.Request) {
-	// Check if this is an API endpoint
-	if !isAPIEndpoint(r.URL.Path) {
-		fmt.Printf("[Proxy] Non-API request: %s %s\n", r.Method, r.URL.Path)
-		http.NotFound(w, r)
-		return
-	}
-
-	// Forward to LM Studio; metrics are collected as the response streams back
-	ctx := context.WithValue(r.Context(), startTimeKey{}, time.Now())
-	lmProxy.ServeHTTP(w, r.WithContext(ctx))
-}
-
-// displayMetrics shows collected metrics in the terminal
-func displayMetrics() {
-	metrics.mu.RLock()
-	defer metrics.mu.RUnlock()
-=======
 	var tpsSum float64
 	var tpsCount int
 	for _, h := range metrics.History {
@@ -890,26 +680,12 @@ func displayMetrics(info *requestInfo, status int, data MetricsData, snap metric
 
 func formatMetricsLine(now time.Time, info *requestInfo, status int, data MetricsData, snap metricsSnapshot, complete bool) string {
 	var b strings.Builder
->>>>>>> 484980e56ac795e6acc7ad29eb8333853f4c3959
 
 	fmt.Fprintf(&b, "[%s] #%d %s %s %d",
 		now.Format("15:04:05"), snap.QueryCount, info.method, info.path, status)
 
-<<<<<<< HEAD
-	if metrics.QueryCount > 0 {
-		fmt.Printf(" | Avg Time: %.2fms", float64(metrics.AvgTimePerQuery)/float64(time.Millisecond))
-
-		if metrics.TokensPerSecond > 0 {
-			fmt.Printf(" | TPS: %.2f", metrics.TokensPerSecond)
-		}
-
-		if metrics.TotalTokens > 0 {
-			fmt.Printf(" | Tokens: %d", metrics.TotalTokens)
-		}
-=======
 	if data.ModelName != "" {
 		fmt.Fprintf(&b, " | Model: %s", truncateString(data.ModelName, 30))
->>>>>>> 484980e56ac795e6acc7ad29eb8333853f4c3959
 	}
 	if data.PromptTokens > 0 || data.CompletionTokens > 0 {
 		fmt.Fprintf(&b, " | Tokens: %d in / %d out", data.PromptTokens, data.CompletionTokens)
