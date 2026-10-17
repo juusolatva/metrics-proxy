@@ -155,7 +155,7 @@ All application logic is currently contained in `main.go`:
    - With `--csv`, opens the file via `openCSVLog()`: append mode, created if missing, header (`csvHeader`) written only when the file is empty. An open error exits with status 1. The file is closed (deferred) after `runProxy()` returns.
    - Builds `proxy` targeting `upstreamURL()`.
    - Names the upstream in the startup banner via `detectBackend()`: probes `/api/version` (Ollama), `/api/v1/models` (LM Studio), `/v1/models` (OpenAI-compatible) with a 2 s timeout, checking the JSON body for a known key because LM Studio answers unknown endpoints with `200` and an error body. Falls back to "upstream … (server type not detected)" and stops probing on the first connection error. Only affects the banner.
-   - `setupSignalHandling()` returns two contexts: `stop` (done on the first `SIGINT`/`SIGTERM`) and `force` (done on the second).
+   - `main` creates two cancelable contexts, `stop` and `force`, with `defer cancel()`. `setupSignalHandling(stopNow, forceNow)` calls the first cancel on the first `SIGINT`/`SIGTERM` and the second on the next. Keep context creation and `defer cancel()` in `main`: SonarCloud rule `godre:S8188` flags cancel functions that aren't deferred where they're created.
    - `runProxy()` listens on `cfg.ProxyPort` and hands the `http.Server` (handler `handleRequest`) to `serve()`. No read/write timeouts (generations can take minutes; an expiring `ReadTimeout` cancels the request context), only `ReadHeaderTimeout`/`IdleTimeout`.
 2. **Request Routing (`handleRequest`)**:
    - Validates incoming path against `cfg.APIEndpoints` using `isAPIEndpoint()` (prefix match, trailing `*` stripped).

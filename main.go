@@ -138,8 +138,13 @@ func main() {
 	target := upstreamURL()
 	proxy = newReverseProxy(target)
 
-	// Setup signal handling for graceful shutdown
-	stop, force := setupSignalHandling()
+	// Setup signal handling for graceful shutdown: stop is done on the first
+	// signal, force on the second.
+	stop, stopNow := context.WithCancel(context.Background())
+	defer stopNow()
+	force, forceNow := context.WithCancel(context.Background())
+	defer forceNow()
+	setupSignalHandling(stopNow, forceNow)
 
 	// Start proxy server
 	fmt.Printf("Proxy listening on port %d\n", cfg.ProxyPort)
@@ -295,19 +300,18 @@ func detectBackend(target *url.URL) string {
 // setupSignalHandling returns a context that is done on the first SIGINT or
 // SIGTERM (start a graceful shutdown) and one that is done on the second
 // (abort it).
-func setupSignalHandling() (stop, force context.Context) {
+// setupSignalHandling calls onFirst on the first SIGINT or SIGTERM (start a
+// graceful shutdown) and onSecond on the second (abort it).
+func setupSignalHandling(onFirst, onSecond func()) {
 	sigChan := make(chan os.Signal, 2)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	stop, stopNow := context.WithCancel(context.Background())
-	force, forceNow := context.WithCancel(context.Background())
 	go func() {
 		<-sigChan
-		stopNow()
+		onFirst()
 		<-sigChan
-		forceNow()
+		onSecond()
 	}()
-	return stop, force
 }
 
 func runProxy(stop, force context.Context) error {

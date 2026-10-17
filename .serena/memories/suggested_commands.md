@@ -1,6 +1,6 @@
 # Commands (run from repo root)
 
-- Run: `go run .` — must run from repo root; `config.yaml` is loaded from CWD.
+- Run: `go run .` (loads `config.yaml` from CWD) or `go run . --config <file>`; add `--csv <file>` to save per-query stats. `go run . --help` lists flags.
 - Build: `go build -o metrics_proxy .` — output (`/metrics_proxy`, `metrics_proxy.exe`) is gitignored.
 - Test: `go test -v ./...`; race: `go test -race -v ./...`
 - Format: `gofmt -s -w .`; check: `gofmt -l .`

@@ -366,20 +366,22 @@ func TestProxyStreamsSSEWithoutBuffering(t *testing.T) {
 
 	// The headers and first event must arrive while the upstream is still
 	// generating. A buffering proxy would block in http.Post itself, so the
-	// request is made inside the timed goroutine.
-	type firstEvent struct {
-		resp  *http.Response
-		br    *bufio.Reader
-		event string
-		err   error
+	// request is made inside the timed goroutine, which also reads the rest
+	// of the stream once released and closes the body.
+	type result struct {
+		body string
+		err  error
 	}
-	gotFirst := make(chan firstEvent, 1)
+	gotFirst := make(chan result, 1)
+	gotRest := make(chan result, 1)
 	go func() {
 		resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"stream":true}`))
 		if err != nil {
-			gotFirst <- firstEvent{err: err}
+			gotFirst <- result{err: err}
 			return
 		}
+		defer resp.Body.Close()
+
 		br := bufio.NewReader(resp.Body)
 		var sb strings.Builder
 		for !strings.HasSuffix(sb.String(), "\n\n") {
@@ -389,27 +391,35 @@ func TestProxyStreamsSSEWithoutBuffering(t *testing.T) {
 				break
 			}
 		}
-		gotFirst <- firstEvent{resp: resp, br: br, event: sb.String()}
+		gotFirst <- result{body: sb.String()}
+
+		b, err := io.ReadAll(br)
+		gotRest <- result{body: string(b), err: err}
 	}()
 
-	var fe firstEvent
 	select {
-	case fe = <-gotFirst:
+	case r := <-gotFirst:
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		if r.body != first {
+			t.Fatalf("first event = %q, want %q", r.body, first)
+		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("first SSE event not delivered before upstream finished; response is being buffered")
 	}
-	if fe.err != nil {
-		t.Fatal(fe.err)
-	}
-	defer fe.resp.Body.Close()
-	if fe.event != first {
-		t.Fatalf("first event = %q, want %q", fe.event, first)
-	}
 
 	unblock()
-	br := fe.br
-	if got := readAll(t, br); got != rest {
-		t.Errorf("remaining stream = %q, want %q", got, rest)
+	select {
+	case r := <-gotRest:
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		if r.body != rest {
+			t.Errorf("remaining stream = %q, want %q", r.body, rest)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("rest of the stream not delivered after the upstream finished")
 	}
 
 	waitForQueries(t, 1)
