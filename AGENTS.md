@@ -31,13 +31,23 @@ metrics_proxy/
 ├── main_test.go       # httptest-based tests (proxying, streaming, parsing, concurrency)
 ├── README.md          # Minimal project overview
 ├── CLAUDE.md          # Includes this file (`@AGENTS.md`)
-├── testdata/          # Real responses captured from LM Studio (lm_*) and Ollama (ol_*)
-│   ├── lm_v1_chat.json, lm_v1_chat_stream.sse   # LM Studio native /api/v1/chat
-│   ├── lm_oai.json, lm_oai_stream.sse           # LM Studio OpenAI-compatible /v1/chat/completions
-│   ├── ol_chat.json, ol_chat_stream.ndjson      # Ollama native /api/chat
-│   └── ol_oai_stream.sse                        # Ollama OpenAI-compatible /v1/chat/completions
+├── .gitattributes     # Keeps testdata/ byte-exact (no CRLF conversion)
+├── docs/
+│   └── windows-testing.md   # Checklist for testing on Windows 11
+├── testdata/          # Real response bodies captured from LM Studio (lm_*) and Ollama (ol_*)
+│   ├── lm_v1_chat.json, lm_v1_chat_stream.sse          # LM Studio native /api/v1/chat
+│   ├── lm_oai.json, lm_oai_stream.sse                  # LM Studio /v1/chat/completions (stream with include_usage)
+│   ├── lm_oai_stream_nousage.sse                       #   … streamed without include_usage
+│   ├── ol_chat.json, ol_chat_stream.ndjson             # Ollama native /api/chat
+│   ├── ol_generate.json, ol_generate_stream.ndjson     # Ollama native /api/generate
+│   ├── ol_oai.json, ol_oai_stream.sse                  # Ollama /v1/chat/completions (stream with include_usage)
+│   └── ol_oai_stream_nousage.sse                       #   … streamed without include_usage
 └── .serena/           # Serena project config + memories (committed); cache/ and project.local.yml are gitignored
 ```
+
+The current captures were taken on 2026-10-17. All of them used the prompt `Count from 1 to 5, separated by spaces.`, sent directly to the server (not through the proxy). Only response bodies were saved.
+- **LM Studio:** `qwen/qwen2.5-coder-14b` with speculative decoding (draft model Qwen2.5 Coder 0.5B). Its OpenAI-compatible `stats` contain only the draft counters (`draft_model`, `*_draft_tokens_count`) and no rate.
+- **Ollama:** `qwen3:4b-instruct-2507-q8_0`.
 
 ---
 
@@ -65,7 +75,9 @@ metrics_proxy/
 ### Testing
 Tests live in `main_test.go`. They start a fake upstream and the proxy with `httptest`, and reset the global state (`cfg`, `metrics`, `proxy`, `out`) per test via `startProxy()`. Metrics are recorded on the proxy's goroutine, so tests wait for them with `waitFor`/`waitForQueries` instead of asserting immediately.
 
-Parser tests should use the captured payloads in `testdata/` rather than hand-written JSON where possible, and feed them both whole and in 1-byte chunks to exercise chunk boundaries (`TestCaptureFixtures`). When adding support for a new upstream or endpoint, capture a real response (JSON and streamed) into `testdata/` with a `<upstream>_<api>[_stream].<ext>` name.
+Parser tests should use the captured payloads in `testdata/` (read with `readFixture()`) rather than hand-written JSON where possible. `TestCaptureFixtures` feeds every capture whole and in 1-byte chunks, to exercise chunk boundaries, and checks the model, tokens, TPS, TTFT and that no document was invalid. `TestProxyOllamaNativeNDJSON` sends a capture end to end through the proxy. When adding support for a new upstream or endpoint, capture a real response (JSON and streamed) with a `<upstream>_<api>[_stream][_variant].<ext>` name, using `curl -sN -o testdata/<file>` directly against the server, and add it to `TestCaptureFixtures`. Captures are committed; check them for anything private before adding them.
+
+Testing on Windows: see `docs/windows-testing.md`.
 - **Run tests**:
   ```bash
   go test -v ./...

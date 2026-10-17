@@ -492,28 +492,47 @@ func TestSSECaptureMultiLineDataAndUnterminatedEvent(t *testing.T) {
 	}
 }
 
+// readFixture returns a response captured from a real server in testdata/.
+func readFixture(t *testing.T, name string) []byte {
+	t.Helper()
+	body, err := os.ReadFile(filepath.Join("testdata", name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return body
+}
+
 // Fixtures in testdata/ are real responses captured from LM Studio and Ollama.
 func TestCaptureFixtures(t *testing.T) {
+	const (
+		lmModel = "qwen/qwen2.5-coder-14b"
+		olModel = "qwen3:4b-instruct-2507-q8_0"
+	)
 	tests := []struct {
 		file        string
 		contentType string
 		model       string
+		in, out     int // prompt and completion tokens; 0 when not reported
 		tps         float64
 		ttft        time.Duration
 	}{
-		{"lm_v1_chat.json", "application/json", "qwen/qwen3-vl-4b", 65.5780706931602, 51323 * time.Microsecond},
-		{"lm_v1_chat_stream.sse", "text/event-stream", "qwen/qwen3-vl-4b", 76.20208793720948, 13606 * time.Microsecond},
-		{"lm_oai.json", "application/json", "qwen/qwen3-vl-4b", 0, 0},
-		{"lm_oai_stream.sse", "text/event-stream", "qwen/qwen3-vl-4b", 0, 0},
-		{"ol_chat.json", "application/json; charset=utf-8", "qwen3:4b-instruct", 2 / 0.036687, 0},
-		{"ol_chat_stream.ndjson", "application/x-ndjson", "qwen3:4b-instruct", 2 / 0.025315, 0},
-		{"ol_oai_stream.sse", "text/event-stream", "qwen3:4b-instruct", 86.95652173913044, 0},
+		{"lm_v1_chat.json", "application/json; charset=utf-8", lmModel, 41, 10, 80.17174569522265, 110923 * time.Microsecond},
+		{"lm_v1_chat_stream.sse", "text/event-stream", lmModel, 41, 10, 84.25309630128908, 34515 * time.Microsecond},
+		// LM Studio's OpenAI-compatible stats carry only speculative-decoding
+		// counters (draft model), no rate.
+		{"lm_oai.json", "application/json; charset=utf-8", lmModel, 41, 29, 0, 0},
+		{"lm_oai_stream.sse", "text/event-stream", lmModel, 41, 17, 0, 0},
+		{"lm_oai_stream_nousage.sse", "text/event-stream", lmModel, 0, 0, 0, 0},
+		{"ol_chat.json", "application/json; charset=utf-8", olModel, 20, 10, 10 / 0.355075, 0},
+		{"ol_chat_stream.ndjson", "application/x-ndjson", olModel, 20, 10, 10 / 0.341097, 0},
+		{"ol_generate.json", "application/json; charset=utf-8", olModel, 20, 10, 10 / 0.340531, 0},
+		{"ol_generate_stream.ndjson", "application/x-ndjson", olModel, 20, 10, 10 / 0.340514, 0},
+		{"ol_oai.json", "application/json", olModel, 20, 10, 0, 0},
+		{"ol_oai_stream.sse", "text/event-stream", olModel, 20, 10, 29.325513196480937, 0},
+		{"ol_oai_stream_nousage.sse", "text/event-stream", olModel, 0, 0, 0, 0},
 	}
 	for _, tt := range tests {
-		body, err := os.ReadFile("testdata/" + tt.file)
-		if err != nil {
-			t.Fatal(err)
-		}
+		body := readFixture(t, tt.file)
 		// Feed the body whole and byte by byte to exercise chunk boundaries.
 		for _, chunkSize := range []int{len(body), 1} {
 			c := newCapture(tt.contentType)
@@ -528,10 +547,13 @@ func TestCaptureFixtures(t *testing.T) {
 			got := c.finish()
 			// Duration 0: totals are filled in but no throughput is estimated.
 			got.completeDerived(0)
-			if got.ModelName != tt.model || got.PromptTokens != 13 || got.CompletionTokens != 2 ||
-				got.TotalTokens != 15 || !approxEqual(got.TokensPerSecond, tt.tps) || got.TimeToFirstToken != tt.ttft {
-				t.Errorf("%s (chunk %d): got %+v, want model=%q tokens=13+2 tps=%v ttft=%v",
-					tt.file, chunkSize, got, tt.model, tt.tps, tt.ttft)
+			if got.ModelName != tt.model || got.PromptTokens != tt.in || got.CompletionTokens != tt.out ||
+				got.TotalTokens != tt.in+tt.out || !approxEqual(got.TokensPerSecond, tt.tps) || got.TimeToFirstToken != tt.ttft {
+				t.Errorf("%s (chunk %d): got %+v, want model=%q tokens=%d+%d tps=%v ttft=%v",
+					tt.file, chunkSize, got, tt.model, tt.in, tt.out, tt.tps, tt.ttft)
+			}
+			if d := c.diag(); d.invalid != 0 || d.oversized != 0 {
+				t.Errorf("%s (chunk %d): diag %+v, want every document parsed", tt.file, chunkSize, d)
 			}
 		}
 	}
@@ -579,10 +601,7 @@ func TestCaptureEdgeCases(t *testing.T) {
 }
 
 func TestProxyOllamaNativeNDJSON(t *testing.T) {
-	stream, err := os.ReadFile("testdata/ol_chat_stream.ndjson")
-	if err != nil {
-		t.Fatal(err)
-	}
+	stream := readFixture(t, "ol_chat_stream.ndjson")
 	target := startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/x-ndjson")
 		w.Write(stream)
@@ -602,7 +621,7 @@ func TestProxyOllamaNativeNDJSON(t *testing.T) {
 	waitForQueries(t, 1)
 	metrics.mu.RLock()
 	defer metrics.mu.RUnlock()
-	if metrics.ModelName != "qwen3:4b-instruct" || metrics.TotalTokens != 15 || !approxEqual(metrics.TokensPerSecond, 2/0.025315) {
+	if metrics.ModelName != "qwen3:4b-instruct-2507-q8_0" || metrics.TotalTokens != 30 || !approxEqual(metrics.TokensPerSecond, 10/0.341097) {
 		t.Errorf("got model %q, tokens %d, tps %v", metrics.ModelName, metrics.TotalTokens, metrics.TokensPerSecond)
 	}
 }

@@ -1,0 +1,22 @@
+data: {"id":"chatcmpl-18","object":"chat.completion.chunk","created":1792199120,"model":"qwen3:4b-instruct-2507-q8_0","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"role":"assistant","content":"1"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-18","object":"chat.completion.chunk","created":1792199120,"model":"qwen3:4b-instruct-2507-q8_0","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":" "},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-18","object":"chat.completion.chunk","created":1792199120,"model":"qwen3:4b-instruct-2507-q8_0","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":"2"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-18","object":"chat.completion.chunk","created":1792199120,"model":"qwen3:4b-instruct-2507-q8_0","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":" "},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-18","object":"chat.completion.chunk","created":1792199120,"model":"qwen3:4b-instruct-2507-q8_0","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":"3"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-18","object":"chat.completion.chunk","created":1792199120,"model":"qwen3:4b-instruct-2507-q8_0","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":" "},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-18","object":"chat.completion.chunk","created":1792199120,"model":"qwen3:4b-instruct-2507-q8_0","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":"4"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-18","object":"chat.completion.chunk","created":1792199120,"model":"qwen3:4b-instruct-2507-q8_0","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":" "},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-18","object":"chat.completion.chunk","created":1792199120,"model":"qwen3:4b-instruct-2507-q8_0","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":"5"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-18","object":"chat.completion.chunk","created":1792199120,"model":"qwen3:4b-instruct-2507-q8_0","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+

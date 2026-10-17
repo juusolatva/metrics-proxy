@@ -1,0 +1,35 @@
+{
+  "id": "chatcmpl-m4st4y36jeomjeahx0bfsn",
+  "object": "chat.completion",
+  "created": 1792199104,
+  "model": "qwen/qwen2.5-coder-14b",
+  "draft_model": "Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF/qwen2.5-coder-0.5b-instruct-q8_0.gguf",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Here is the count from 1 to 5, separated by spaces:\n\n```\n1 2 3 4 5\n```",
+        "reasoning_content": "",
+        "tool_calls": []
+      },
+      "logprobs": null,
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 41,
+    "completion_tokens": 29,
+    "total_tokens": 70,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    }
+  },
+  "stats": {
+    "draft_model": "Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF/qwen2.5-coder-0.5b-instruct-q8_0.gguf",
+    "total_draft_tokens_count": 33,
+    "accepted_draft_tokens_count": 21,
+    "rejected_draft_tokens_count": 12
+  },
+  "system_fingerprint": "qwen/qwen2.5-coder-14b"
+}

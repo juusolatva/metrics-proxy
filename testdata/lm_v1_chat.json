@@ -1,0 +1,18 @@
+{
+  "model_instance_id": "qwen/qwen2.5-coder-14b",
+  "output": [
+    {
+      "type": "message",
+      "content": "1 2 3 4 5"
+    }
+  ],
+  "stats": {
+    "input_tokens": 41,
+    "total_output_tokens": 10,
+    "reasoning_output_tokens": 0,
+    "tokens_per_second": 80.17174569522265,
+    "time_to_first_token_seconds": 0.11092300000000001,
+    "model_load_time_seconds": 6.49
+  },
+  "response_id": "resp_9a10d77e61c6bf281d654cf606254936f909dd3878b67770"
+}

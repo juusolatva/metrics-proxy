@@ -1,0 +1,2 @@
+# Captured server responses must stay byte-for-byte (no CRLF conversion on Windows).
+testdata/** -text
