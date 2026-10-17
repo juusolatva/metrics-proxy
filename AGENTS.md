@@ -32,6 +32,10 @@ metrics_proxy/
 ├── README.md          # Minimal project overview
 ├── CLAUDE.md          # Includes this file (`@AGENTS.md`)
 ├── .gitattributes     # Keeps testdata/ byte-exact (no CRLF conversion)
+├── .golangci.yml      # golangci-lint v2 config (standard linters; errcheck off in tests)
+├── sonar-project.properties  # SonarQube Cloud analysis settings (CI-based analysis, coverage)
+├── .github/
+│   └── workflows/ci.yml     # CI: fmt, vet, tests + coverage, SonarQube Cloud, golangci-lint, govulncheck
 ├── docs/
 │   └── windows-testing.md   # Checklist for testing on Windows 11
 ├── testdata/          # Real response bodies captured from LM Studio (lm_*) and Ollama (ol_*)
@@ -100,6 +104,15 @@ Testing on Windows: see `docs/windows-testing.md`.
   ```bash
   go vet ./...
   ```
+- **Lint** (same version as CI, config in `.golangci.yml`):
+  ```bash
+  go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 run
+  ```
+- **Vulnerability check** (same version as CI):
+  ```bash
+  go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+  ```
+- **CI** (`.github/workflows/ci.yml`, on pushes to `main` and on pull requests): `gofmt -s -l`, `go mod verify`, `go vet` and `go test -race` with coverage on the Go version from `go.mod` and on `stable`; the `stable` run uploads `coverage.out` to SonarQube Cloud. golangci-lint and govulncheck run on `stable`.
 
 ### Dependencies
 - **Tidy dependencies**:
@@ -239,7 +252,7 @@ All application logic is currently contained in `main.go`:
 - **Maintain Concurrency Safety**: Ensure `metrics.mu` write locks are held when updating state and read locks when reading state. Avoid holding locks across network I/O.
 - **Configuration Compatibility**: New options must be optional with sane defaults, so existing files keep working. Config parsing is strict: removing or renaming a key makes files that still use it fail with an "unknown field" error. The project has a single user so far, so renames and removals don't need aliases or deprecation periods (as with `metrics.mode` and `lm_studio` → `server`); note them in README.md and `config.yaml` comments.
 - **Testing**: Whenever fixing bugs or adding features, write corresponding unit tests using `net/http/httptest` to verify proxying, metrics parsing, and concurrent safety.
-- **SonarCloud**: Pushed commits are analyzed automatically (project `juusolatva_metrics_proxy`, public). Rules hit so far:
+- **SonarCloud**: Analyzed by the CI workflow (project `juusolatva_metrics_proxy`, public; settings in `sonar-project.properties`, token in the `SONAR_TOKEN` repository secret). Automatic Analysis must stay disabled in SonarQube Cloud, or the CI scan fails. Rules hit so far:
   - Keep each function's cognitive complexity at 15 or less, tests included (`go:S3776`). Move loop bodies, handlers and checks into named helpers. Check locally with `go run github.com/uudashr/gocognit/cmd/gocognit@v1.1.3 -over 15 .`, which scores function literals somewhat higher than Sonar.
   - Defer a context's cancel function in the function that creates it (`godre:S8188`).
   - Close response bodies with `defer resp.Body.Close()` right after the error check (`godre:S8208`).

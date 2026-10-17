@@ -393,7 +393,7 @@ func serve(stop, force context.Context, server *http.Server, ln net.Listener, ti
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
-	<-errc // http.ErrServerClosed
+	<-errc //nolint:errcheck // always http.ErrServerClosed after Shutdown/Close
 	fmt.Fprintln(out, "Proxy stopped")
 	return nil
 }
@@ -527,7 +527,7 @@ func (b *meteredBody) Read(p []byte) (int, error) {
 			b.firstByte = time.Now()
 		}
 		if b.capture != nil {
-			b.capture.Write(p[:n])
+			_, _ = b.capture.Write(p[:n]) // captures never fail; parse problems show in diag()
 		}
 	}
 	if err == io.EOF {
@@ -1044,7 +1044,7 @@ func openCSVLog(path string) (*csvRecorder, error) {
 	}
 	r := &csvRecorder{f: f, w: csv.NewWriter(f)}
 	if st, err := f.Stat(); err != nil || st.Size() == 0 {
-		r.w.Write(csvHeader)
+		_ = r.w.Write(csvHeader) // write errors are sticky; checked via r.w.Error()
 		r.w.Flush()
 		if err := r.w.Error(); err != nil {
 			f.Close()
@@ -1080,7 +1080,7 @@ func (r *csvRecorder) record(now time.Time, info *requestInfo, status int, data 
 	if r.closed {
 		return nil // a request cut off by shutdown finished after Close
 	}
-	r.w.Write(row)
+	_ = r.w.Write(row) // write errors are sticky; returned by r.w.Error()
 	r.w.Flush()
 	return r.w.Error()
 }

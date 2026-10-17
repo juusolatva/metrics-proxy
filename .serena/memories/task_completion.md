@@ -1,7 +1,7 @@
 # Task completion checklist
 
 1. `gofmt -s -w .` then `gofmt -l .` prints nothing.
-2. `go vet ./...` clean.
+2. `go vet ./...` and `go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 run` clean (CI fails otherwise).
 3. `go build ./...` succeeds.
 4. `go test -race -v ./...` passes; new behavior covered by tests.
 5. `go run github.com/uudashr/gocognit/cmd/gocognit@v1.1.3 -over 15 .` shows no function you added or changed (SonarCloud `go:S3776`).

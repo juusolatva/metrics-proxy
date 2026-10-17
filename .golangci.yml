@@ -1,0 +1,14 @@
+version: "2"
+
+linters:
+  # "standard": errcheck, govet, ineffassign, staticcheck, unused.
+  default: standard
+  exclusions:
+    presets:
+      # Unchecked Close, fmt.Fprint*, os.Setenv and similar.
+      - std-error-handling
+    rules:
+      # Tests write to httptest recorders and temp files; failures surface as assertion errors.
+      - path: _test\.go
+        linters:
+          - errcheck

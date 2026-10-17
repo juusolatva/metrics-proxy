@@ -5,6 +5,8 @@
 - Test: `go test -v ./...`; race: `go test -race -v ./...`
 - Format: `gofmt -s -w .`; check: `gofmt -l .`
 - Vet: `go vet ./...`
+- Lint (as CI, config `.golangci.yml`): `go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 run`
+- Vulnerabilities (as CI): `go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...`
 - Deps: `go mod tidy`, `go mod verify`
 - Cognitive complexity (SonarCloud `go:S3776`): `go run github.com/uudashr/gocognit/cmd/gocognit@v1.1.3 -over 15 .`
 - Windows build check (from Linux): `GOOS=windows go build ./... && GOOS=windows go vet ./... && GOOS=windows go test -c -o /dev/null .`
