@@ -114,8 +114,25 @@ config for LM Studio on `localhost:1234`. Unknown or misspelled keys are an
 error naming the key and line, e.g.
 `line 3: field histroy_points not found in type main.MetricsConfig`. This
 includes the removed `metrics.mode` and `metrics.refresh_interval_ms`
-settings, so delete them from older config files. `logging.debug` is
-accepted but has no effect yet.
+settings, so delete them from older config files.
+
+### Debug output
+
+Set `logging.debug: true` to see how the proxy arrived at each query's
+numbers. That is useful when a value is missing or looks wrong:
+
+```
+[DEBUG] req 2: POST /v1/chat/completions from [::1]:37316
+[DEBUG] req 2: upstream http://10.0.0.2:1234/v1/chat/completions -> 200 after 0.00s, Content-Type "text/event-stream"
+[DEBUG] req 2: body ended at EOF after 2797 bytes, stream time 0.03s
+[DEBUG] req 2: parsed as SSE: 10 JSON document(s), 0 invalid, 0 skipped as larger than 16 MiB
+[DEBUG] req 2: stream has no token usage; OpenAI-compatible clients must send "stream_options": {"include_usage": true}
+[03:52:45] #2 POST /v1/chat/completions 200 | Model: qwen2.5-coder-0.5b-instruct | Time: 0.04s | ...
+```
+
+At startup it also prints the effective configuration and what the backend
+probe found. Lines are tagged `req N` so concurrent requests can be told
+apart. Request and response bodies are never logged.
 
 ## Limitations
 

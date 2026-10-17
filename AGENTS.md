@@ -125,14 +125,14 @@ metrics:
 
 # Logging settings
 logging:
-  debug: false              # Not implemented yet
+  debug: false              # Print [DEBUG] lines explaining each request's metrics
 ```
 
 ### Configuration Notes
 - The config path comes from `--config` (`parseFlags()`), default `config.yaml`. Relative paths are resolved against the working directory, not the binary's location. A missing, unreadable or invalid file exits with status 1 and an error naming the file. Positional arguments (e.g. `metrics_proxy my.yaml`) are rejected with exit status 2 instead of being ignored.
 - `parseConfig()` applies defaults for unset fields: `proxy_port` 8080, `lm_studio` `localhost:1234`, `history_points` 10, and `api_endpoints` `["/api/v1/*", "/v1/*"]` (also when given as an empty list). An empty config file is valid (`io.EOF` from the decoder is treated as "no settings").
 - `parseConfig()` decodes strictly (`yaml.Decoder.KnownFields(true)`): unknown keys, i.e. typos or removed settings, fail with `field <key> not found in type main.<Struct>` and the line number (`TestParseConfigRejectsUnknownKeys`). `metrics.mode` and `metrics.refresh_interval_ms` were removed (never implemented), so old files containing them now fail to load until the keys are deleted. Removing or renaming a key has the same effect, so mention it in README.md.
-- `logging.debug` is parsed but has no runtime behavior yet.
+- `logging.debug` enables `[DEBUG]` output (see §5, "Debug Logging").
 - The `lm_studio` key names the upstream regardless of server type; to front Ollama, point it at `localhost:11434` and add `"/api/*"` (Ollama native `/api/chat`, `/api/generate`) to `api_endpoints`. Keep the key name for backward compatibility; an alias (e.g. `upstream`) would have to fall back to it.
 
 ---
@@ -180,6 +180,13 @@ All application logic is currently contained in `main.go`:
    - It then calls `server.Shutdown`, which closes the listener and waits for in-flight requests, streamed generations included, to finish normally and be recorded. The wait is bounded by `shutdownTimeout` (60 s, below systemd's default 90 s stop timeout) and aborted early by `force`.
    - On timeout or force it calls `server.Close()`. That cancels the upstream requests, so their bodies end without EOF and are logged as `incomplete`. It waits up to 2 s for those handlers to record, then prints `Proxy stopped` and returns `nil` (exit status 0).
    - Upgraded (`101`, hijacked) connections are not tracked by `Shutdown` and are dropped.
+8. **Debug Logging (`debugf`, `logging.debug`)**:
+   - `debugf()` prints `[DEBUG] …` lines to `out` only when `cfg.Logging.Debug` is set. Each forwarded request gets an ID from `requestSeq` (`requestInfo.id`), and its lines start with `req N:`.
+   - Startup: the effective config after defaults, and each `detectBackend()` probe's result (status, non-JSON body, missing or found key, connection error).
+   - `handleRequest`: method, request URI and client address.
+   - `meterResponse`: upstream URL, status, time to response headers, Content-Type, and whether the body is inspected (not for unknown Content-Types or `101` upgrades).
+   - `meteredBody.debugSummary()` (from `finish()`): whether the body reached EOF, its byte count and stream time; the capture's `captureDiag` (parser name; JSON documents parsed, invalid, or skipped for exceeding `maxCaptureBytes`); the basis of an estimated TPS (returned by `completeDerived()`); and hints when nothing counts as inference, or when an SSE stream has no usage (the `include_usage` hint).
+   - The counters live in each capture (`captureDiag.count()` from `mergeJSON`'s return value, `lineSplitter.oversized`). `mergeJSON` returns `false` for non-objects; a type error on the whole document (`UnmarshalTypeError.Field == ""`) counts as invalid, a field-level one doesn't. When adding a capture, implement `diag()`.
 
 ---
 
@@ -195,8 +202,9 @@ All application logic is currently contained in `main.go`:
    - Only the LM Studio native API (`/api/v1/*`) reports TTFT. Ollama (native and OpenAI-compatible) and LM Studio's OpenAI-compatible API don't, so their status lines have no `TTFT` field. For streamed responses it could be measured by the proxy (request start to first byte), which is not implemented.
 4. **Do not buffer response bodies before forwarding**:
    - Bodies must stay streamed through `meteredBody`; reading the body in `ModifyResponse` would also hold back response headers and break SSE. `TestProxyStreamsSSEWithoutBuffering` guards this.
-5. **Unimplemented configuration**:
-   - `logging.debug` is parsed but has no effect. (`metrics.mode` and `metrics.refresh_interval_ms` were removed and are now rejected as unknown keys.)
+5. **Debug logging is config-only and unstructured**:
+   - It is enabled only by `logging.debug: true` (there is no `--debug` flag). `[DEBUG]` lines go to `out` (stdout), interleaved with the status lines, and lines of concurrent requests interleave too (match them by `req N`).
+   - Bodies and headers other than Content-Type are never logged, only sizes and counts. Client addresses and upstream URLs are logged.
 6. **Shutdown waits for in-flight requests**:
    - The first signal waits up to `shutdownTimeout` (60 s, a constant, not configurable) for running generations; a second signal aborts them. Tests drive `serve()` directly with their own contexts and timeout (`startServe`), not real signals. Aggregates are in memory only and are lost on exit; with `--csv`, per-query rows are kept in the file.
    - `--csv` does not check an existing file's header. Appending to a CSV with different columns (e.g. from a future version) mixes formats.

@@ -123,6 +123,8 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Printf("Loaded config from %s\n", opts.configPath)
+	debugf("config: proxy_port=%d upstream=%s:%d api_endpoints=%q history_points=%d",
+		cfg.ProxyPort, cfg.LmStudio.Host, cfg.LmStudio.Port, cfg.APIEndpoints, cfg.Metrics.HistoryPoints)
 
 	if opts.csvPath != "" {
 		rec, err := openCSVLog(opts.csvPath)
@@ -274,7 +276,12 @@ func detectBackend(target *url.URL) string {
 		}
 		defer resp.Body.Close()
 		var body map[string]json.RawMessage
-		if resp.StatusCode != http.StatusOK || json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&body) != nil {
+		if resp.StatusCode != http.StatusOK {
+			debugf("backend probe %s: status %d", path, resp.StatusCode)
+			return nil, nil
+		}
+		if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&body); err != nil {
+			debugf("backend probe %s: body is not a JSON object: %v", path, err)
 			return nil, nil
 		}
 		return body, nil
@@ -288,10 +295,15 @@ func detectBackend(target *url.URL) string {
 	for _, p := range probes {
 		body, err := get(p.path)
 		if err != nil {
+			debugf("backend probe %s: %v", p.path, err)
 			return "" // unreachable; don't wait for the other probes
 		}
 		if _, ok := body[p.key]; ok {
+			debugf("backend probe %s: found %q, upstream is %s", p.path, p.key, p.name)
 			return p.name
+		}
+		if body != nil {
+			debugf("backend probe %s: no %q key, not %s", p.path, p.key, p.name)
 		}
 	}
 	return ""
@@ -392,9 +404,20 @@ func isAPIEndpoint(path string) bool {
 // requestInfo describes an incoming request; it travels to the response
 // side of the proxy via the request context.
 type requestInfo struct {
+	id     uint64 // sequence number, tells concurrent requests apart in debug lines
 	start  time.Time
 	method string
 	path   string
+}
+
+// requestSeq numbers forwarded requests for debug output.
+var requestSeq atomic.Uint64
+
+// debugf prints a [DEBUG] status line when logging.debug is enabled.
+func debugf(format string, args ...any) {
+	if cfg.Logging.Debug {
+		fmt.Fprintf(out, "[DEBUG] "+format+"\n", args...)
+	}
 }
 
 type requestInfoKey struct{}
@@ -407,7 +430,8 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	info := &requestInfo{start: time.Now(), method: r.Method, path: r.URL.Path}
+	info := &requestInfo{id: requestSeq.Add(1), start: time.Now(), method: r.Method, path: r.URL.Path}
+	debugf("req %d: %s %s from %s", info.id, r.Method, r.URL.RequestURI(), r.RemoteAddr)
 	ctx := context.WithValue(r.Context(), requestInfoKey{}, info)
 	proxy.ServeHTTP(w, r.WithContext(ctx))
 }
@@ -434,16 +458,27 @@ func newReverseProxy(target *url.URL) *httputil.ReverseProxy {
 // once the body has been streamed to the client.
 func meterResponse(resp *http.Response) error {
 	info, ok := resp.Request.Context().Value(requestInfoKey{}).(*requestInfo)
+	if !ok {
+		return nil
+	}
+	contentType := resp.Header.Get("Content-Type")
+	debugf("req %d: upstream %s -> %d after %.2fs, Content-Type %q",
+		info.id, resp.Request.URL, resp.StatusCode, time.Since(info.start).Seconds(), contentType)
 	// A 101 response body is used for the upgraded connection and must not be wrapped.
-	if !ok || resp.StatusCode == http.StatusSwitchingProtocols {
+	if resp.StatusCode == http.StatusSwitchingProtocols {
+		debugf("req %d: protocol upgrade, connection not inspected", info.id)
 		return nil
 	}
 
+	c := newCapture(contentType)
+	if c == nil {
+		debugf("req %d: Content-Type not inspected; only the duration is recorded", info.id)
+	}
 	resp.Body = &meteredBody{
 		ReadCloser: resp.Body,
 		info:       info,
 		status:     resp.StatusCode,
-		capture:    newCapture(resp.Header.Get("Content-Type")),
+		capture:    c,
 	}
 	return nil
 }
@@ -462,6 +497,7 @@ type meteredBody struct {
 	status    int
 	capture   capture // nil when the body is not inspected
 	firstByte time.Time
+	bytes     int64
 	eof       bool
 	once      sync.Once
 }
@@ -469,6 +505,7 @@ type meteredBody struct {
 func (b *meteredBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	if n > 0 {
+		b.bytes += int64(n)
 		if b.firstByte.IsZero() {
 			b.firstByte = time.Now()
 		}
@@ -507,10 +544,41 @@ func (b *meteredBody) finish() {
 			}
 		}
 		data.Duration = end.Sub(b.info.start)
-		data.completeDerived(streamTime)
+		basis := data.completeDerived(streamTime)
 
+		if cfg.Logging.Debug {
+			b.debugSummary(data, streamTime, basis)
+		}
 		recordQuery(b.info, b.status, data, b.eof)
 	})
+}
+
+// debugSummary explains how the metrics of a finished body were obtained.
+func (b *meteredBody) debugSummary(data MetricsData, streamTime time.Duration, basis string) {
+	id := b.info.id
+	ended := "at EOF"
+	if !b.eof {
+		ended = "before EOF (client disconnected or shutdown)"
+	}
+	if streamTime > 0 {
+		ended += fmt.Sprintf(", stream time %.2fs", streamTime.Seconds())
+	}
+	debugf("req %d: body ended %s after %d bytes", id, ended, b.bytes)
+	if b.capture == nil {
+		return
+	}
+
+	d := b.capture.diag()
+	debugf("req %d: parsed as %s: %d JSON document(s), %d invalid, %d skipped as larger than %d MiB",
+		id, d.name, d.documents, d.invalid, d.oversized, maxCaptureBytes>>20)
+	if basis != "" {
+		debugf("req %d: no tokens/s reported; estimated as %s", id, basis)
+	}
+	if !data.hasInference() {
+		debugf("req %d: no model, token or rate fields found; not counted as a query", id)
+	} else if d.name == "SSE" && data.TotalTokens == 0 {
+		debugf(`req %d: stream has no token usage; OpenAI-compatible clients must send "stream_options": {"include_usage": true}`, id)
+	}
 }
 
 // recordQuery updates the global metrics and prints a status line. Responses
@@ -537,6 +605,26 @@ type capture interface {
 	io.Writer
 	// finish returns the metrics found in everything written so far.
 	finish() MetricsData
+	// diag reports what was parsed, for debug output.
+	diag() captureDiag
+}
+
+// captureDiag counts the JSON documents (whole body, SSE events or NDJSON
+// lines) a capture has seen.
+type captureDiag struct {
+	name      string // "JSON", "SSE" or "NDJSON"
+	documents int    // parsed as JSON objects
+	invalid   int    // not valid JSON objects
+	oversized int    // bodies, lines or events skipped for exceeding maxCaptureBytes
+}
+
+// count records the outcome of parsing one document.
+func (d *captureDiag) count(ok bool) {
+	if ok {
+		d.documents++
+	} else {
+		d.invalid++
+	}
 }
 
 // newCapture returns a capture for bodies of the given Content-Type, or nil
@@ -558,6 +646,7 @@ func newCapture(contentType string) capture {
 type jsonCapture struct {
 	buf      bytes.Buffer
 	overflow bool
+	d        captureDiag
 }
 
 func (c *jsonCapture) Write(p []byte) (int, error) {
@@ -574,18 +663,25 @@ func (c *jsonCapture) Write(p []byte) (int, error) {
 
 func (c *jsonCapture) finish() MetricsData {
 	var d MetricsData
-	if !c.overflow {
-		d.mergeJSON(c.buf.Bytes())
+	c.d = captureDiag{name: "JSON"}
+	switch {
+	case c.overflow:
+		c.d.oversized = 1
+	case c.buf.Len() > 0:
+		c.d.count(d.mergeJSON(c.buf.Bytes()))
 	}
 	return d
 }
+
+func (c *jsonCapture) diag() captureDiag { return c.d }
 
 // lineSplitter splits a body written in arbitrary chunks into lines and
 // passes each line, without its "\n" or "\r\n" terminator, to emit. Lines
 // longer than maxCaptureBytes are discarded.
 type lineSplitter struct {
-	line     []byte // incomplete line carried over between writes
-	skipLine bool   // current line exceeds maxCaptureBytes and is discarded
+	line      []byte // incomplete line carried over between writes
+	skipLine  bool   // current line exceeds maxCaptureBytes and is discarded
+	oversized int    // number of lines discarded
 }
 
 func (s *lineSplitter) write(p []byte, emit func(line []byte)) {
@@ -622,6 +718,7 @@ func (s *lineSplitter) appendLine(p []byte) {
 	}
 	if len(s.line)+len(p) > maxCaptureBytes {
 		s.line, s.skipLine = s.line[:0], true
+		s.oversized++
 		return
 	}
 	s.line = append(s.line, p...)
@@ -634,6 +731,7 @@ type sseCapture struct {
 	lines   lineSplitter
 	data    []byte // data field of the event being assembled
 	metrics MetricsData
+	d       captureDiag
 }
 
 func (c *sseCapture) Write(p []byte) (int, error) {
@@ -649,6 +747,7 @@ func (c *sseCapture) processLine(line []byte) {
 		value := bytes.TrimPrefix(line[len("data:"):], []byte(" "))
 		if len(c.data)+len(value) > maxCaptureBytes {
 			c.data = c.data[:0]
+			c.d.oversized++
 			return
 		}
 		if len(c.data) > 0 {
@@ -662,7 +761,7 @@ func (c *sseCapture) processLine(line []byte) {
 
 func (c *sseCapture) dispatch() {
 	if len(c.data) > 0 && !bytes.Equal(c.data, []byte("[DONE]")) {
-		c.metrics.mergeJSON(c.data)
+		c.d.count(c.metrics.mergeJSON(c.data))
 	}
 	c.data = c.data[:0]
 }
@@ -673,22 +772,43 @@ func (c *sseCapture) finish() MetricsData {
 	return c.metrics
 }
 
+func (c *sseCapture) diag() captureDiag {
+	d := c.d
+	d.name = "SSE"
+	d.oversized += c.lines.oversized
+	return d
+}
+
 // ndjsonCapture parses a newline-delimited JSON body (Ollama's native
 // streaming format) line by line. Metrics from later lines override earlier
 // ones; Ollama reports its stats in the final "done" line.
 type ndjsonCapture struct {
 	lines   lineSplitter
 	metrics MetricsData
+	d       captureDiag
 }
 
 func (c *ndjsonCapture) Write(p []byte) (int, error) {
-	c.lines.write(p, c.metrics.mergeJSON)
+	c.lines.write(p, c.processLine)
 	return len(p), nil
 }
 
+func (c *ndjsonCapture) processLine(line []byte) {
+	if len(bytes.TrimSpace(line)) > 0 {
+		c.d.count(c.metrics.mergeJSON(line))
+	}
+}
+
 func (c *ndjsonCapture) finish() MetricsData {
-	c.lines.flush(c.metrics.mergeJSON)
+	c.lines.flush(c.processLine)
 	return c.metrics
+}
+
+func (c *ndjsonCapture) diag() captureDiag {
+	d := c.d
+	d.name = "NDJSON"
+	d.oversized += c.lines.oversized
+	return d
 }
 
 // llmPayload is the subset of upstream response fields used for metrics. It
@@ -725,15 +845,19 @@ type llmPayload struct {
 	Response json.RawMessage `json:"response"`
 }
 
-// mergeJSON applies the metrics found in a JSON document to d. Documents
-// that are not JSON objects are ignored; a field of unexpected type is
-// skipped without discarding the others.
-func (d *MetricsData) mergeJSON(raw []byte) {
+// mergeJSON applies the metrics found in a JSON document to d and reports
+// whether it was a JSON object. Other documents are ignored; a field of
+// unexpected type is skipped without discarding the others.
+func (d *MetricsData) mergeJSON(raw []byte) bool {
 	var p llmPayload
 	var typeErr *json.UnmarshalTypeError
-	if err := json.Unmarshal(raw, &p); err == nil || errors.As(err, &typeErr) {
-		d.merge(&p)
+	err := json.Unmarshal(raw, &p)
+	// A type error without a field is the document itself (array, string, ...).
+	if err != nil && (!errors.As(err, &typeErr) || typeErr.Field == "") {
+		return false
 	}
+	d.merge(&p)
+	return true
 }
 
 // merge applies the metrics in p, including wrapped payloads, to d. Fields
@@ -788,27 +912,33 @@ func setFirstPositive(dst *int, vals ...int) {
 
 // completeDerived fills in totals and throughput the upstream did not report.
 // streamTime is the time between the first and last body byte of a streamed
-// response, or 0 if the response was not streamed.
-func (d *MetricsData) completeDerived(streamTime time.Duration) {
+// response, or 0 if the response was not streamed. It returns how the rate
+// was estimated, or "" if it was reported or could not be estimated.
+func (d *MetricsData) completeDerived(streamTime time.Duration) (basis string) {
 	if d.TotalTokens == 0 {
 		d.TotalTokens = d.PromptTokens + d.CompletionTokens
 	}
 	if d.TokensPerSecond > 0 || d.CompletionTokens == 0 {
-		return
+		return ""
 	}
 
 	// Estimate generation time; for non-streamed responses without a
 	// reported time to first token this includes prompt processing.
 	genTime := d.Duration
+	basis = "completion tokens / request duration (includes prompt processing)"
 	if d.TimeToFirstToken > 0 && d.TimeToFirstToken < genTime {
 		genTime -= d.TimeToFirstToken
+		basis = "completion tokens / (request duration - time to first token)"
 	} else if streamTime > 0 {
 		genTime = streamTime
+		basis = "completion tokens / stream time (first to last body byte)"
 	}
-	if genTime > 0 {
-		d.TokensPerSecond = float64(d.CompletionTokens) / genTime.Seconds()
-		d.TPSEstimated = true
+	if genTime <= 0 {
+		return ""
 	}
+	d.TokensPerSecond = float64(d.CompletionTokens) / genTime.Seconds()
+	d.TPSEstimated = true
+	return basis
 }
 
 // hasInference reports whether d describes a model query rather than, for

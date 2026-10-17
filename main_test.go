@@ -930,6 +930,116 @@ func TestProxyWritesQueriesToCSV(t *testing.T) {
 	}
 }
 
+func TestCaptureDiag(t *testing.T) {
+	tests := []struct {
+		contentType, body string
+		want              captureDiag
+	}{
+		{"application/json", chatCompletionJSON, captureDiag{name: "JSON", documents: 1}},
+		{"application/json", "not json", captureDiag{name: "JSON", invalid: 1}},
+		{"application/json", "", captureDiag{name: "JSON"}},
+		{"text/event-stream", "data: {\"model\":\"m\"}\n\ndata: oops\n\n: comment\n\ndata: [DONE]\n\n", captureDiag{name: "SSE", documents: 1, invalid: 1}},
+		{"application/x-ndjson", "{\"model\":\"m\"}\n\n[1,2]\n{\"done\":true}", captureDiag{name: "NDJSON", documents: 2, invalid: 1}},
+	}
+	for _, tt := range tests {
+		c := newCapture(tt.contentType)
+		io.WriteString(c, tt.body)
+		c.finish()
+		if got := c.diag(); got != tt.want {
+			t.Errorf("%s %q: diag = %+v, want %+v", tt.contentType, tt.body, got, tt.want)
+		}
+	}
+
+	var s lineSplitter
+	s.write(bytes.Repeat([]byte("x"), maxCaptureBytes+1), func([]byte) {})
+	s.write([]byte("\nshort\n"), func([]byte) {})
+	if s.oversized != 1 {
+		t.Errorf("lineSplitter.oversized = %d, want 1", s.oversized)
+	}
+}
+
+func TestDebugLogging(t *testing.T) {
+	target := startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/chat/completions": // non-streamed, usage but no rate: TPS estimated
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, chatCompletionJSON)
+		case "/v1/stream": // streamed without include_usage
+			w.Header().Set("Content-Type", "text/event-stream")
+			io.WriteString(w, "data: {\"model\":\"m\",\"choices\":[]}\n\ndata: oops\n\ndata: [DONE]\n\n")
+		default:
+			w.Header().Set("Content-Type", "text/plain")
+			io.WriteString(w, "hello")
+		}
+	}))
+
+	t.Run("off", func(t *testing.T) {
+		srv, logs := startProxy(t, target)
+		resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		readAll(t, resp.Body)
+		waitForQueries(t, 1)
+		if strings.Contains(logs.String(), "[DEBUG]") {
+			t.Errorf("debug lines printed with logging.debug off:\n%s", logs)
+		}
+	})
+
+	for _, tt := range []struct {
+		path string
+		want []string
+	}{
+		{"/v1/chat/completions", []string{
+			"POST /v1/chat/completions from 127.0.0.1:",
+			"upstream http://" + target.Host + "/v1/chat/completions -> 200 after",
+			`Content-Type "application/json"`,
+			fmt.Sprintf("body ended at EOF after %d bytes", len(chatCompletionJSON)),
+			"parsed as JSON: 1 JSON document(s), 0 invalid, 0 skipped",
+			"estimated as completion tokens / request duration",
+		}},
+		{"/v1/stream", []string{
+			"parsed as SSE: 1 JSON document(s), 1 invalid, 0 skipped",
+			`must send "stream_options": {"include_usage": true}`,
+		}},
+		{"/v1/text", []string{
+			`Content-Type "text/plain"`,
+			"Content-Type not inspected",
+			"body ended at EOF after 5 bytes",
+		}},
+	} {
+		t.Run(tt.path, func(t *testing.T) {
+			srv, logs := startProxy(t, target)
+			cfg.Logging.Debug = true
+			resp, err := http.Post(srv.URL+tt.path, "application/json", strings.NewReader(`{}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			readAll(t, resp.Body)
+			waitFor(t, "the request to finish", func() bool { return strings.Contains(logs.String(), "body ended") })
+
+			got := logs.String()
+			for _, w := range tt.want {
+				if !strings.Contains(got, w) {
+					t.Errorf("debug output missing %q:\n%s", w, got)
+				}
+			}
+			// All debug lines of one request carry the same request ID.
+			ids := map[string]bool{}
+			for _, line := range strings.Split(strings.TrimSpace(got), "\n") {
+				if rest, ok := strings.CutPrefix(line, "[DEBUG] req "); ok {
+					ids[strings.SplitN(rest, ":", 2)[0]] = true
+				}
+			}
+			if len(ids) != 1 {
+				t.Errorf("want one request ID across debug lines, got %v", ids)
+			}
+		})
+	}
+}
+
 func TestConcurrentRequests(t *testing.T) {
 	target := startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1008,10 +1118,13 @@ func TestCompleteDerived(t *testing.T) {
 	}
 	for _, tt := range tests {
 		d := tt.in
-		d.completeDerived(tt.streamTime)
+		basis := d.completeDerived(tt.streamTime)
 		if d.TotalTokens != tt.wantTotal || d.TokensPerSecond != tt.wantTPS || d.TPSEstimated != tt.wantEst {
 			t.Errorf("%s: total %d, tps %v, est %v; want %d, %v, %v",
 				tt.name, d.TotalTokens, d.TokensPerSecond, d.TPSEstimated, tt.wantTotal, tt.wantTPS, tt.wantEst)
+		}
+		if (basis != "") != tt.wantEst {
+			t.Errorf("%s: basis %q, want one exactly when the rate is estimated", tt.name, basis)
 		}
 	}
 }

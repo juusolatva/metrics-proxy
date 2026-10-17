@@ -28,5 +28,6 @@ metrics:
 
 # Logging settings
 logging:
-  # Debug logging (not implemented yet; has no effect)
+  # Print [DEBUG] lines: effective config, backend probe, and per request the
+  # upstream status, Content-Type, parser used and how metrics were derived.
   debug: false
