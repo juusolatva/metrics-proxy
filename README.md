@@ -1,5 +1,11 @@
 # metrics proxy
 
+[![CI](https://github.com/juusolatva/metrics_proxy/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/juusolatva/metrics_proxy/actions/workflows/ci.yml)
+[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=juusolatva_metrics_proxy&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=juusolatva_metrics_proxy)
+[![Coverage](https://sonarcloud.io/api/project_badges/measure?project=juusolatva_metrics_proxy&metric=coverage)](https://sonarcloud.io/summary/new_code?id=juusolatva_metrics_proxy)
+[![Go version](https://img.shields.io/github/go-mod/go-version/juusolatva/metrics_proxy)](go.mod)
+[![License: MIT](https://img.shields.io/github/license/juusolatva/metrics_proxy)](LICENSE)
+
 A lightweight HTTP reverse proxy that sits between an LLM client and a local
 LLM server and prints inference metrics for every query: model, token counts,
 tokens per second, time to first token and duration, plus running aggregates.
