@@ -41,9 +41,6 @@ type LmStudioConfig struct {
 	Port int    `yaml:"port"`
 }
 
-// MetricsConfig holds metrics settings. The former "mode" and
-// "refresh_interval_ms" keys were never implemented and are now ignored
-// (parseConfig doesn't reject unknown keys, so old config files still load).
 type MetricsConfig struct {
 	HistoryPoints int `yaml:"history_points"`
 }
@@ -223,10 +220,13 @@ func loadConfig(path string) error {
 	return nil
 }
 
-// parseConfig unmarshals YAML configuration and fills in defaults for unset fields.
+// parseConfig unmarshals YAML configuration and fills in defaults for unset
+// fields. Unknown keys (typos, removed settings) are errors.
 func parseConfig(data []byte) (Config, error) {
 	var c Config
-	if err := yaml.Unmarshal(data, &c); err != nil {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)                                             // reject misspelled and unsupported keys
+	if err := dec.Decode(&c); err != nil && !errors.Is(err, io.EOF) { // EOF: empty file
 		return c, fmt.Errorf("failed to parse config file: %w", err)
 	}
 
@@ -238,6 +238,9 @@ func parseConfig(data []byte) (Config, error) {
 	}
 	if c.LmStudio.Port == 0 {
 		c.LmStudio.Port = 1234
+	}
+	if len(c.APIEndpoints) == 0 {
+		c.APIEndpoints = []string{"/api/v1/*", "/v1/*"} // LM Studio native + OpenAI-compatible
 	}
 	if c.Metrics.HistoryPoints <= 0 {
 		c.Metrics.HistoryPoints = 10

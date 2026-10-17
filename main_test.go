@@ -143,12 +143,23 @@ func TestIsAPIEndpoint(t *testing.T) {
 }
 
 func TestParseConfigDefaults(t *testing.T) {
-	c, err := parseConfig([]byte("api_endpoints: [\"/v1/*\"]\n"))
+	for _, data := range []string{"", "# only a comment\n", "proxy_port: 0\napi_endpoints: []\n"} {
+		c, err := parseConfig([]byte(data))
+		if err != nil {
+			t.Fatalf("%q: %v", data, err)
+		}
+		if c.ProxyPort != 8080 || c.LmStudio.Host != "localhost" || c.LmStudio.Port != 1234 || c.Metrics.HistoryPoints != 10 ||
+			fmt.Sprint(c.APIEndpoints) != "[/api/v1/* /v1/*]" {
+			t.Errorf("%q: defaults not applied: %+v", data, c)
+		}
+	}
+
+	c, err := parseConfig([]byte("api_endpoints: [\"/api/*\"]\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.ProxyPort != 8080 || c.LmStudio.Host != "localhost" || c.LmStudio.Port != 1234 || c.Metrics.HistoryPoints != 10 {
-		t.Errorf("defaults not applied: %+v", c)
+	if fmt.Sprint(c.APIEndpoints) != "[/api/*]" {
+		t.Errorf("APIEndpoints = %q, want the configured list only", c.APIEndpoints)
 	}
 }
 
@@ -166,14 +177,16 @@ func TestParseConfigFile(t *testing.T) {
 	}
 }
 
-func TestParseConfigIgnoresRemovedKeys(t *testing.T) {
-	// metrics.mode and refresh_interval_ms were removed; old files must load.
-	c, err := parseConfig([]byte("metrics:\n  mode: \"periodic\"\n  refresh_interval_ms: 500\n  history_points: 3\n"))
-	if err != nil {
-		t.Fatalf("old config with removed keys rejected: %v", err)
-	}
-	if c.Metrics.HistoryPoints != 3 {
-		t.Errorf("HistoryPoints = %d, want 3", c.Metrics.HistoryPoints)
+func TestParseConfigRejectsUnknownKeys(t *testing.T) {
+	for _, tt := range []struct{ data, want string }{
+		{"metrics:\n  histroy_points: 5\n", "line 2: field histroy_points not found"},
+		{"proxy_port: 8080\nproxyport: 9090\n", "line 2: field proxyport not found"},
+		{"metrics:\n  mode: \"periodic\"\n", "field mode not found"}, // removed setting
+		{"upstream:\n  host: x\n", "field upstream not found"},
+	} {
+		if _, err := parseConfig([]byte(tt.data)); err == nil || !strings.Contains(err.Error(), tt.want) {
+			t.Errorf("%q: err = %v, want it to contain %q", tt.data, err, tt.want)
+		}
 	}
 }
 

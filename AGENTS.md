@@ -130,8 +130,8 @@ logging:
 
 ### Configuration Notes
 - The config path comes from `--config` (`parseFlags()`), default `config.yaml`. Relative paths are resolved against the working directory, not the binary's location. A missing, unreadable or invalid file exits with status 1 and an error naming the file. Positional arguments (e.g. `metrics_proxy my.yaml`) are rejected with exit status 2 instead of being ignored.
-- `parseConfig()` applies defaults for unset fields: `proxy_port` 8080, `lm_studio` `localhost:1234`, `history_points` 10. `api_endpoints` has no default: a file without it forwards nothing (every request gets 404).
-- `parseConfig()` uses non-strict YAML decoding, so unknown keys are ignored. That keeps old files loading after a key is removed: `metrics.mode` and `metrics.refresh_interval_ms` were dropped (never implemented), and `TestParseConfigIgnoresRemovedKeys` guards it. The flip side is that a typo in a key name is silently ignored.
+- `parseConfig()` applies defaults for unset fields: `proxy_port` 8080, `lm_studio` `localhost:1234`, `history_points` 10, and `api_endpoints` `["/api/v1/*", "/v1/*"]` (also when given as an empty list). An empty config file is valid (`io.EOF` from the decoder is treated as "no settings").
+- `parseConfig()` decodes strictly (`yaml.Decoder.KnownFields(true)`): unknown keys, i.e. typos or removed settings, fail with `field <key> not found in type main.<Struct>` and the line number (`TestParseConfigRejectsUnknownKeys`). `metrics.mode` and `metrics.refresh_interval_ms` were removed (never implemented), so old files containing them now fail to load until the keys are deleted. Removing or renaming a key has the same effect, so mention it in README.md.
 - `logging.debug` is parsed but has no runtime behavior yet.
 - The `lm_studio` key names the upstream regardless of server type; to front Ollama, point it at `localhost:11434` and add `"/api/*"` (Ollama native `/api/chat`, `/api/generate`) to `api_endpoints`. Keep the key name for backward compatibility; an alias (e.g. `upstream`) would have to fall back to it.
 
@@ -196,7 +196,7 @@ All application logic is currently contained in `main.go`:
 4. **Do not buffer response bodies before forwarding**:
    - Bodies must stay streamed through `meteredBody`; reading the body in `ModifyResponse` would also hold back response headers and break SSE. `TestProxyStreamsSSEWithoutBuffering` guards this.
 5. **Unimplemented configuration**:
-   - `logging.debug` is parsed but has no effect. (`metrics.mode` and `metrics.refresh_interval_ms` were removed; old files containing them still load.)
+   - `logging.debug` is parsed but has no effect. (`metrics.mode` and `metrics.refresh_interval_ms` were removed and are now rejected as unknown keys.)
 6. **Shutdown waits for in-flight requests**:
    - The first signal waits up to `shutdownTimeout` (60 s, a constant, not configurable) for running generations; a second signal aborts them. Tests drive `serve()` directly with their own contexts and timeout (`startServe`), not real signals. Aggregates are in memory only and are lost on exit; with `--csv`, per-query rows are kept in the file.
    - `--csv` does not check an existing file's header. Appending to a CSV with different columns (e.g. from a future version) mixes formats.
@@ -211,7 +211,7 @@ All application logic is currently contained in `main.go`:
 
 - **Standard Library First**: Prefer Go standard library packages (`net/http`, `net/http/httputil`, `sync`, `time`, `encoding/json`) over introducing new dependencies.
 - **Maintain Concurrency Safety**: Ensure `metrics.mu` write locks are held when updating state and read locks when reading state. Avoid holding locks across network I/O.
-- **Preserve Configuration Compatibility**: Keep `config.yaml` schema backward-compatible when adding new features or configurations.
+- **Configuration Compatibility**: New options must be optional with sane defaults, so existing files keep working. Config parsing is strict: removing or renaming a key makes files that still use it fail with an "unknown field" error. That is acceptable for unused settings (as with `metrics.mode`); note it in README.md.
 - **Testing**: Whenever fixing bugs or adding features, write corresponding unit tests using `net/http/httptest` to verify proxying, metrics parsing, and concurrent safety.
 - **Git Hygiene**: Do not commit build artifacts (`metrics_proxy`, `.exe`) or temporary files.
 - **Merges**: Before committing a merge, run `git diff --check` and `go build ./... && go test -race ./...`; conflict markers have been committed to `main` before (merge `6a83ff7`, fixed afterwards).

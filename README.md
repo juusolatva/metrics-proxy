@@ -109,10 +109,13 @@ metrics:
 To front Ollama, set the upstream to `localhost:11434` and add `"/api/*"` to
 `api_endpoints`.
 
-Unset values fall back to the defaults shown above, except `api_endpoints`:
-without it, nothing is forwarded. `logging.debug` is accepted but has no
-effect yet. The old `metrics.mode` and `metrics.refresh_interval_ms` settings
-have been removed; config files that still contain them load fine.
+Unset values fall back to the defaults shown above; an empty file is a valid
+config for LM Studio on `localhost:1234`. Unknown or misspelled keys are an
+error naming the key and line, e.g.
+`line 3: field histroy_points not found in type main.MetricsConfig`. This
+includes the removed `metrics.mode` and `metrics.refresh_interval_ms`
+settings, so delete them from older config files. `logging.debug` is
+accepted but has no effect yet.
 
 ## Limitations
 
