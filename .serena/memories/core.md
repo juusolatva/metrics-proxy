@@ -5,7 +5,7 @@ HTTP reverse proxy between LLM clients and a local LLM server (LM Studio primary
 ## Source map
 - `main.go` — entire app (single `package main`): config (`loadConfig`, `parseConfig` with defaults), startup banner backend probe (`detectBackend`), server (`runProxy`, `serve` with graceful shutdown driven by `stop`/`force` contexts created in `main` (with `defer cancel()`) and cancelled by `setupSignalHandling(onFirst, onSecond)`, `handleRequest`), forwarding (`newReverseProxy`, `meterResponse`), body inspection (`meteredBody`, `newCapture` → `jsonCapture` / `sseCapture` / `ndjsonCapture`, streaming ones share `lineSplitter`), payload parsing (`llmPayload`, `MetricsData.merge`), aggregation (`updateGlobalMetrics`), terminal output (`displayMetrics`), CSV output (`--csv` flag → `openCSVLog` / `csvRecorder`, global `csvLog`).
 - `main_test.go` — httptest tests; `startUpstream`/`startProxy` helpers reset globals.
-- `testdata/` — real captured responses: `lm_*` LM Studio (native v1 + OpenAI-compat, JSON + SSE), `ol_*` Ollama (native JSON + NDJSON stream, OpenAI-compat SSE). Recaptured on 2026-10-17 (12 files, committed; `.gitattributes` sets `testdata/** -text`). LM Studio `qwen/qwen2.5-coder-14b` with speculative decoding (draft 0.5B; intended, user wants it tested), Ollama `qwen3:4b-instruct-2507-q8_0`. Prompt `Count from 1 to 5, separated by spaces.`. Covers /api/v1/chat, /v1/chat/completions (JSON, stream with/without include_usage), Ollama /api/chat, /api/generate. Read via `readFixture()` (fails if missing). Old captures are in git history (`eed1e06`).
+- `testdata/` — real captured response bodies: `lm_*` LM Studio, `ol_*` Ollama. Recaptured on 2026-10-17 (12 files, committed; `.gitattributes` sets `testdata/** -text`). LM Studio `qwen/qwen2.5-coder-14b` with speculative decoding (draft 0.5B; intended, user wants it tested), Ollama `qwen3:4b-instruct-2507-q8_0`. Prompt `Count from 1 to 5, separated by spaces.`. Covers /api/v1/chat, /v1/chat/completions (JSON, stream with/without include_usage), Ollama /api/chat, /api/generate. Read via `readFixture()` (fails if missing). Old captures are in git history (`eed1e06`).
 - `docs/windows-testing.md` — checklist for testing on Windows 11 (Ctrl+C/shutdown, Excel CSV lock and separators, paths, firewall/reserved ports, CRLF, slow refused connections in tests).
 - `config.yaml` — default runtime config; path set by `--config` (default `config.yaml`, relative to CWD).
 - `AGENTS.md` (included by `CLAUDE.md`) — authoritative dev guide: architecture walkthrough (§5), config reference (§4), known limitations (§6), modification guidelines (§7). Read it instead of duplicating here.
@@ -27,13 +27,15 @@ HTTP reverse proxy between LLM clients and a local LLM server (LM Studio primary
 - Config key `lm_studio` names the upstream for any server type; keep it (backward compat).
 - Responses without model/tokens/TPS are not counted as queries.
 - Shutdown: the first SIGINT/SIGTERM triggers `server.Shutdown`, waiting up to `shutdownTimeout` (60 s) for in-flight streams. A second signal or the timeout triggers `server.Close`, and cut-off queries are logged `incomplete`. Exit status is 0 either way. Test `serve` via the `startServe` helper with your own contexts, not real signals.
-- TPS not reported by the upstream is derived in `completeDerived`, which sets `MetricsData.TPSEstimated`; the status line shows `(est.)`. LM Studio OpenAI-compat JSON has empty `stats: {}`, so its TPS is always estimated (badly understated for short replies).
+- TPS not reported by the upstream is derived in `completeDerived`, which sets `MetricsData.TPSEstimated`; the status line shows `(est.)`. LM Studio OpenAI-compat (`/v1/*`, streamed or not) never reports a rate: `stats` is empty or, with speculative decoding, holds only draft counters. So its TPS is always estimated (non-streamed: badly understated for short replies).
 - TTFT comes only from LM Studio native `/api/v1/*`; Ollama (native + OpenAI-compat) and LM Studio OpenAI-compat don't report it, so no `TTFT` field for them.
 - LM Studio answers unknown endpoints with HTTP 200 + `{"error":...}` (Ollama: 404). Never identify the server by status code; `detectBackend` checks for a known JSON key per probe.
-- Verified live on 2026-10-17 against LM Studio and Ollama (all native/OpenAI-compat endpoints, streamed and not).
+- Verified live on 2026-10-17 against LM Studio and Ollama (all native/OpenAI-compat endpoints, streamed and not). Not yet run on Windows (cross-compiles; checklist in `docs/windows-testing.md`).
+- `proxyError` answers 502 "Failed to connect to the upstream LLM server". User-facing text must not assume LM Studio (banner, errors); only the `lm_studio` config key keeps the name.
 
 ## Further memories
 - Language/deps/version pins: `mem:tech_stack`
 - Build/run/test/lint commands: `mem:suggested_commands`
 - Code style and design rules (stdlib-first, testing approach): `mem:conventions`
 - Checks required before declaring a task done: `mem:task_completion`
+- SonarCloud project, how to read its open issues, rules hit so far and the local complexity check: `mem:sonarcloud`

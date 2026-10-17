@@ -73,7 +73,7 @@ The current captures were taken on 2026-10-17. All of them used the prompt `Coun
   ```
 
 ### Testing
-Tests live in `main_test.go`. They start a fake upstream and the proxy with `httptest`, and reset the global state (`cfg`, `metrics`, `proxy`, `out`) per test via `startProxy()`. Metrics are recorded on the proxy's goroutine, so tests wait for them with `waitFor`/`waitForQueries` instead of asserting immediately.
+Tests live in `main_test.go`. They start a fake upstream and the proxy with `httptest`, and reset the global state (`cfg`, `metrics`, `proxy`, `out`, `csvLog`) per test via `startProxy()`. Graceful-shutdown tests run the proxy through `serve()` with their own contexts via `startServe()`. Metrics are recorded on the proxy's goroutine, so tests wait for them with `waitFor`/`waitForQueries` instead of asserting immediately.
 
 Parser tests should use the captured payloads in `testdata/` (read with `readFixture()`) rather than hand-written JSON where possible. `TestCaptureFixtures` feeds every capture whole and in 1-byte chunks, to exercise chunk boundaries, and checks the model, tokens, TPS, TTFT and that no document was invalid. `TestProxyOllamaNativeNDJSON` sends a capture end to end through the proxy. When adding support for a new upstream or endpoint, capture a real response (JSON and streamed) with a `<upstream>_<api>[_stream][_variant].<ext>` name, using `curl -sN -o testdata/<file>` directly against the server, and add it to `TestCaptureFixtures`. Captures are committed; check them for anything private before adding them.
 
@@ -155,7 +155,7 @@ All application logic is currently contained in `main.go`:
 
 ### Global State
 - `cfg` (`Config`): Global configuration parsed once at startup.
-- `proxy` (`*httputil.ReverseProxy`): Reverse proxy to LM Studio, built by `newReverseProxy()`.
+- `proxy` (`*httputil.ReverseProxy`): Reverse proxy to the upstream server, built by `newReverseProxy()`.
 - `metrics` (`Metrics`): Thread-safe in-memory metrics store protected by `metrics.mu` (`sync.RWMutex`).
 - `out` (`io.Writer`): Destination for per-request status lines (stdout; replaced in tests).
 - `csvLog` (`*csvRecorder`): Per-query CSV output opened by `openCSVLog()` when `--csv` is given; `nil` when disabled (reset by `startProxy()` in tests).
@@ -172,11 +172,11 @@ All application logic is currently contained in `main.go`:
 2. **Request Routing (`handleRequest`)**:
    - Validates incoming path against `cfg.APIEndpoints` using `isAPIEndpoint()` (prefix match, trailing `*` stripped).
    - Returns `404 Not Found` if the path does not match any configured prefix.
-   - Stores a `requestInfo` (start time, method, path) in the request context and calls `proxy.ServeHTTP`.
+   - Stores a `requestInfo` (request ID, start time, method, path) in the request context and calls `proxy.ServeHTTP`.
 3. **Forwarding (`newReverseProxy`)**:
    - `Rewrite` points the request at the upstream, sets `X-Forwarded-*`, and drops `Accept-Encoding` so the transport decompresses bodies before they are inspected.
    - `FlushInterval: -1` flushes every write, so streamed tokens reach the client immediately.
-   - `ErrorHandler` (`proxyError`) logs and returns `502 Bad Gateway`.
+   - `ErrorHandler` (`proxyError`) logs an `[ERROR]` line and returns `502 Bad Gateway` ("Failed to connect to the upstream LLM server").
 4. **Metrics Capture (`meterResponse` → `meteredBody`)**:
    - `ModifyResponse` wraps the upstream body in a `meteredBody` (except `101` upgrades). As the proxy copies the body to the client, each chunk is also written to a `capture` chosen by Content-Type (`newCapture`): `jsonCapture` (buffers, parses at end), `sseCapture` (`text/event-stream`, parses event by event) or `ndjsonCapture` (`application/x-ndjson`, Ollama native streaming, parses line by line). The streaming captures share a `lineSplitter`. Other content types are not inspected. Captures are bounded by `maxCaptureBytes` (16 MiB); oversized bodies/lines are proxied but not parsed.
    - On EOF or `Close` (e.g. client disconnect), `finish()` runs once: gets `MetricsData` from the capture, sets the duration, and fills totals/TPS the upstream didn't report (`completeDerived`; for streamed captures the first-to-last-byte time is used as generation time). A derived TPS sets `MetricsData.TPSEstimated`, and the status line shows it as `TPS: 40.98 (est.)`.
@@ -209,7 +209,7 @@ All application logic is currently contained in `main.go`:
 2. **Derived TPS is an estimate**:
    - When the upstream reports no `tokens_per_second`, `completeDerived()` computes completion tokens / generation time. For non-streamed responses without a reported time to first token, that time includes prompt processing, so TPS is understated.
    - Estimated values are marked `(est.)` in the status line but still count towards the `Avg … tok/s` over `History`.
-   - The error grows as replies get shorter, since request overhead dominates: in a live test, a 6-token non-streamed LM Studio `/v1/chat/completions` reply showed ~41 tok/s against a real ~250. LM Studio's OpenAI-compatible JSON responses carry an empty `stats: {}`, so their TPS is always estimated.
+   - The error grows as replies get shorter, since request overhead dominates: in a live test, a 6-token non-streamed LM Studio `/v1/chat/completions` reply showed ~41 tok/s against a real ~250. LM Studio's OpenAI-compatible API (`/v1/*`) never reports a rate, streamed or not: `stats` is empty, or with speculative decoding holds only the draft counters. So its TPS is always estimated; for streams the stream time is used, which is closer.
 3. **Time to first token is only shown when the upstream reports it**:
    - Only the LM Studio native API (`/api/v1/*`) reports TTFT. Ollama (native and OpenAI-compatible) and LM Studio's OpenAI-compatible API don't, so their status lines have no `TTFT` field. For streamed responses it could be measured by the proxy (request start to first byte), which is not implemented.
 4. **Do not buffer response bodies before forwarding**:
@@ -224,6 +224,8 @@ All application logic is currently contained in `main.go`:
    - `go.mod` declares Go 1.21. Avoid standard library APIs newer than 1.21 (e.g. `http.ServeMux` method/wildcard patterns from 1.22) unless the `go` directive is bumped. The `min`/`max` builtins (1.21) are fine.
 8. **Single upstream, no auth/TLS options**:
    - The upstream is always `http://host:port`; there is no HTTPS upstream, API key injection, or per-endpoint routing.
+9. **Not yet tested on Windows**:
+   - The binary and tests cross-compile (`GOOS=windows go build ./... && GOOS=windows go vet ./... && GOOS=windows go test -c .`), but nothing has been run on Windows. `docs/windows-testing.md` lists what to check (Ctrl+C handling, Excel's CSV lock and separators, paths, firewall and reserved ports, slow refused connections in two tests).
 
 ---
 
@@ -233,6 +235,10 @@ All application logic is currently contained in `main.go`:
 - **Maintain Concurrency Safety**: Ensure `metrics.mu` write locks are held when updating state and read locks when reading state. Avoid holding locks across network I/O.
 - **Configuration Compatibility**: New options must be optional with sane defaults, so existing files keep working. Config parsing is strict: removing or renaming a key makes files that still use it fail with an "unknown field" error. That is acceptable for unused settings (as with `metrics.mode`); note it in README.md.
 - **Testing**: Whenever fixing bugs or adding features, write corresponding unit tests using `net/http/httptest` to verify proxying, metrics parsing, and concurrent safety.
+- **SonarCloud**: Pushed commits are analyzed automatically (project `juusolatva_metrics_proxy`, public). Rules hit so far:
+  - Keep each function's cognitive complexity at 15 or less, tests included (`go:S3776`). Move loop bodies, handlers and checks into named helpers. Check locally with `go run github.com/uudashr/gocognit/cmd/gocognit@v1.1.3 -over 15 .`, which scores function literals somewhat higher than Sonar.
+  - Defer a context's cancel function in the function that creates it (`godre:S8188`).
+  - Close response bodies with `defer resp.Body.Close()` right after the error check (`godre:S8208`).
 - **Git Hygiene**: Do not commit build artifacts (`metrics_proxy`, `.exe`) or temporary files.
 - **Merges**: Before committing a merge, run `git diff --check` and `go build ./... && go test -race ./...`; conflict markers have been committed to `main` before (merge `6a83ff7`, fixed afterwards).
-- **Keep docs in sync**: Behavior, config or limitation changes must update this file, `config.yaml` comments, and the affected `.serena/memories/` (committed, reviewed like code).
+- **Keep docs in sync**: Behavior, config or limitation changes must update this file, `README.md`, `config.yaml` comments, and the affected `.serena/memories/` (committed, reviewed like code).

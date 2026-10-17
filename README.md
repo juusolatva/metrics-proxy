@@ -37,6 +37,30 @@ Run `./metrics_proxy --help` to list all options.
 Point your client at the proxy instead of the LLM server, e.g.
 `http://localhost:8080/v1` instead of `http://localhost:1234/v1`.
 
+### Output
+
+On startup the proxy probes the upstream and names it in the banner
+(`Forwarding to Ollama at localhost:11434`). If the server is unreachable or
+not recognized, it prints `upstream … (server type not detected)` and proxies
+as usual.
+
+Each completed query prints a line like this:
+
+```
+[14:02:31] #3 POST /api/v1/chat 200 | Model: qwen3-8b | Tokens: 42 in / 311 out | TPS: 48.12 | TTFT: 0.21s | Time: 6.68s | Avg: 5.90s @ 47.80 tok/s | Total tokens: 1024
+```
+
+`Avg` is the average query duration over all queries and the average tokens
+per second over the last `history_points` queries. Requests without inference
+data (such as `/v1/models` or errors) are logged as `[Proxy]` lines and not
+counted. If the upstream can't be reached, the client gets
+`502 Bad Gateway` and the proxy logs an `[ERROR]` line.
+
+`TPS` is the rate reported by the server. When the server doesn't report one,
+the proxy estimates it and marks it `(est.)`, e.g. `TPS: 40.98 (est.)`. `TTFT`
+(time to first token) only appears when the server reports it (see
+[Limitations](#limitations)).
+
 ### Saving statistics to CSV
 
 ```bash
@@ -58,27 +82,6 @@ Values the server didn't report (tokens, TPS, TTFT) are left empty.
 `tps_estimated` is `true` when the TPS was estimated by the proxy (shown as
 `(est.)` in the terminal), and `complete` is `false` for responses that were
 cut off. Only per-query values are saved; the running averages are not.
-
-Each completed query prints a line like this:
-
-```
-[14:02:31] #3 POST /api/v1/chat 200 | Model: qwen3-8b | Tokens: 42 in / 311 out | TPS: 48.12 | TTFT: 0.21s | Time: 6.68s | Avg: 5.90s @ 47.80 tok/s | Total tokens: 1024
-```
-
-`Avg` is the average query duration over all queries and the average tokens
-per second over the last `history_points` queries. Requests without inference
-data (such as `/v1/models` or errors) are logged as `[Proxy]` lines and not
-counted.
-
-`TPS` is the rate reported by the server. When the server doesn't report one,
-the proxy estimates it and marks it `(est.)`, e.g. `TPS: 40.98 (est.)`. `TTFT`
-(time to first token) only appears when the server reports it (see
-[Limitations](#limitations)).
-
-On startup the proxy probes the upstream and names it in the banner
-(`Forwarding to Ollama at localhost:11434`). If the server is unreachable or
-not recognized, it prints `upstream … (server type not detected)` and proxies
-as usual.
 
 ### Stopping
 
@@ -104,6 +107,9 @@ api_endpoints:            # path prefixes to forward; others get 404
 
 metrics:
   history_points: 10      # recent queries to average tokens/sec over
+
+logging:
+  debug: false            # see "Debug output" below
 ```
 
 To front Ollama, set the upstream to `localhost:11434` and add `"/api/*"` to
@@ -142,15 +148,17 @@ apart. Request and response bodies are never logged.
 - When the upstream doesn't report tokens per second, it is estimated from the
   completion tokens and generation time and marked `(est.)`. For non-streamed
   responses this includes prompt processing and request overhead, so the
-  value is understated, badly so for short replies. LM Studio's
-  OpenAI-compatible API (`/v1/...`) never reports TPS for non-streamed
-  responses.
+  value is understated, badly so for short replies; for streams the time
+  between the first and last chunk is used, which is closer. LM Studio's
+  OpenAI-compatible API (`/v1/...`) never reports TPS, streamed or not.
 - Time to first token is only reported by LM Studio's native API
   (`/api/v1/...`). Ollama (native and OpenAI-compatible) and LM Studio's
   OpenAI-compatible API don't report it, so their lines have no `TTFT`.
 - One upstream over plain HTTP; no HTTPS upstream or API key injection.
 - Running totals and averages are kept in memory only and are lost when the
   proxy stops. Use `--csv` to keep per-query statistics.
+- Not yet tested on Windows. It builds for Windows, and
+  [docs/windows-testing.md](docs/windows-testing.md) lists what to check.
 
 ## Development
 
@@ -159,6 +167,9 @@ go test -race ./...
 go vet ./...
 gofmt -l .
 ```
+
+The parser tests use real responses captured from LM Studio and Ollama in
+`testdata/`. SonarCloud analyzes every push.
 
 See [AGENTS.md](AGENTS.md) for architecture and contribution guidelines.
 

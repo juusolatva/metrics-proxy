@@ -255,7 +255,7 @@ func parseConfig(data []byte) (Config, error) {
 	return c, nil
 }
 
-// upstreamURL returns the base URL of the configured LM Studio instance.
+// upstreamURL returns the base URL of the configured upstream server.
 func upstreamURL() *url.URL {
 	return &url.URL{
 		Scheme: "http",
@@ -486,7 +486,7 @@ func meterResponse(resp *http.Response) error {
 // proxyError reports upstream failures to the client as 502 Bad Gateway.
 func proxyError(w http.ResponseWriter, r *http.Request, err error) {
 	fmt.Fprintf(out, "[ERROR] %s %s: %v\n", r.Method, r.URL.Path, err)
-	http.Error(w, "Failed to connect to LM Studio", http.StatusBadGateway)
+	http.Error(w, "Failed to connect to the upstream LLM server", http.StatusBadGateway)
 }
 
 // meteredBody passes an upstream response body through to the reverse proxy,
