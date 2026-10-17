@@ -8,4 +8,4 @@
 - Deps: `go mod tidy`, `go mod verify`
 - Cognitive complexity (SonarCloud `go:S3776`): `go run github.com/uudashr/gocognit/cmd/gocognit@v1.1.3 -over 15 .`
 - Windows build check (from Linux): `GOOS=windows go build ./... && GOOS=windows go vet ./... && GOOS=windows go test -c -o /dev/null .`
-- Manual smoke test needs LM Studio on the configured host/port, or a stub upstream; proxy listens on `proxy_port` (default 8080).
+- Manual smoke test needs LM Studio on the configured host/port, or a stub upstream; proxy listens on `proxy_port` (default 11436).

@@ -60,12 +60,12 @@ If there is only time for one pass, these steps cover the likely problems
 ## 4. Network
 
 - [ ] **Firewall prompt:** the proxy listens on all network interfaces
-  (`:8080`), so Windows Firewall asks on first start. Check that clicking
+  (`:11436` by default), so Windows Firewall asks on first start. Check that clicking
   Cancel still allows connections from the same machine. If it's only used
   locally, a listen-address option for `127.0.0.1` would avoid the prompt.
-- [ ] **Reserved ports:** Hyper-V and WSL reserve port ranges, and 8080 is
-  sometimes among them. Startup then fails with an "access permissions"
-  error.
+- [ ] **Reserved ports:** Hyper-V and WSL reserve port ranges, and the
+  configured port can fall in one of them. Startup then fails with an
+  "access permissions" error.
   `netsh int ipv4 show excludedportrange protocol=tcp` lists the reserved
   ranges.
 - [ ] **Upstream offline at startup:** the banner should say

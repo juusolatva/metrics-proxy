@@ -3,8 +3,9 @@
 # Read from ./config.yaml by default; use --config <file> to load another file,
 # e.g. one per upstream server.
 
-# Port the proxy server listens on (default: 8080)
-proxy_port: 8080
+# Port the proxy server listens on (default: 11436, next to Ollama's 11434 and
+# a second instance's 11435; earlier versions used 8080)
+proxy_port: 11436
 
 # Upstream LLM server: LM Studio, Ollama or any OpenAI-compatible HTTP server.
 # The key is named "lm_studio" for backward compatibility, whatever the server.
@@ -14,12 +15,17 @@ lm_studio:
   host: "localhost"
   port: 1234
 
-# Request paths forwarded to the upstream; all other paths get 404.
-# Patterns are path prefixes; a trailing "*" is optional.
+# Request paths whose responses are metered. Patterns are path prefixes; a
+# trailing "*" is optional.
 api_endpoints:
   - "/api/v1/*"  # LM Studio native REST API
   - "/v1/*"      # OpenAI-compatible API (LM Studio, Ollama, others)
   # - "/api/*"   # Ollama native API (/api/chat, /api/generate)
+
+# Forward requests to other paths (e.g. /api/tags, /models) to the upstream
+# unmetered, so clients get the upstream's own answer (default: true).
+# false answers them with 404 without forwarding.
+forward_unmatched: true
 
 # Metrics settings
 metrics:

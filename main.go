@@ -32,8 +32,16 @@ type Config struct {
 	ProxyPort    int            `yaml:"proxy_port"`
 	LmStudio     LmStudioConfig `yaml:"lm_studio"`
 	APIEndpoints []string       `yaml:"api_endpoints"`
-	Metrics      MetricsConfig  `yaml:"metrics"`
-	Logging      LoggingConfig  `yaml:"logging"`
+	// ForwardUnmatched forwards paths outside APIEndpoints without metering
+	// them instead of answering 404. Unset means true (forwardsUnmatched).
+	ForwardUnmatched *bool         `yaml:"forward_unmatched"`
+	Metrics          MetricsConfig `yaml:"metrics"`
+	Logging          LoggingConfig `yaml:"logging"`
+}
+
+// forwardsUnmatched reports whether paths outside APIEndpoints are forwarded.
+func (c Config) forwardsUnmatched() bool {
+	return c.ForwardUnmatched == nil || *c.ForwardUnmatched
 }
 
 type LmStudioConfig struct {
@@ -123,8 +131,8 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Printf("Loaded config from %s\n", opts.configPath)
-	debugf("config: proxy_port=%d upstream=%s:%d api_endpoints=%q history_points=%d",
-		cfg.ProxyPort, cfg.LmStudio.Host, cfg.LmStudio.Port, cfg.APIEndpoints, cfg.Metrics.HistoryPoints)
+	debugf("config: proxy_port=%d upstream=%s:%d api_endpoints=%q forward_unmatched=%t history_points=%d",
+		cfg.ProxyPort, cfg.LmStudio.Host, cfg.LmStudio.Port, cfg.APIEndpoints, cfg.forwardsUnmatched(), cfg.Metrics.HistoryPoints)
 
 	if opts.csvPath != "" {
 		rec, err := openCSVLog(opts.csvPath)
@@ -238,7 +246,7 @@ func parseConfig(data []byte) (Config, error) {
 	}
 
 	if c.ProxyPort == 0 {
-		c.ProxyPort = 8080
+		c.ProxyPort = 11436 // clear of 8080 (llama.cpp and many others) and Ollama's 11434/11435
 	}
 	if c.LmStudio.Host == "" {
 		c.LmStudio.Host = "localhost"
@@ -408,6 +416,8 @@ type requestInfo struct {
 	start  time.Time
 	method string
 	path   string
+	// metered is false for paths outside api_endpoints (forward_unmatched).
+	metered bool
 }
 
 // requestSeq numbers forwarded requests for debug output.
@@ -424,14 +434,15 @@ type requestInfoKey struct{}
 
 // handleRequest processes incoming requests
 func handleRequest(w http.ResponseWriter, r *http.Request) {
-	if !isAPIEndpoint(r.URL.Path) {
+	metered := isAPIEndpoint(r.URL.Path)
+	if !metered && !cfg.forwardsUnmatched() {
 		fmt.Fprintf(out, "[Proxy] Non-API request: %s %s\n", r.Method, r.URL.Path)
 		http.NotFound(w, r)
 		return
 	}
 
-	info := &requestInfo{id: requestSeq.Add(1), start: time.Now(), method: r.Method, path: r.URL.Path}
-	debugf("req %d: %s %s from %s", info.id, r.Method, r.URL.RequestURI(), r.RemoteAddr)
+	info := &requestInfo{id: requestSeq.Add(1), start: time.Now(), method: r.Method, path: r.URL.Path, metered: metered}
+	debugf("req %d: %s %s from %s (metered: %t)", info.id, r.Method, r.URL.RequestURI(), r.RemoteAddr, metered)
 	ctx := context.WithValue(r.Context(), requestInfoKey{}, info)
 	proxy.ServeHTTP(w, r.WithContext(ctx))
 }
@@ -464,6 +475,12 @@ func meterResponse(resp *http.Response) error {
 	contentType := resp.Header.Get("Content-Type")
 	debugf("req %d: upstream %s -> %d after %.2fs, Content-Type %q",
 		info.id, resp.Request.URL, resp.StatusCode, time.Since(info.start).Seconds(), contentType)
+	if !info.metered {
+		// Logged when the headers arrive; the body is passed through as is.
+		fmt.Fprintf(out, "[Proxy] %s %s %d (%.2fs, not metered)\n",
+			info.method, info.path, resp.StatusCode, time.Since(info.start).Seconds())
+		return nil
+	}
 	// A 101 response body is used for the upgraded connection and must not be wrapped.
 	if resp.StatusCode == http.StatusSwitchingProtocols {
 		debugf("req %d: protocol upgrade, connection not inspected", info.id)

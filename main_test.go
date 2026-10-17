@@ -148,7 +148,7 @@ func TestParseConfigDefaults(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%q: %v", data, err)
 		}
-		if c.ProxyPort != 8080 || c.LmStudio.Host != "localhost" || c.LmStudio.Port != 1234 || c.Metrics.HistoryPoints != 10 ||
+		if c.ProxyPort != 11436 || !c.forwardsUnmatched() || c.LmStudio.Host != "localhost" || c.LmStudio.Port != 1234 || c.Metrics.HistoryPoints != 10 ||
 			fmt.Sprint(c.APIEndpoints) != "[/api/v1/* /v1/*]" {
 			t.Errorf("%q: defaults not applied: %+v", data, c)
 		}
@@ -160,6 +160,16 @@ func TestParseConfigDefaults(t *testing.T) {
 	}
 	if fmt.Sprint(c.APIEndpoints) != "[/api/*]" {
 		t.Errorf("APIEndpoints = %q, want the configured list only", c.APIEndpoints)
+	}
+
+	for data, want := range map[string]bool{"forward_unmatched: false\n": false, "forward_unmatched: true\n": true} {
+		c, err := parseConfig([]byte(data))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.forwardsUnmatched() != want {
+			t.Errorf("%q: forwardsUnmatched() = %t, want %t", data, !want, want)
+		}
 	}
 }
 
@@ -233,15 +243,15 @@ func TestLoadConfigFromPath(t *testing.T) {
 	dir := t.TempDir()
 	good := filepath.Join(dir, "ollama.yaml")
 	bad := filepath.Join(dir, "bad.yaml")
-	os.WriteFile(good, []byte("lm_studio:\n  host: \"10.0.0.4\"\n  port: 11434\napi_endpoints: [\"/api/*\"]\n"), 0o644)
+	os.WriteFile(good, []byte("lm_studio:\n  host: \"192.0.2.10\"\n  port: 11434\napi_endpoints: [\"/api/*\"]\n"), 0o644)
 	os.WriteFile(bad, []byte("proxy_port: [not, a, port]\n"), 0o644)
 	t.Cleanup(func() { cfg = Config{} })
 
 	if err := loadConfig(good); err != nil {
 		t.Fatal(err)
 	}
-	if cfg.LmStudio.Host != "10.0.0.4" || cfg.LmStudio.Port != 11434 || cfg.ProxyPort != 8080 {
-		t.Errorf("cfg = %+v, want upstream 10.0.0.4:11434 and default port", cfg)
+	if cfg.LmStudio.Host != "192.0.2.10" || cfg.LmStudio.Port != 11434 || cfg.ProxyPort != 11436 {
+		t.Errorf("cfg = %+v, want upstream 192.0.2.10:11434 and default port", cfg)
 	}
 
 	for _, path := range []string{filepath.Join(dir, "missing.yaml"), bad, dir} {
@@ -830,12 +840,52 @@ func TestShutdownAbortsInFlightStream(t *testing.T) {
 	}
 }
 
+func TestNonAPIPathForwardedUnmetered(t *testing.T) {
+	target := startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/tags" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"models":[{"name":"qwen3:4b","model":"qwen3:4b"}]}`)
+	}))
+	srv, logs := startProxy(t, target)
+
+	for path, wantStatus := range map[string]int{"/api/tags": http.StatusOK, "/models": http.StatusNotFound} {
+		resp, err := http.Get(srv.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != wantStatus {
+			t.Errorf("%s: status = %d, want the upstream's %d", path, resp.StatusCode, wantStatus)
+		}
+		if path == "/api/tags" && !strings.Contains(string(body), "qwen3:4b") {
+			t.Errorf("%s: body = %q, want the upstream's", path, body)
+		}
+		if want := fmt.Sprintf("[Proxy] GET %s %d (", path, wantStatus); !strings.Contains(logs.String(), want) {
+			t.Errorf("logs missing %q:\n%s", want, logs.String())
+		}
+	}
+	if !strings.Contains(logs.String(), "not metered)") {
+		t.Errorf("logs don't mark the requests as not metered:\n%s", logs.String())
+	}
+	metrics.mu.RLock()
+	defer metrics.mu.RUnlock()
+	if metrics.QueryCount != 0 {
+		t.Errorf("QueryCount = %d, want unmetered requests not counted", metrics.QueryCount)
+	}
+}
+
 func TestNonAPIPathNotForwarded(t *testing.T) {
 	var hits atomic.Int32
 	target := startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
 	}))
 	srv, _ := startProxy(t, target)
+	forward := false
+	cfg.ForwardUnmatched = &forward
 
 	resp, err := http.Get(srv.URL + "/admin")
 	if err != nil {

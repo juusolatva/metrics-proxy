@@ -35,7 +35,15 @@ Use `--config` to load another file, e.g. one per upstream server:
 Run `./metrics_proxy --help` to list all options.
 
 Point your client at the proxy instead of the LLM server, e.g.
-`http://localhost:8080/v1` instead of `http://localhost:1234/v1`.
+`http://localhost:11436/v1` instead of `http://localhost:1234/v1`. Keep the
+same path the client used with the server: if it worked with
+`http://localhost:11434/v1`, use `http://localhost:11436/v1`, not
+`http://localhost:11436`.
+
+The default port was 8080 before; it moved to 11436 to stay clear of the
+many programs using 8080 (llama.cpp's `llama-server` among them) and of
+Ollama's 11434 and a second Ollama instance's 11435. Set `proxy_port: 8080`
+to keep the old port.
 
 ### Output
 
@@ -95,15 +103,17 @@ Requests cut off this way are logged as `incomplete`.
 `config.yaml` (or the file given with `--config`):
 
 ```yaml
-proxy_port: 8080          # port the proxy listens on
+proxy_port: 11436         # port the proxy listens on
 
 lm_studio:                # upstream LLM server (any supported server type)
   host: "localhost"
   port: 1234
 
-api_endpoints:            # path prefixes to forward; others get 404
+api_endpoints:            # path prefixes to meter
   - "/api/v1/*"           # LM Studio native REST API
   - "/v1/*"               # OpenAI-compatible API
+
+forward_unmatched: true   # forward other paths unmetered (false: answer 404)
 
 metrics:
   history_points: 10      # recent queries to average tokens/sec over
@@ -114,6 +124,19 @@ logging:
 
 To front Ollama, set the upstream to `localhost:11434` and add `"/api/*"` to
 `api_endpoints`.
+
+Requests to paths outside `api_endpoints` (model lists such as Ollama's
+`/api/tags`, or a client's `/models`) are forwarded unchanged, so the client
+gets the upstream's own answer, and logged without metrics:
+
+```
+[Proxy] GET /models 404 (0.01s, not metered)
+```
+
+The time is until the response headers arrived. A `404` there comes from the
+upstream and usually means the client's base URL lacks a path such as `/v1`.
+Set `forward_unmatched: false` to answer such requests with `404` without
+forwarding them, as earlier versions did.
 
 Unset values fall back to the defaults shown above; an empty file is a valid
 config for LM Studio on `localhost:1234`. Unknown or misspelled keys are an
@@ -129,7 +152,7 @@ numbers. That is useful when a value is missing or looks wrong:
 
 ```
 [DEBUG] req 2: POST /v1/chat/completions from [::1]:37316
-[DEBUG] req 2: upstream http://10.0.0.2:1234/v1/chat/completions -> 200 after 0.00s, Content-Type "text/event-stream"
+[DEBUG] req 2: upstream http://192.0.2.20:1234/v1/chat/completions -> 200 after 0.00s, Content-Type "text/event-stream"
 [DEBUG] req 2: body ended at EOF after 2797 bytes, stream time 0.03s
 [DEBUG] req 2: parsed as SSE: 10 JSON document(s), 0 invalid, 0 skipped as larger than 16 MiB
 [DEBUG] req 2: stream has no token usage; OpenAI-compatible clients must send "stream_options": {"include_usage": true}

@@ -119,17 +119,20 @@ Configuration is read from the file given by `--config` (default `config.yaml`) 
 
 ```yaml
 # Port the proxy server listens on
-proxy_port: 8080
+proxy_port: 11436
 
 # Upstream LLM server (LM Studio, Ollama or OpenAI-compatible; key name kept for compatibility)
 lm_studio:
   host: "localhost"
   port: 1234
 
-# API endpoint patterns to intercept (path prefixes; trailing "*" optional)
+# API endpoint patterns to meter (path prefixes; trailing "*" optional)
 api_endpoints:
   - "/api/v1/*"  # LM Studio native REST API
   - "/v1/*"      # OpenAI-compatible API
+
+# Forward other paths unmetered (false: answer 404 without forwarding)
+forward_unmatched: true
 
 # Metrics settings
 metrics:
@@ -142,7 +145,7 @@ logging:
 
 ### Configuration Notes
 - The config path comes from `--config` (`parseFlags()`), default `config.yaml`. Relative paths are resolved against the working directory, not the binary's location. A missing, unreadable or invalid file exits with status 1 and an error naming the file. Positional arguments (e.g. `metrics_proxy my.yaml`) are rejected with exit status 2 instead of being ignored.
-- `parseConfig()` applies defaults for unset fields: `proxy_port` 8080, `lm_studio` `localhost:1234`, `history_points` 10, and `api_endpoints` `["/api/v1/*", "/v1/*"]` (also when given as an empty list). An empty config file is valid (`io.EOF` from the decoder is treated as "no settings").
+- `parseConfig()` applies defaults for unset fields: `proxy_port` 11436, `lm_studio` `localhost:1234`, `history_points` 10, and `api_endpoints` `["/api/v1/*", "/v1/*"]` (also when given as an empty list). `forward_unmatched` is a `*bool` so that unset means `true`; read it via `cfg.forwardsUnmatched()`, which also treats the `nil` of test-built `Config`s as `true`. The port was 8080 until 2026-10-17; it moved to stay clear of 8080 (llama.cpp's `llama-server` and many others), Ollama's 11434 and a second Ollama instance's 11435. An empty config file is valid (`io.EOF` from the decoder is treated as "no settings").
 - `parseConfig()` decodes strictly (`yaml.Decoder.KnownFields(true)`): unknown keys, i.e. typos or removed settings, fail with `field <key> not found in type main.<Struct>` and the line number (`TestParseConfigRejectsUnknownKeys`). `metrics.mode` and `metrics.refresh_interval_ms` were removed (never implemented), so old files containing them now fail to load until the keys are deleted. Removing or renaming a key has the same effect, so mention it in README.md.
 - `logging.debug` enables `[DEBUG]` output (see §5, "Debug Logging").
 - The `lm_studio` key names the upstream regardless of server type; to front Ollama, point it at `localhost:11434` and add `"/api/*"` (Ollama native `/api/chat`, `/api/generate`) to `api_endpoints`. Keep the key name for backward compatibility; an alias (e.g. `upstream`) would have to fall back to it.
@@ -171,14 +174,15 @@ All application logic is currently contained in `main.go`:
    - `runProxy()` listens on `cfg.ProxyPort` and hands the `http.Server` (handler `handleRequest`) to `serve()`. No read/write timeouts (generations can take minutes; an expiring `ReadTimeout` cancels the request context), only `ReadHeaderTimeout`/`IdleTimeout`.
 2. **Request Routing (`handleRequest`)**:
    - Validates incoming path against `cfg.APIEndpoints` using `isAPIEndpoint()` (prefix match, trailing `*` stripped).
-   - Returns `404 Not Found` if the path does not match any configured prefix.
-   - Stores a `requestInfo` (request ID, start time, method, path) in the request context and calls `proxy.ServeHTTP`.
+   - Paths that match are metered. Others are forwarded unmetered when `cfg.forwardsUnmatched()` (default), otherwise answered with `404 Not Found` and a `[Proxy] Non-API request` line, without contacting the upstream.
+   - Stores a `requestInfo` (request ID, start time, method, path, `metered`) in the request context and calls `proxy.ServeHTTP`.
 3. **Forwarding (`newReverseProxy`)**:
    - `Rewrite` points the request at the upstream, sets `X-Forwarded-*`, and drops `Accept-Encoding` so the transport decompresses bodies before they are inspected.
    - `FlushInterval: -1` flushes every write, so streamed tokens reach the client immediately.
    - `ErrorHandler` (`proxyError`) logs an `[ERROR]` line and returns `502 Bad Gateway` ("Failed to connect to the upstream LLM server").
 4. **Metrics Capture (`meterResponse` → `meteredBody`)**:
-   - `ModifyResponse` wraps the upstream body in a `meteredBody` (except `101` upgrades). As the proxy copies the body to the client, each chunk is also written to a `capture` chosen by Content-Type (`newCapture`): `jsonCapture` (buffers, parses at end), `sseCapture` (`text/event-stream`, parses event by event) or `ndjsonCapture` (`application/x-ndjson`, Ollama native streaming, parses line by line). The streaming captures share a `lineSplitter`. Other content types are not inspected. Captures are bounded by `maxCaptureBytes` (16 MiB); oversized bodies/lines are proxied but not parsed.
+   - For unmetered requests (`requestInfo.metered` false), `meterResponse` only prints `[Proxy] METHOD PATH STATUS (Ns, not metered)` when the headers arrive (time to headers, not the body) and leaves the body unwrapped; nothing is counted or written to CSV.
+   - Otherwise `ModifyResponse` wraps the upstream body in a `meteredBody` (except `101` upgrades). As the proxy copies the body to the client, each chunk is also written to a `capture` chosen by Content-Type (`newCapture`): `jsonCapture` (buffers, parses at end), `sseCapture` (`text/event-stream`, parses event by event) or `ndjsonCapture` (`application/x-ndjson`, Ollama native streaming, parses line by line). The streaming captures share a `lineSplitter`. Other content types are not inspected. Captures are bounded by `maxCaptureBytes` (16 MiB); oversized bodies/lines are proxied but not parsed.
    - On EOF or `Close` (e.g. client disconnect), `finish()` runs once: gets `MetricsData` from the capture, sets the duration, and fills totals/TPS the upstream didn't report (`completeDerived`; for streamed captures the first-to-last-byte time is used as generation time). A derived TPS sets `MetricsData.TPSEstimated`, and the status line shows it as `TPS: 40.98 (est.)`.
 5. **Payload Parsing (`llmPayload`, `MetricsData.merge`)**:
    - `encoding/json` into a struct covering OpenAI-compatible responses (`model`, `usage.*`; Ollama adds `timings.predicted_per_second`), Ollama native (`prompt_eval_count`, `eval_count`, `eval_duration` in ns → TPS = `eval_count / eval_duration`), LM Studio API v0 (`usage`, `stats.tokens_per_second`, `stats.time_to_first_token`) and v1 (`model_instance_id`, `stats.input_tokens`, `stats.total_output_tokens`, `stats.tokens_per_second`, `stats.time_to_first_token_seconds`). Wrapped payloads in `result` (v1 `chat.end` SSE event) and `response` (OpenAI Responses API events) are merged recursively. Later SSE events / NDJSON lines override earlier fields. Non-object payloads are ignored; a field of unexpected type (`json.UnmarshalTypeError`) is skipped without discarding the others.
