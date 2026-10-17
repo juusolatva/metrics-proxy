@@ -31,6 +31,28 @@ from the repository root (or wherever your `config.yaml` is).
 Point your client at the proxy instead of the LLM server, e.g.
 `http://localhost:8080/v1` instead of `http://localhost:1234/v1`.
 
+### Saving statistics to CSV
+
+```bash
+./metrics_proxy --csv stats.csv
+```
+
+Each recorded query is appended to the file as one row, as soon as it
+finishes. The file is created with a header row if it doesn't exist; existing
+files are appended to, so restarts keep adding to the same file. Requests
+without inference data (such as `/v1/models`) are not written.
+
+```csv
+timestamp,method,path,status,model,prompt_tokens,completion_tokens,total_tokens,tokens_per_second,tps_estimated,ttft_seconds,duration_seconds,complete
+2026-10-17T03:28:30.366+03:00,POST,/api/v1/chat,200,qwen2.5-coder-0.5b-instruct,32,10,42,271.22,false,0.005,0.054,true
+2026-10-17T03:28:30.447+03:00,POST,/v1/chat/completions,200,qwen2.5-coder-0.5b-instruct,32,10,42,234.45,true,,0.043,true
+```
+
+Values the server didn't report (tokens, TPS, TTFT) are left empty.
+`tps_estimated` is `true` when the TPS was estimated by the proxy (shown as
+`(est.)` in the terminal), and `complete` is `false` for responses that were
+cut off. Only per-query values are saved; the running averages are not.
+
 Each completed query prints a line like this:
 
 ```
@@ -99,7 +121,8 @@ but have no effect yet.
   (`/api/v1/...`). Ollama (native and OpenAI-compatible) and LM Studio's
   OpenAI-compatible API don't report it, so their lines have no `TTFT`.
 - One upstream over plain HTTP; no HTTPS upstream or API key injection.
-- Metrics are kept in memory only and are lost when the proxy stops.
+- Running totals and averages are kept in memory only and are lost when the
+  proxy stops. Use `--csv` to keep per-query statistics.
 
 ## Development
 

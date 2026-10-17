@@ -53,6 +53,10 @@ metrics_proxy/
   go run .
   ```
   *Note: The application expects `config.yaml` to reside in the current working directory from which the command is executed.*
+- **Save per-query statistics to CSV** (command-line flag, not a `config.yaml` setting):
+  ```bash
+  go run . --csv stats.csv
+  ```
 
 ### Testing
 Tests live in `main_test.go`. They start a fake upstream and the proxy with `httptest`, and reset the global state (`cfg`, `metrics`, `proxy`, `out`) per test via `startProxy()`. Metrics are recorded on the proxy's goroutine, so tests wait for them with `waitFor`/`waitForQueries` instead of asserting immediately.
@@ -139,10 +143,13 @@ All application logic is currently contained in `main.go`:
 - `proxy` (`*httputil.ReverseProxy`): Reverse proxy to LM Studio, built by `newReverseProxy()`.
 - `metrics` (`Metrics`): Thread-safe in-memory metrics store protected by `metrics.mu` (`sync.RWMutex`).
 - `out` (`io.Writer`): Destination for per-request status lines (stdout; replaced in tests).
+- `csvLog` (`*csvRecorder`): Per-query CSV output opened by `openCSVLog()` when `--csv` is given; `nil` when disabled (reset by `startProxy()` in tests).
 
 ### Execution Flow
 1. **Startup (`main`)**:
+   - Parses command-line flags (`flag`); the only one is `--csv <file>`. Document and show flags GNU-style (`--name`). `flagUsage()` prints `--help` that way, and the `flag` package also accepts the single-dash form.
    - Loads configuration via `loadConfig()` / `parseConfig()`.
+   - With `--csv`, opens the file via `openCSVLog()`: append mode, created if missing, header (`csvHeader`) written only when the file is empty. An open error exits with status 1. The file is closed (deferred) after `runProxy()` returns.
    - Builds `proxy` targeting `upstreamURL()`.
    - Names the upstream in the startup banner via `detectBackend()`: probes `/api/version` (Ollama), `/api/v1/models` (LM Studio), `/v1/models` (OpenAI-compatible) with a 2 s timeout, checking the JSON body for a known key because LM Studio answers unknown endpoints with `200` and an error body. Falls back to "upstream … (server type not detected)" and stops probing on the first connection error. Only affects the banner.
    - `setupSignalHandling()` returns two contexts: `stop` (done on the first `SIGINT`/`SIGTERM`) and `force` (done on the second).
@@ -164,6 +171,7 @@ All application logic is currently contained in `main.go`:
    - Responses without inference data (no model, tokens or TPS, e.g. `/v1/models`, errors) are logged with a `[Proxy]` line and not counted.
    - Otherwise `updateGlobalMetrics()` locks `metrics.mu`, updates count, cumulative tokens, running average time, latest model/TPS, appends to `History` (newest last, bounded to `cfg.Metrics.HistoryPoints`), and returns a `metricsSnapshot` (incl. average TPS over `History`).
    - `displayMetrics()` prints one line per query from the snapshot without holding the lock.
+   - If `csvLog` is set, `csvRecorder.record()` appends the query as a CSV row and flushes it. The writer is guarded by its own mutex, not `metrics.mu`. Columns: `timestamp` (RFC 3339, ms, local zone), `method`, `path`, `status`, `model`, `prompt_tokens`, `completion_tokens`, `total_tokens`, `tokens_per_second`, `tps_estimated`, `ttft_seconds`, `duration_seconds`, `complete`. Unknown tokens, TPS and TTFT are left empty, not written as `0`. Rows are per-query values only; aggregates (`Avg`, running totals) are not written. Write errors are logged as `[ERROR] writing CSV` and don't affect proxying. Rows arriving after `Close()` (requests cut off by shutdown) are dropped.
 7. **Shutdown (`serve`)**:
    - `serve()` wraps the handler with an in-flight request counter and runs `server.Serve` until `stop` is done.
    - It then calls `server.Shutdown`, which closes the listener and waits for in-flight requests, streamed generations included, to finish normally and be recorded. The wait is bounded by `shutdownTimeout` (60 s, below systemd's default 90 s stop timeout) and aborted early by `force`.
@@ -187,7 +195,8 @@ All application logic is currently contained in `main.go`:
 5. **Unimplemented configuration**:
    - `metrics.mode`, `metrics.refresh_interval_ms` and `logging.debug` are parsed but have no effect.
 6. **Shutdown waits for in-flight requests**:
-   - The first signal waits up to `shutdownTimeout` (60 s, a constant, not configurable) for running generations; a second signal aborts them. Tests drive `serve()` directly with their own contexts and timeout (`startServe`), not real signals. Metrics are in memory only and are lost on exit.
+   - The first signal waits up to `shutdownTimeout` (60 s, a constant, not configurable) for running generations; a second signal aborts them. Tests drive `serve()` directly with their own contexts and timeout (`startServe`), not real signals. Aggregates are in memory only and are lost on exit; with `--csv`, per-query rows are kept in the file.
+   - `--csv` does not check an existing file's header. Appending to a CSV with different columns (e.g. from a future version) mixes formats.
 7. **Go version**:
    - `go.mod` declares Go 1.21. Avoid standard library APIs newer than 1.21 (e.g. `http.ServeMux` method/wildcard patterns from 1.22) unless the `go` directive is bumped. The `min`/`max` builtins (1.21) are fine.
 8. **Single upstream, no auth/TLS options**:

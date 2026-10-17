@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/csv"
 	"fmt"
 	"io"
 	"math"
@@ -12,6 +13,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -71,6 +73,7 @@ func startProxy(t *testing.T, target *url.URL) (*httptest.Server, *syncBuffer) {
 		Metrics:      MetricsConfig{HistoryPoints: 10},
 	}
 	resetMetrics()
+	csvLog = nil
 	proxy = newReverseProxy(target)
 
 	srv := httptest.NewServer(http.HandlerFunc(handleRequest))
@@ -735,6 +738,98 @@ func TestNonInferenceResponseNotCounted(t *testing.T) {
 	defer metrics.mu.RUnlock()
 	if metrics.QueryCount != 0 {
 		t.Errorf("QueryCount = %d, want 0", metrics.QueryCount)
+	}
+}
+
+func readCSV(t *testing.T, path string) [][]string {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	rows, err := csv.NewReader(f).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rows
+}
+
+func TestCSVLogAppendsWithSingleHeader(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stats.csv")
+	info := &requestInfo{method: "POST", path: "/api/v1/chat"}
+	now := time.Date(2026, 10, 17, 14, 2, 31, 500e6, time.UTC)
+	full := MetricsData{
+		ModelName: "qwen, \"8b\"", PromptTokens: 42, CompletionTokens: 311, TotalTokens: 353,
+		TokensPerSecond: 48.123, TimeToFirstToken: 210 * time.Millisecond, Duration: 6680 * time.Millisecond,
+	}
+	sparse := MetricsData{ModelName: "m", Duration: time.Second}
+
+	// Two runs of the proxy appending to the same file.
+	for _, rows := range [][]MetricsData{{full}, {sparse}} {
+		rec, err := openCSVLog(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, d := range rows {
+			if err := rec.record(now, info, 200, d, d.TotalTokens > 0); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := rec.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := rec.record(now, info, 200, sparse, true); err != nil {
+			t.Errorf("record after Close = %v, want it silently dropped", err)
+		}
+	}
+
+	want := [][]string{
+		csvHeader,
+		{"2026-10-17T14:02:31.500Z", "POST", "/api/v1/chat", "200", "qwen, \"8b\"", "42", "311", "353", "48.12", "false", "0.210", "6.680", "true"},
+		{"2026-10-17T14:02:31.500Z", "POST", "/api/v1/chat", "200", "m", "", "", "", "", "false", "", "1.000", "false"},
+	}
+	if got := readCSV(t, path); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("CSV rows:\n got %q\nwant %q", got, want)
+	}
+}
+
+func TestProxyWritesQueriesToCSV(t *testing.T) {
+	target := startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/v1/models" {
+			io.WriteString(w, `{"object":"list","data":[]}`)
+			return
+		}
+		io.WriteString(w, chatCompletionJSON)
+	}))
+	srv, _ := startProxy(t, target)
+	path := filepath.Join(t.TempDir(), "stats.csv")
+	rec, err := openCSVLog(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { rec.Close() })
+	csvLog = rec
+
+	for _, p := range []string{"/v1/models", "/v1/chat/completions"} {
+		resp, err := http.Post(srv.URL+p, "application/json", strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		readAll(t, resp.Body)
+		resp.Body.Close()
+	}
+	waitForQueries(t, 1)
+
+	rows := readCSV(t, path)
+	if len(rows) != 2 {
+		t.Fatalf("want header + 1 query row (models request not written), got %q", rows)
+	}
+	// Non-streamed OpenAI response without a reported rate: TPS is estimated.
+	row := rows[1]
+	if row[2] != "/v1/chat/completions" || row[4] != "qwen2.5-7b-instruct" || row[7] != "30" || row[9] != "true" || row[12] != "true" {
+		t.Errorf("unexpected row %q", row)
 	}
 }
 

@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"mime"
@@ -14,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -101,16 +104,32 @@ var (
 	cfg     Config
 	proxy   *httputil.ReverseProxy
 	metrics Metrics
-	out     io.Writer = os.Stdout // destination for per-request status lines
+	out     io.Writer    = os.Stdout // destination for per-request status lines
+	csvLog  *csvRecorder             // per-query CSV output (--csv flag); nil when disabled
 )
 
 func main() {
+	csvPath := flag.String("csv", "", "append per-query statistics to this CSV `file`")
+	flag.Usage = flagUsage
+	flag.Parse()
+
 	fmt.Println("=== LLM Metrics Proxy ===")
 
 	// Load configuration
 	if err := loadConfig(); err != nil {
 		fmt.Printf("Error loading config: %v\n", err)
 		os.Exit(1)
+	}
+
+	if *csvPath != "" {
+		rec, err := openCSVLog(*csvPath)
+		if err != nil {
+			fmt.Printf("Error opening CSV file: %v\n", err)
+			os.Exit(1)
+		}
+		csvLog = rec
+		defer rec.Close()
+		fmt.Printf("Writing statistics to %s\n", *csvPath)
 	}
 
 	target := upstreamURL()
@@ -131,6 +150,17 @@ func main() {
 		fmt.Printf("Error running proxy: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// flagUsage prints the flags in the GNU style (--name). The flag package
+// accepts both -name and --name, but its default help shows -name.
+func flagUsage() {
+	w := flag.CommandLine.Output()
+	fmt.Fprintf(w, "Usage: %s [options]\n\nOptions:\n", filepath.Base(os.Args[0]))
+	flag.VisitAll(func(f *flag.Flag) {
+		arg, usage := flag.UnquoteUsage(f)
+		fmt.Fprintf(w, "  --%s %s\n    \t%s\n", f.Name, arg, usage)
+	})
 }
 
 func loadConfig() error {
@@ -439,8 +469,14 @@ func recordQuery(info *requestInfo, status int, data MetricsData, complete bool)
 		return
 	}
 
+	now := time.Now()
 	snap := updateGlobalMetrics(data)
-	displayMetrics(info, status, data, snap, complete)
+	displayMetrics(now, info, status, data, snap, complete)
+	if csvLog != nil {
+		if err := csvLog.record(now, info, status, data, complete); err != nil {
+			fmt.Fprintf(out, "[ERROR] writing CSV: %v\n", err)
+		}
+	}
 }
 
 // capture inspects a response body as it is streamed to the client.
@@ -778,8 +814,86 @@ func updateGlobalMetrics(data MetricsData) metricsSnapshot {
 }
 
 // displayMetrics shows the metrics of a query and the aggregates in the terminal
-func displayMetrics(info *requestInfo, status int, data MetricsData, snap metricsSnapshot, complete bool) {
-	fmt.Fprintln(out, formatMetricsLine(time.Now(), info, status, data, snap, complete))
+func displayMetrics(now time.Time, info *requestInfo, status int, data MetricsData, snap metricsSnapshot, complete bool) {
+	fmt.Fprintln(out, formatMetricsLine(now, info, status, data, snap, complete))
+}
+
+// csvHeader names the columns written by csvRecorder.record. Unknown values
+// (no tokens, TPS or TTFT reported) are left empty rather than written as 0.
+var csvHeader = []string{
+	"timestamp", "method", "path", "status", "model",
+	"prompt_tokens", "completion_tokens", "total_tokens",
+	"tokens_per_second", "tps_estimated", "ttft_seconds", "duration_seconds", "complete",
+}
+
+// csvRecorder appends one row per recorded query to a CSV file. Rows are
+// flushed as they are written, so the file is usable while the proxy runs.
+type csvRecorder struct {
+	mu     sync.Mutex
+	f      *os.File
+	w      *csv.Writer
+	closed bool
+}
+
+// openCSVLog opens path for appending, creating it if needed. The header is
+// written only when the file is empty, so restarts keep adding to one file.
+func openCSVLog(path string) (*csvRecorder, error) {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	r := &csvRecorder{f: f, w: csv.NewWriter(f)}
+	if st, err := f.Stat(); err != nil || st.Size() == 0 {
+		r.w.Write(csvHeader)
+		r.w.Flush()
+		if err := r.w.Error(); err != nil {
+			f.Close()
+			return nil, err
+		}
+	}
+	return r, nil
+}
+
+func (r *csvRecorder) record(now time.Time, info *requestInfo, status int, data MetricsData, complete bool) error {
+	optInt := func(n int) string {
+		if n == 0 {
+			return ""
+		}
+		return strconv.Itoa(n)
+	}
+	tps, ttft := "", ""
+	if data.TokensPerSecond > 0 {
+		tps = strconv.FormatFloat(data.TokensPerSecond, 'f', 2, 64)
+	}
+	if data.TimeToFirstToken > 0 {
+		ttft = strconv.FormatFloat(data.TimeToFirstToken.Seconds(), 'f', 3, 64)
+	}
+	row := []string{
+		now.Format("2006-01-02T15:04:05.000Z07:00"), info.method, info.path, strconv.Itoa(status), data.ModelName,
+		optInt(data.PromptTokens), optInt(data.CompletionTokens), optInt(data.TotalTokens),
+		tps, strconv.FormatBool(data.TPSEstimated), ttft,
+		strconv.FormatFloat(data.Duration.Seconds(), 'f', 3, 64), strconv.FormatBool(complete),
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil // a request cut off by shutdown finished after Close
+	}
+	r.w.Write(row)
+	r.w.Flush()
+	return r.w.Error()
+}
+
+func (r *csvRecorder) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil
+	}
+	r.closed = true
+	r.w.Flush()
+	return errors.Join(r.w.Error(), r.f.Close())
 }
 
 func formatMetricsLine(now time.Time, info *requestInfo, status int, data MetricsData, snap metricsSnapshot, complete bool) string {

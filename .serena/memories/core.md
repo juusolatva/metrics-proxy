@@ -3,7 +3,7 @@
 HTTP reverse proxy between LLM clients and a local LLM server (LM Studio primary; Ollama and other OpenAI-compatible servers also targeted); extracts per-request inference metrics (tokens, TPS, duration, model) and prints them to stdout.
 
 ## Source map
-- `main.go` — entire app (single `package main`): config (`loadConfig`, `parseConfig` with defaults), startup banner backend probe (`detectBackend`), server (`runProxy`, `serve` with graceful shutdown driven by `setupSignalHandling`'s `stop`/`force` contexts, `handleRequest`), forwarding (`newReverseProxy`, `meterResponse`), body inspection (`meteredBody`, `newCapture` → `jsonCapture` / `sseCapture` / `ndjsonCapture`, streaming ones share `lineSplitter`), payload parsing (`llmPayload`, `MetricsData.merge`), aggregation (`updateGlobalMetrics`), terminal output (`displayMetrics`).
+- `main.go` — entire app (single `package main`): config (`loadConfig`, `parseConfig` with defaults), startup banner backend probe (`detectBackend`), server (`runProxy`, `serve` with graceful shutdown driven by `setupSignalHandling`'s `stop`/`force` contexts, `handleRequest`), forwarding (`newReverseProxy`, `meterResponse`), body inspection (`meteredBody`, `newCapture` → `jsonCapture` / `sseCapture` / `ndjsonCapture`, streaming ones share `lineSplitter`), payload parsing (`llmPayload`, `MetricsData.merge`), aggregation (`updateGlobalMetrics`), terminal output (`displayMetrics`), CSV output (`--csv` flag → `openCSVLog` / `csvRecorder`, global `csvLog`).
 - `main_test.go` — httptest tests; `startUpstream`/`startProxy` helpers reset globals.
 - `testdata/` — real captured responses: `lm_*` LM Studio (native v1 + OpenAI-compat, JSON + SSE), `ol_*` Ollama (native JSON + NDJSON stream, OpenAI-compat SSE). Ground truth for parser tests.
 - `config.yaml` — runtime config; read from CWD (hardcoded relative path).
@@ -11,7 +11,10 @@ HTTP reverse proxy between LLM clients and a local LLM server (LM Studio primary
 - `.serena/` — committed: `project.yml` and `memories/` are shared and reviewed like code; `cache/` and `project.local.yml` are excluded by `.serena/.gitignore`.
 
 ## Invariants / gotchas
-- Package-level globals: `cfg`, `proxy`, `metrics`, `out` (status-line writer, swapped in tests). `metrics.mu` (RWMutex) guards all `Metrics` fields; never hold it across network I/O.
+- Package-level globals: `cfg`, `proxy`, `metrics`, `out` (status-line writer, swapped in tests), `csvLog` (nil unless `--csv`; reset in `startProxy`).
+- `--csv` is a command-line flag, not a `config.yaml` key (the only flag so far). `recordQuery` writes one row per counted query (same filter as the status line). The `csvRecorder` has its own mutex and flushes every row. The header (`csvHeader`) is written only to an empty file. Unknown values are empty, not 0. Changing columns breaks appending to existing files: add new columns at the end.
+- `metrics.mu` (RWMutex) guards all `Metrics` fields; never hold it across network I/O.
+- Command-line flags: document and show them as GNU-style `--name` (user preference; `flagUsage` prints help that way). Go's `flag` package accepts both `-name` and `--name`, so no parsing change is needed.
 - `config.yaml` schema must stay backward-compatible.
 - Parsed-but-unimplemented config: `metrics.mode`, `metrics.refresh_interval_ms`, `logging.debug`.
 - Response bodies are streamed via `httputil.ReverseProxy` and inspected through a `meteredBody` wrapper (set in `ModifyResponse`); metrics are recorded when the body ends, on the proxy goroutine — after or racing with the client finishing its read. Never read the body in `ModifyResponse` (blocks headers, breaks SSE).
