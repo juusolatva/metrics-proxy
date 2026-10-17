@@ -220,11 +220,16 @@ apart. Request and response bodies are never logged.
 ```bash
 go test -race ./...
 go vet ./...
-gofmt -l .
+gofmt -s -l .
+go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 run
+go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 ```
 
 The parser tests use real responses captured from LM Studio and Ollama in
-`testdata/`. SonarCloud analyzes every push.
+`testdata/`. GitHub Actions (`.github/workflows/ci.yml`) runs these checks on
+pushes to `main` and on pull requests, with the tests on both the Go version
+from `go.mod` and the latest stable Go, and sends the results and test
+coverage to SonarQube Cloud.
 
 See [AGENTS.md](AGENTS.md) for architecture and contribution guidelines.
 
