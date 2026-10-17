@@ -508,14 +508,7 @@ func TestCaptureFixtures(t *testing.T) {
 		lmModel = "qwen/qwen2.5-coder-14b"
 		olModel = "qwen3:4b-instruct-2507-q8_0"
 	)
-	tests := []struct {
-		file        string
-		contentType string
-		model       string
-		in, out     int // prompt and completion tokens; 0 when not reported
-		tps         float64
-		ttft        time.Duration
-	}{
+	tests := []fixtureCase{
 		{"lm_v1_chat.json", "application/json; charset=utf-8", lmModel, 41, 10, 80.17174569522265, 110923 * time.Microsecond},
 		{"lm_v1_chat_stream.sse", "text/event-stream", lmModel, 41, 10, 84.25309630128908, 34515 * time.Microsecond},
 		// LM Studio's OpenAI-compatible stats carry only speculative-decoding
@@ -532,31 +525,55 @@ func TestCaptureFixtures(t *testing.T) {
 		{"ol_oai_stream_nousage.sse", "text/event-stream", olModel, 0, 0, 0, 0},
 	}
 	for _, tt := range tests {
-		body := readFixture(t, tt.file)
-		// Feed the body whole and byte by byte to exercise chunk boundaries.
-		for _, chunkSize := range []int{len(body), 1} {
-			c := newCapture(tt.contentType)
-			if c == nil {
-				t.Fatalf("%s: no capture for %q", tt.file, tt.contentType)
-			}
-			for b := body; len(b) > 0; {
-				n := min(chunkSize, len(b))
-				c.Write(b[:n])
-				b = b[n:]
-			}
-			got := c.finish()
-			// Duration 0: totals are filled in but no throughput is estimated.
-			got.completeDerived(0)
-			if got.ModelName != tt.model || got.PromptTokens != tt.in || got.CompletionTokens != tt.out ||
-				got.TotalTokens != tt.in+tt.out || !approxEqual(got.TokensPerSecond, tt.tps) || got.TimeToFirstToken != tt.ttft {
-				t.Errorf("%s (chunk %d): got %+v, want model=%q tokens=%d+%d tps=%v ttft=%v",
-					tt.file, chunkSize, got, tt.model, tt.in, tt.out, tt.tps, tt.ttft)
-			}
-			if d := c.diag(); d.invalid != 0 || d.oversized != 0 {
-				t.Errorf("%s (chunk %d): diag %+v, want every document parsed", tt.file, chunkSize, d)
-			}
+		checkFixture(t, tt)
+	}
+}
+
+// fixtureCase is a captured response in testdata/ and the metrics it holds.
+type fixtureCase struct {
+	file        string
+	contentType string
+	model       string
+	in, out     int // prompt and completion tokens; 0 when not reported
+	tps         float64
+	ttft        time.Duration
+}
+
+// checkFixture parses a capture whole and byte by byte, to exercise chunk
+// boundaries, and compares the result with the expected metrics.
+func checkFixture(t *testing.T, tt fixtureCase) {
+	t.Helper()
+	body := readFixture(t, tt.file)
+	for _, chunkSize := range []int{len(body), 1} {
+		got, d := parseInChunks(t, tt.contentType, body, chunkSize)
+		// Duration 0: totals are filled in but no throughput is estimated.
+		got.completeDerived(0)
+		want := MetricsData{
+			ModelName: tt.model, PromptTokens: tt.in, CompletionTokens: tt.out, TotalTokens: tt.in + tt.out,
+			TokensPerSecond: got.TokensPerSecond, TimeToFirstToken: tt.ttft,
+		}
+		if got != want || !approxEqual(got.TokensPerSecond, tt.tps) {
+			t.Errorf("%s (chunk %d): got %+v, want model=%q tokens=%d+%d tps=%v ttft=%v",
+				tt.file, chunkSize, got, tt.model, tt.in, tt.out, tt.tps, tt.ttft)
+		}
+		if d.invalid != 0 || d.oversized != 0 {
+			t.Errorf("%s (chunk %d): diag %+v, want every document parsed", tt.file, chunkSize, d)
 		}
 	}
+}
+
+// parseInChunks writes body to a new capture for contentType in chunks of
+// chunkSize bytes and returns what it found.
+func parseInChunks(t *testing.T, contentType string, body []byte, chunkSize int) (MetricsData, captureDiag) {
+	t.Helper()
+	c := newCapture(contentType)
+	if c == nil {
+		t.Fatalf("no capture for %q", contentType)
+	}
+	for b := body; len(b) > 0; b = b[min(chunkSize, len(b)):] {
+		c.Write(b[:min(chunkSize, len(b))])
+	}
+	return c.finish(), c.diag()
 }
 
 func TestCaptureEdgeCases(t *testing.T) {
@@ -977,36 +994,45 @@ func TestCaptureDiag(t *testing.T) {
 	}
 }
 
+// debugTestUpstream serves the responses used by the debug logging tests.
+func debugTestUpstream(w http.ResponseWriter, r *http.Request) {
+	switch r.URL.Path {
+	case "/v1/chat/completions": // non-streamed, usage but no rate: TPS estimated
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, chatCompletionJSON)
+	case "/v1/stream": // streamed without include_usage
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: {\"model\":\"m\",\"choices\":[]}\n\ndata: oops\n\ndata: [DONE]\n\n")
+	default:
+		w.Header().Set("Content-Type", "text/plain")
+		io.WriteString(w, "hello")
+	}
+}
+
+// postAndDrain sends an empty JSON request through the proxy and reads the
+// whole response.
+func postAndDrain(t *testing.T, url string) {
+	t.Helper()
+	resp, err := http.Post(url, "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	readAll(t, resp.Body)
+}
+
+func TestDebugLoggingOffByDefault(t *testing.T) {
+	srv, logs := startProxy(t, startUpstream(t, http.HandlerFunc(debugTestUpstream)))
+	postAndDrain(t, srv.URL+"/v1/chat/completions")
+	waitForQueries(t, 1)
+	if strings.Contains(logs.String(), "[DEBUG]") {
+		t.Errorf("debug lines printed with logging.debug off:\n%s", logs)
+	}
+}
+
 func TestDebugLogging(t *testing.T) {
-	target := startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/v1/chat/completions": // non-streamed, usage but no rate: TPS estimated
-			w.Header().Set("Content-Type", "application/json")
-			io.WriteString(w, chatCompletionJSON)
-		case "/v1/stream": // streamed without include_usage
-			w.Header().Set("Content-Type", "text/event-stream")
-			io.WriteString(w, "data: {\"model\":\"m\",\"choices\":[]}\n\ndata: oops\n\ndata: [DONE]\n\n")
-		default:
-			w.Header().Set("Content-Type", "text/plain")
-			io.WriteString(w, "hello")
-		}
-	}))
-
-	t.Run("off", func(t *testing.T) {
-		srv, logs := startProxy(t, target)
-		resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{}`))
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer resp.Body.Close()
-		readAll(t, resp.Body)
-		waitForQueries(t, 1)
-		if strings.Contains(logs.String(), "[DEBUG]") {
-			t.Errorf("debug lines printed with logging.debug off:\n%s", logs)
-		}
-	})
-
-	for _, tt := range []struct {
+	target := startUpstream(t, http.HandlerFunc(debugTestUpstream))
+	tests := []struct {
 		path string
 		want []string
 	}{
@@ -1027,36 +1053,41 @@ func TestDebugLogging(t *testing.T) {
 			"Content-Type not inspected",
 			"body ended at EOF after 5 bytes",
 		}},
-	} {
-		t.Run(tt.path, func(t *testing.T) {
-			srv, logs := startProxy(t, target)
-			cfg.Logging.Debug = true
-			resp, err := http.Post(srv.URL+tt.path, "application/json", strings.NewReader(`{}`))
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer resp.Body.Close()
-			readAll(t, resp.Body)
-			waitFor(t, "the request to finish", func() bool { return strings.Contains(logs.String(), "body ended") })
-
-			got := logs.String()
-			for _, w := range tt.want {
-				if !strings.Contains(got, w) {
-					t.Errorf("debug output missing %q:\n%s", w, got)
-				}
-			}
-			// All debug lines of one request carry the same request ID.
-			ids := map[string]bool{}
-			for _, line := range strings.Split(strings.TrimSpace(got), "\n") {
-				if rest, ok := strings.CutPrefix(line, "[DEBUG] req "); ok {
-					ids[strings.SplitN(rest, ":", 2)[0]] = true
-				}
-			}
-			if len(ids) != 1 {
-				t.Errorf("want one request ID across debug lines, got %v", ids)
-			}
-		})
 	}
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) { checkDebugOutput(t, target, tt.path, tt.want) })
+	}
+}
+
+// checkDebugOutput sends one request with logging.debug on and checks that
+// the debug lines contain want and share one request ID.
+func checkDebugOutput(t *testing.T, target *url.URL, path string, want []string) {
+	t.Helper()
+	srv, logs := startProxy(t, target)
+	cfg.Logging.Debug = true
+	postAndDrain(t, srv.URL+path)
+	waitFor(t, "the request to finish", func() bool { return strings.Contains(logs.String(), "body ended") })
+
+	got := logs.String()
+	for _, w := range want {
+		if !strings.Contains(got, w) {
+			t.Errorf("debug output missing %q:\n%s", w, got)
+		}
+	}
+	if ids := debugRequestIDs(got); len(ids) != 1 {
+		t.Errorf("want one request ID across debug lines, got %v", ids)
+	}
+}
+
+// debugRequestIDs returns the request IDs ("req N:") found in debug lines.
+func debugRequestIDs(logs string) map[string]bool {
+	ids := map[string]bool{}
+	for _, line := range strings.Split(logs, "\n") {
+		if rest, ok := strings.CutPrefix(line, "[DEBUG] req "); ok {
+			ids[strings.SplitN(rest, ":", 2)[0]] = true
+		}
+	}
+	return ids
 }
 
 func TestConcurrentRequests(t *testing.T) {
