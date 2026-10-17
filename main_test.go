@@ -3,9 +3,11 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -528,6 +530,170 @@ func TestUpstreamUnavailable(t *testing.T) {
 	}
 }
 
+// servedProxy is the proxy run through serve, as main runs it.
+type servedProxy struct {
+	url, addr   string
+	logs        *syncBuffer
+	stop, force context.CancelFunc
+	done        chan struct{} // closed when serve returns
+	err         error         // serve's result, set before done is closed
+}
+
+// wait returns serve's result, failing the test if it doesn't return in time.
+func (p *servedProxy) wait(t *testing.T, timeout time.Duration) error {
+	t.Helper()
+	select {
+	case <-p.done:
+		return p.err
+	case <-time.After(timeout):
+		t.Fatal("serve did not return")
+		return nil
+	}
+}
+
+func startServe(t *testing.T, target *url.URL, timeout time.Duration) *servedProxy {
+	t.Helper()
+	_, logs := startProxy(t, target)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopCtx, stop := context.WithCancel(context.Background())
+	forceCtx, force := context.WithCancel(context.Background())
+	p := &servedProxy{
+		url: "http://" + ln.Addr().String(), addr: ln.Addr().String(),
+		logs: logs, stop: stop, force: force, done: make(chan struct{}),
+	}
+	go func() {
+		defer close(p.done)
+		p.err = serve(stopCtx, forceCtx, &http.Server{Handler: http.HandlerFunc(handleRequest)}, ln, timeout)
+	}()
+	t.Cleanup(func() {
+		stop()
+		force()
+		p.wait(t, 5*time.Second)
+	})
+	return p
+}
+
+// startStreamingUpstream serves an SSE response whose first event is sent
+// immediately and whose rest is sent once release is closed.
+func startStreamingUpstream(t *testing.T, first, rest string) (target *url.URL, release func()) {
+	t.Helper()
+	ch := make(chan struct{})
+	var once sync.Once
+	release = func() { once.Do(func() { close(ch) }) }
+	target = startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, first)
+		w.(http.Flusher).Flush()
+		select {
+		case <-ch:
+			io.WriteString(w, rest)
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(release) // runs before the upstream closes
+	return target, release
+}
+
+// postStream sends a streaming request and reads the first SSE event.
+func postStream(t *testing.T, base string) (*http.Response, *bufio.Reader) {
+	t.Helper()
+	resp, err := http.Post(base+"/v1/chat/completions", "application/json", strings.NewReader(`{"stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { resp.Body.Close() })
+	br := bufio.NewReader(resp.Body)
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatalf("reading first event: %v", err)
+		}
+		if line == "\n" {
+			return resp, br
+		}
+	}
+}
+
+const (
+	streamFirst = "data: {\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n"
+	streamRest  = "data: {\"model\":\"m\",\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}\n\n" +
+		"data: [DONE]\n\n"
+)
+
+func TestGracefulShutdownWaitsForInFlightStream(t *testing.T) {
+	target, release := startStreamingUpstream(t, streamFirst, streamRest)
+	p := startServe(t, target, time.Minute)
+	_, br := postStream(t, p.url)
+
+	p.stop()
+	waitFor(t, "listener to close", func() bool {
+		conn, err := net.Dial("tcp", p.addr)
+		if err == nil {
+			conn.Close()
+		}
+		return err != nil
+	})
+	if line := p.logs.String(); !strings.Contains(line, "waiting up to 1m0s for 1 in-flight request(s)") {
+		t.Errorf("shutdown message missing from logs:\n%s", line)
+	}
+	select {
+	case <-p.done:
+		t.Fatalf("serve returned (%v) while a stream was in flight", p.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	release()
+	if got := readAll(t, br); got != streamRest {
+		t.Errorf("remaining stream = %q, want %q", got, streamRest)
+	}
+	if err := p.wait(t, 2*time.Second); err != nil {
+		t.Errorf("serve() = %v, want nil", err)
+	}
+
+	logs := p.logs.String()
+	if !strings.Contains(logs, "Total tokens: 7") || strings.Contains(logs, "incomplete") || !strings.HasSuffix(logs, "Proxy stopped\n") {
+		t.Errorf("want one complete query and a stop message, logs:\n%s", logs)
+	}
+}
+
+func TestShutdownAbortsInFlightStream(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		timeout time.Duration
+		force   bool
+		want    string
+	}{
+		{"timeout", 100 * time.Millisecond, false, "Shutdown timed out: closing 1 request(s)"},
+		{"second signal", time.Minute, true, "Shutdown forced: closing 1 request(s)"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			target, _ := startStreamingUpstream(t, streamFirst, streamRest)
+			p := startServe(t, target, tt.timeout)
+			_, br := postStream(t, p.url)
+
+			p.stop()
+			if tt.force {
+				waitFor(t, "shutdown to start", func() bool { return strings.Contains(p.logs.String(), "waiting up to") })
+				p.force()
+			}
+			if err := p.wait(t, 2*time.Second); err != nil {
+				t.Errorf("serve() = %v, want nil", err)
+			}
+			if _, err := io.ReadAll(br); err == nil {
+				t.Error("client read the stream to a clean EOF; want it cut off")
+			}
+
+			logs := p.logs.String()
+			if !strings.Contains(logs, tt.want) || !strings.Contains(logs, "| incomplete") || !strings.HasSuffix(logs, "Proxy stopped\n") {
+				t.Errorf("want %q, an incomplete query and a stop message, logs:\n%s", tt.want, logs)
+			}
+		})
+	}
+}
+
 func TestNonAPIPathNotForwarded(t *testing.T) {
 	var hits atomic.Int32
 	target := startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -640,19 +806,81 @@ func TestCompleteDerived(t *testing.T) {
 		streamTime time.Duration
 		wantTotal  int
 		wantTPS    float64
+		wantEst    bool
 	}{
-		{"reported rate kept", MetricsData{CompletionTokens: 10, TokensPerSecond: 7, Duration: time.Second}, 0, 10, 7},
-		{"ttft excluded", MetricsData{PromptTokens: 5, CompletionTokens: 10, TimeToFirstToken: time.Second, Duration: 3 * time.Second}, 0, 15, 5},
-		{"stream time used", MetricsData{CompletionTokens: 10, Duration: 3 * time.Second}, 2 * time.Second, 10, 5},
-		{"whole duration fallback", MetricsData{CompletionTokens: 10, Duration: 2 * time.Second}, 0, 10, 5},
-		{"no completion tokens", MetricsData{PromptTokens: 4, Duration: time.Second}, 0, 4, 0},
+		{"reported rate kept", MetricsData{CompletionTokens: 10, TokensPerSecond: 7, Duration: time.Second}, 0, 10, 7, false},
+		{"ttft excluded", MetricsData{PromptTokens: 5, CompletionTokens: 10, TimeToFirstToken: time.Second, Duration: 3 * time.Second}, 0, 15, 5, true},
+		{"stream time used", MetricsData{CompletionTokens: 10, Duration: 3 * time.Second}, 2 * time.Second, 10, 5, true},
+		{"whole duration fallback", MetricsData{CompletionTokens: 10, Duration: 2 * time.Second}, 0, 10, 5, true},
+		{"no completion tokens", MetricsData{PromptTokens: 4, Duration: time.Second}, 0, 4, 0, false},
 	}
 	for _, tt := range tests {
 		d := tt.in
 		d.completeDerived(tt.streamTime)
-		if d.TotalTokens != tt.wantTotal || d.TokensPerSecond != tt.wantTPS {
-			t.Errorf("%s: total %d, tps %v; want %d, %v", tt.name, d.TotalTokens, d.TokensPerSecond, tt.wantTotal, tt.wantTPS)
+		if d.TotalTokens != tt.wantTotal || d.TokensPerSecond != tt.wantTPS || d.TPSEstimated != tt.wantEst {
+			t.Errorf("%s: total %d, tps %v, est %v; want %d, %v, %v",
+				tt.name, d.TotalTokens, d.TokensPerSecond, d.TPSEstimated, tt.wantTotal, tt.wantTPS, tt.wantEst)
 		}
+	}
+}
+
+func TestFormatMetricsLineMarksEstimatedTPS(t *testing.T) {
+	info := &requestInfo{method: "POST", path: "/v1/chat/completions"}
+	snap := metricsSnapshot{QueryCount: 1}
+	for _, tt := range []struct {
+		est  bool
+		want string
+	}{
+		{false, "| TPS: 40.00 |"},
+		{true, "| TPS: 40.00 (est.) |"},
+	} {
+		line := formatMetricsLine(time.Now(), info, 200, MetricsData{TokensPerSecond: 40, TPSEstimated: tt.est}, snap, true)
+		if !strings.Contains(line, tt.want) {
+			t.Errorf("estimated=%v: line %q does not contain %q", tt.est, line, tt.want)
+		}
+	}
+}
+
+func TestDetectBackend(t *testing.T) {
+	// Responses modeled on the real servers: LM Studio answers unknown
+	// endpoints with 200 and an error body, Ollama with 404.
+	lmUnknown := `{"error":"Unexpected endpoint or method."}`
+	servers := map[string]map[string]string{
+		"Ollama": {
+			"/api/version": `{"version":"0.40.2"}`,
+			"/v1/models":   `{"object":"list","data":[]}`,
+		},
+		"LM Studio": {
+			"/api/version":   lmUnknown,
+			"/api/v1/models": `{"models":[]}`,
+			"/v1/models":     `{"data":[],"object":"list"}`,
+		},
+		"OpenAI-compatible server": {
+			"/v1/models": `{"object":"list","data":[]}`,
+		},
+		"": {
+			"/api/version": "Not JSON",
+		},
+	}
+	for want, routes := range servers {
+		target := startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, ok := routes[r.URL.Path]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			io.WriteString(w, body)
+		}))
+		if got := detectBackend(target); got != want {
+			t.Errorf("detectBackend() = %q, want %q", got, want)
+		}
+	}
+
+	closed := httptest.NewServer(http.NotFoundHandler())
+	u, _ := url.Parse(closed.URL)
+	closed.Close()
+	if got := detectBackend(u); got != "" {
+		t.Errorf("unreachable upstream: detectBackend() = %q, want \"\"", got)
 	}
 }
 

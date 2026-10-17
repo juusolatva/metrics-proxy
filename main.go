@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -81,6 +82,7 @@ type MetricsData struct {
 	CompletionTokens int
 	TotalTokens      int
 	TokensPerSecond  float64
+	TPSEstimated     bool          // TokensPerSecond derived by completeDerived, not reported
 	TimeToFirstToken time.Duration // as reported by the upstream; 0 if unknown
 	Duration         time.Duration
 }
@@ -89,6 +91,10 @@ type MetricsData struct {
 // line) is buffered for metrics parsing. Larger bodies are proxied as usual
 // but not inspected.
 const maxCaptureBytes = 16 << 20
+
+// shutdownTimeout bounds how long a graceful shutdown waits for in-flight
+// requests; below systemd's default 90 s stop timeout.
+const shutdownTimeout = 60 * time.Second
 
 // Global config and metrics
 var (
@@ -99,7 +105,7 @@ var (
 )
 
 func main() {
-	fmt.Println("=== LM Studio Metrics Proxy ===")
+	fmt.Println("=== LLM Metrics Proxy ===")
 
 	// Load configuration
 	if err := loadConfig(); err != nil {
@@ -111,13 +117,17 @@ func main() {
 	proxy = newReverseProxy(target)
 
 	// Setup signal handling for graceful shutdown
-	go setupSignalHandling()
+	stop, force := setupSignalHandling()
 
 	// Start proxy server
 	fmt.Printf("Proxy listening on port %d\n", cfg.ProxyPort)
-	fmt.Printf("Forwarding to LM Studio at %s\n", target.Host)
+	if backend := detectBackend(target); backend != "" {
+		fmt.Printf("Forwarding to %s at %s\n", backend, target.Host)
+	} else {
+		fmt.Printf("Forwarding to upstream at %s (server type not detected)\n", target.Host)
+	}
 
-	if err := runProxy(); err != nil {
+	if err := runProxy(stop, force); err != nil {
 		fmt.Printf("Error running proxy: %v\n", err)
 		os.Exit(1)
 	}
@@ -167,29 +177,122 @@ func upstreamURL() *url.URL {
 	}
 }
 
-func setupSignalHandling() {
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+// detectBackend identifies the upstream server type for the startup banner.
+// It checks response bodies rather than status codes, since LM Studio answers
+// unknown endpoints with 200 and an error body. It returns "" if the upstream
+// is unreachable or not recognized.
+func detectBackend(target *url.URL) string {
+	client := &http.Client{Timeout: 2 * time.Second}
+	get := func(path string) (map[string]json.RawMessage, error) {
+		resp, err := client.Get(target.JoinPath(path).String())
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		var body map[string]json.RawMessage
+		if resp.StatusCode != http.StatusOK || json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&body) != nil {
+			return nil, nil
+		}
+		return body, nil
+	}
 
-	go func() {
-		<-sigChan
-		fmt.Println("\nShutting down...")
-		os.Exit(0)
-	}()
+	probes := []struct{ name, path, key string }{
+		{"Ollama", "/api/version", "version"},
+		{"LM Studio", "/api/v1/models", "models"},
+		{"OpenAI-compatible server", "/v1/models", "data"},
+	}
+	for _, p := range probes {
+		body, err := get(p.path)
+		if err != nil {
+			return "" // unreachable; don't wait for the other probes
+		}
+		if _, ok := body[p.key]; ok {
+			return p.name
+		}
+	}
+	return ""
 }
 
-func runProxy() error {
+// setupSignalHandling returns a context that is done on the first SIGINT or
+// SIGTERM (start a graceful shutdown) and one that is done on the second
+// (abort it).
+func setupSignalHandling() (stop, force context.Context) {
+	sigChan := make(chan os.Signal, 2)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	stop, stopNow := context.WithCancel(context.Background())
+	force, forceNow := context.WithCancel(context.Background())
+	go func() {
+		<-sigChan
+		stopNow()
+		<-sigChan
+		forceNow()
+	}()
+	return stop, force
+}
+
+func runProxy(stop, force context.Context) error {
 	server := &http.Server{
-		Addr:    fmt.Sprintf(":%d", cfg.ProxyPort),
 		Handler: http.HandlerFunc(handleRequest),
 		// No ReadTimeout/WriteTimeout: generations can take minutes, and an
 		// expiring ReadTimeout cancels the request context mid-response.
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.ProxyPort))
+	if err != nil {
+		return err
+	}
 
 	fmt.Println("Press Ctrl+C to stop")
-	return server.ListenAndServe()
+	return serve(stop, force, server, ln, shutdownTimeout)
+}
+
+// serve runs server on ln until stop is done, then shuts it down gracefully:
+// it stops accepting connections and waits up to timeout for in-flight
+// requests (streamed generations included) to finish. If the timeout passes
+// or force is done first, the remaining connections are closed and their
+// queries are recorded as incomplete.
+func serve(stop, force context.Context, server *http.Server, ln net.Listener, timeout time.Duration) error {
+	var inFlight atomic.Int64
+	next := server.Handler
+	server.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		inFlight.Add(1)
+		defer inFlight.Add(-1)
+		next.ServeHTTP(w, r)
+	})
+
+	errc := make(chan error, 1)
+	go func() { errc <- server.Serve(ln) }()
+
+	select {
+	case err := <-errc:
+		return err
+	case <-stop.Done():
+	}
+
+	if n := inFlight.Load(); n > 0 {
+		fmt.Fprintf(out, "\nShutting down: waiting up to %s for %d in-flight request(s) (Ctrl+C again to force)\n", timeout, n)
+	} else {
+		fmt.Fprintln(out, "\nShutting down")
+	}
+	ctx, cancel := context.WithTimeout(force, timeout)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		reason := "timed out"
+		if force.Err() != nil {
+			reason = "forced"
+		}
+		fmt.Fprintf(out, "Shutdown %s: closing %d request(s)\n", reason, inFlight.Load())
+		server.Close()
+		// Give the aborted requests a moment to record their metrics.
+		for deadline := time.Now().Add(2 * time.Second); inFlight.Load() > 0 && time.Now().Before(deadline); {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	<-errc // http.ErrServerClosed
+	fmt.Fprintln(out, "Proxy stopped")
+	return nil
 }
 
 // isAPIEndpoint checks if the request path matches an API endpoint pattern.
@@ -615,6 +718,7 @@ func (d *MetricsData) completeDerived(streamTime time.Duration) {
 	}
 	if genTime > 0 {
 		d.TokensPerSecond = float64(d.CompletionTokens) / genTime.Seconds()
+		d.TPSEstimated = true
 	}
 }
 
@@ -694,6 +798,9 @@ func formatMetricsLine(now time.Time, info *requestInfo, status int, data Metric
 	}
 	if data.TokensPerSecond > 0 {
 		fmt.Fprintf(&b, " | TPS: %.2f", data.TokensPerSecond)
+		if data.TPSEstimated {
+			b.WriteString(" (est.)")
+		}
 	}
 	if data.TimeToFirstToken > 0 {
 		fmt.Fprintf(&b, " | TTFT: %.2fs", data.TimeToFirstToken.Seconds())

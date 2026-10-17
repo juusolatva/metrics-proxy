@@ -3,7 +3,7 @@
 HTTP reverse proxy between LLM clients and a local LLM server (LM Studio primary; Ollama and other OpenAI-compatible servers also targeted); extracts per-request inference metrics (tokens, TPS, duration, model) and prints them to stdout.
 
 ## Source map
-- `main.go` — entire app (single `package main`): config (`loadConfig`, `parseConfig` with defaults), server (`runProxy`, `handleRequest`), forwarding (`newReverseProxy`, `meterResponse`), body inspection (`meteredBody`, `newCapture` → `jsonCapture` / `sseCapture` / `ndjsonCapture`, streaming ones share `lineSplitter`), payload parsing (`llmPayload`, `MetricsData.merge`), aggregation (`updateGlobalMetrics`), terminal output (`displayMetrics`).
+- `main.go` — entire app (single `package main`): config (`loadConfig`, `parseConfig` with defaults), startup banner backend probe (`detectBackend`), server (`runProxy`, `serve` with graceful shutdown driven by `setupSignalHandling`'s `stop`/`force` contexts, `handleRequest`), forwarding (`newReverseProxy`, `meterResponse`), body inspection (`meteredBody`, `newCapture` → `jsonCapture` / `sseCapture` / `ndjsonCapture`, streaming ones share `lineSplitter`), payload parsing (`llmPayload`, `MetricsData.merge`), aggregation (`updateGlobalMetrics`), terminal output (`displayMetrics`).
 - `main_test.go` — httptest tests; `startUpstream`/`startProxy` helpers reset globals.
 - `testdata/` — real captured responses: `lm_*` LM Studio (native v1 + OpenAI-compat, JSON + SSE), `ol_*` Ollama (native JSON + NDJSON stream, OpenAI-compat SSE). Ground truth for parser tests.
 - `config.yaml` — runtime config; read from CWD (hardcoded relative path).
@@ -20,6 +20,11 @@ HTTP reverse proxy between LLM clients and a local LLM server (LM Studio primary
 - `mergeJSON` tolerates `json.UnmarshalTypeError` (keeps other fields); `result`/`response` stay `json.RawMessage` (Ollama `/api/generate` `response` is a string).
 - Config key `lm_studio` names the upstream for any server type; keep it (backward compat).
 - Responses without model/tokens/TPS are not counted as queries.
+- Shutdown: the first SIGINT/SIGTERM triggers `server.Shutdown`, waiting up to `shutdownTimeout` (60 s) for in-flight streams. A second signal or the timeout triggers `server.Close`, and cut-off queries are logged `incomplete`. Exit status is 0 either way. Test `serve` via the `startServe` helper with your own contexts, not real signals.
+- TPS not reported by the upstream is derived in `completeDerived`, which sets `MetricsData.TPSEstimated`; the status line shows `(est.)`. LM Studio OpenAI-compat JSON has empty `stats: {}`, so its TPS is always estimated (badly understated for short replies).
+- TTFT comes only from LM Studio native `/api/v1/*`; Ollama (native + OpenAI-compat) and LM Studio OpenAI-compat don't report it, so no `TTFT` field for them.
+- LM Studio answers unknown endpoints with HTTP 200 + `{"error":...}` (Ollama: 404). Never identify the server by status code; `detectBackend` checks for a known JSON key per probe.
+- Verified live on 2026-10-17 against LM Studio and Ollama (all native/OpenAI-compat endpoints, streamed and not).
 
 ## Further memories
 - Language/deps/version pins: `mem:tech_stack`
