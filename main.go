@@ -29,9 +29,9 @@ import (
 
 // Config holds the proxy configuration
 type Config struct {
-	ProxyPort    int            `yaml:"proxy_port"`
-	LmStudio     LmStudioConfig `yaml:"lm_studio"`
-	APIEndpoints []string       `yaml:"api_endpoints"`
+	ProxyPort    int          `yaml:"proxy_port"`
+	Server       ServerConfig `yaml:"server"`
+	APIEndpoints []string     `yaml:"api_endpoints"`
 	// ForwardUnmatched forwards paths outside APIEndpoints without metering
 	// them instead of answering 404. Unset means true (forwardsUnmatched).
 	ForwardUnmatched *bool         `yaml:"forward_unmatched"`
@@ -44,7 +44,7 @@ func (c Config) forwardsUnmatched() bool {
 	return c.ForwardUnmatched == nil || *c.ForwardUnmatched
 }
 
-type LmStudioConfig struct {
+type ServerConfig struct {
 	Host string `yaml:"host"`
 	Port int    `yaml:"port"`
 }
@@ -132,7 +132,7 @@ func main() {
 	}
 	fmt.Printf("Loaded config from %s\n", opts.configPath)
 	debugf("config: proxy_port=%d upstream=%s:%d api_endpoints=%q forward_unmatched=%t history_points=%d",
-		cfg.ProxyPort, cfg.LmStudio.Host, cfg.LmStudio.Port, cfg.APIEndpoints, cfg.forwardsUnmatched(), cfg.Metrics.HistoryPoints)
+		cfg.ProxyPort, cfg.Server.Host, cfg.Server.Port, cfg.APIEndpoints, cfg.forwardsUnmatched(), cfg.Metrics.HistoryPoints)
 
 	if opts.csvPath != "" {
 		rec, err := openCSVLog(opts.csvPath)
@@ -248,11 +248,11 @@ func parseConfig(data []byte) (Config, error) {
 	if c.ProxyPort == 0 {
 		c.ProxyPort = 11436 // clear of 8080 (llama.cpp and many others) and Ollama's 11434/11435
 	}
-	if c.LmStudio.Host == "" {
-		c.LmStudio.Host = "localhost"
+	if c.Server.Host == "" {
+		c.Server.Host = "localhost"
 	}
-	if c.LmStudio.Port == 0 {
-		c.LmStudio.Port = 1234
+	if c.Server.Port == 0 {
+		c.Server.Port = 1234
 	}
 	if len(c.APIEndpoints) == 0 {
 		c.APIEndpoints = []string{"/api/v1/*", "/v1/*"} // LM Studio native + OpenAI-compatible
@@ -267,7 +267,7 @@ func parseConfig(data []byte) (Config, error) {
 func upstreamURL() *url.URL {
 	return &url.URL{
 		Scheme: "http",
-		Host:   net.JoinHostPort(cfg.LmStudio.Host, strconv.Itoa(cfg.LmStudio.Port)),
+		Host:   net.JoinHostPort(cfg.Server.Host, strconv.Itoa(cfg.Server.Port)),
 	}
 }
 

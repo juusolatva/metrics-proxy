@@ -121,8 +121,8 @@ Configuration is read from the file given by `--config` (default `config.yaml`) 
 # Port the proxy server listens on
 proxy_port: 11436
 
-# Upstream LLM server (LM Studio, Ollama or OpenAI-compatible; key name kept for compatibility)
-lm_studio:
+# Upstream LLM server (LM Studio, Ollama or OpenAI-compatible)
+server:
   host: "localhost"
   port: 1234
 
@@ -145,10 +145,10 @@ logging:
 
 ### Configuration Notes
 - The config path comes from `--config` (`parseFlags()`), default `config.yaml`. Relative paths are resolved against the working directory, not the binary's location. A missing, unreadable or invalid file exits with status 1 and an error naming the file. Positional arguments (e.g. `metrics_proxy my.yaml`) are rejected with exit status 2 instead of being ignored.
-- `parseConfig()` applies defaults for unset fields: `proxy_port` 11436, `lm_studio` `localhost:1234`, `history_points` 10, and `api_endpoints` `["/api/v1/*", "/v1/*"]` (also when given as an empty list). `forward_unmatched` is a `*bool` so that unset means `true`; read it via `cfg.forwardsUnmatched()`, which also treats the `nil` of test-built `Config`s as `true`. The port was 8080 until 2026-10-17; it moved to stay clear of 8080 (llama.cpp's `llama-server` and many others), Ollama's 11434 and a second Ollama instance's 11435. An empty config file is valid (`io.EOF` from the decoder is treated as "no settings").
+- `parseConfig()` applies defaults for unset fields: `proxy_port` 11436, `server` `localhost:1234`, `history_points` 10, and `api_endpoints` `["/api/v1/*", "/v1/*"]` (also when given as an empty list). `forward_unmatched` is a `*bool` so that unset means `true`; read it via `cfg.forwardsUnmatched()`, which also treats the `nil` of test-built `Config`s as `true`. The port was 8080 until 2026-10-17; it moved to stay clear of 8080 (llama.cpp's `llama-server` and many others), Ollama's 11434 and a second Ollama instance's 11435. An empty config file is valid (`io.EOF` from the decoder is treated as "no settings").
 - `parseConfig()` decodes strictly (`yaml.Decoder.KnownFields(true)`): unknown keys, i.e. typos or removed settings, fail with `field <key> not found in type main.<Struct>` and the line number (`TestParseConfigRejectsUnknownKeys`). `metrics.mode` and `metrics.refresh_interval_ms` were removed (never implemented), so old files containing them now fail to load until the keys are deleted. Removing or renaming a key has the same effect, so mention it in README.md.
 - `logging.debug` enables `[DEBUG]` output (see §5, "Debug Logging").
-- The `lm_studio` key names the upstream regardless of server type; to front Ollama, point it at `localhost:11434` and add `"/api/*"` (Ollama native `/api/chat`, `/api/generate`) to `api_endpoints`. Keep the key name for backward compatibility; an alias (e.g. `upstream`) would have to fall back to it.
+- The `server` key (`Config.Server`, `ServerConfig`) names the upstream regardless of server type; to front Ollama, point it at `localhost:11434` and add `"/api/*"` (Ollama native `/api/chat`, `/api/generate`) to `api_endpoints`. It was called `lm_studio` until 2026-10-17 and was renamed without an alias, since the project has a single user; old files fail with `field lm_studio not found`.
 
 ---
 
@@ -237,7 +237,7 @@ All application logic is currently contained in `main.go`:
 
 - **Standard Library First**: Prefer Go standard library packages (`net/http`, `net/http/httputil`, `sync`, `time`, `encoding/json`) over introducing new dependencies.
 - **Maintain Concurrency Safety**: Ensure `metrics.mu` write locks are held when updating state and read locks when reading state. Avoid holding locks across network I/O.
-- **Configuration Compatibility**: New options must be optional with sane defaults, so existing files keep working. Config parsing is strict: removing or renaming a key makes files that still use it fail with an "unknown field" error. That is acceptable for unused settings (as with `metrics.mode`); note it in README.md.
+- **Configuration Compatibility**: New options must be optional with sane defaults, so existing files keep working. Config parsing is strict: removing or renaming a key makes files that still use it fail with an "unknown field" error. The project has a single user so far, so renames and removals don't need aliases or deprecation periods (as with `metrics.mode` and `lm_studio` → `server`); note them in README.md and `config.yaml` comments.
 - **Testing**: Whenever fixing bugs or adding features, write corresponding unit tests using `net/http/httptest` to verify proxying, metrics parsing, and concurrent safety.
 - **SonarCloud**: Pushed commits are analyzed automatically (project `juusolatva_metrics_proxy`, public). Rules hit so far:
   - Keep each function's cognitive complexity at 15 or less, tests included (`go:S3776`). Move loop bodies, handlers and checks into named helpers. Check locally with `go run github.com/uudashr/gocognit/cmd/gocognit@v1.1.3 -over 15 .`, which scores function literals somewhat higher than Sonar.

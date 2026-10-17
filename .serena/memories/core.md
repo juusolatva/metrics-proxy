@@ -24,14 +24,14 @@ HTTP reverse proxy between LLM clients and a local LLM server (LM Studio primary
 - Upstream payload shapes differ per API: OpenAI-compat `/v1/*` (`model`, `usage.*`), LM Studio native v1 `/api/v1/*` (`model_instance_id`, `stats.{input_tokens,total_output_tokens,tokens_per_second,time_to_first_token_seconds}`; streamed `chat.end` wraps it in `result`), v0 (`usage` + `stats.time_to_first_token`). Source: lmstudio.ai/docs/developer/rest.
 - Ollama shapes: native `/api/chat|generate` → `prompt_eval_count`, `eval_count`, `eval_duration` (ns), streamed as `application/x-ndjson` (final line `done:true` holds stats); OpenAI-compat SSE reports TPS only in `timings.predicted_per_second`. TPS = `eval_count / eval_duration`.
 - `mergeJSON` tolerates `json.UnmarshalTypeError` (keeps other fields); `result`/`response` stay `json.RawMessage` (Ollama `/api/generate` `response` is a string).
-- Config key `lm_studio` names the upstream for any server type; keep it (backward compat).
+- Config key `server` (`Config.Server`, `ServerConfig`) names the upstream for any server type. It was `lm_studio` until 2026-10-17; the user had it renamed without an alias, as they are the only user so far and want no backward-compat shims.
 - Responses without model/tokens/TPS are not counted as queries.
 - Shutdown: the first SIGINT/SIGTERM triggers `server.Shutdown`, waiting up to `shutdownTimeout` (60 s) for in-flight streams. A second signal or the timeout triggers `server.Close`, and cut-off queries are logged `incomplete`. Exit status is 0 either way. Test `serve` via the `startServe` helper with your own contexts, not real signals.
 - TPS not reported by the upstream is derived in `completeDerived`, which sets `MetricsData.TPSEstimated`; the status line shows `(est.)`. LM Studio OpenAI-compat (`/v1/*`, streamed or not) never reports a rate: `stats` is empty or, with speculative decoding, holds only draft counters. So its TPS is always estimated (non-streamed: badly understated for short replies).
 - TTFT comes only from LM Studio native `/api/v1/*`; Ollama (native + OpenAI-compat) and LM Studio OpenAI-compat don't report it, so no `TTFT` field for them.
 - LM Studio answers unknown endpoints with HTTP 200 + `{"error":...}` (Ollama: 404). Never identify the server by status code; `detectBackend` checks for a known JSON key per probe.
 - Verified live on 2026-10-17 against LM Studio and Ollama (all native/OpenAI-compat endpoints, streamed and not). Not yet run on Windows (cross-compiles; checklist in `docs/windows-testing.md`).
-- `proxyError` answers 502 "Failed to connect to the upstream LLM server". User-facing text must not assume LM Studio (banner, errors); only the `lm_studio` config key keeps the name.
+- `proxyError` answers 502 "Failed to connect to the upstream LLM server". User-facing text and config keys must not assume LM Studio (banner, errors, `server` key).
 
 ## Further memories
 - Language/deps/version pins: `mem:tech_stack`

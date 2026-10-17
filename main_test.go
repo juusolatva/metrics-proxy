@@ -148,7 +148,7 @@ func TestParseConfigDefaults(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%q: %v", data, err)
 		}
-		if c.ProxyPort != 11436 || !c.forwardsUnmatched() || c.LmStudio.Host != "localhost" || c.LmStudio.Port != 1234 || c.Metrics.HistoryPoints != 10 ||
+		if c.ProxyPort != 11436 || !c.forwardsUnmatched() || c.Server.Host != "localhost" || c.Server.Port != 1234 || c.Metrics.HistoryPoints != 10 ||
 			fmt.Sprint(c.APIEndpoints) != "[/api/v1/* /v1/*]" {
 			t.Errorf("%q: defaults not applied: %+v", data, c)
 		}
@@ -193,6 +193,7 @@ func TestParseConfigRejectsUnknownKeys(t *testing.T) {
 		{"proxy_port: 8080\nproxyport: 9090\n", "line 2: field proxyport not found"},
 		{"metrics:\n  mode: \"periodic\"\n", "field mode not found"}, // removed setting
 		{"upstream:\n  host: x\n", "field upstream not found"},
+		{"lm_studio:\n  host: x\n", "field lm_studio not found"}, // renamed to server
 	} {
 		if _, err := parseConfig([]byte(tt.data)); err == nil || !strings.Contains(err.Error(), tt.want) {
 			t.Errorf("%q: err = %v, want it to contain %q", tt.data, err, tt.want)
@@ -243,14 +244,14 @@ func TestLoadConfigFromPath(t *testing.T) {
 	dir := t.TempDir()
 	good := filepath.Join(dir, "ollama.yaml")
 	bad := filepath.Join(dir, "bad.yaml")
-	os.WriteFile(good, []byte("lm_studio:\n  host: \"192.0.2.10\"\n  port: 11434\napi_endpoints: [\"/api/*\"]\n"), 0o644)
+	os.WriteFile(good, []byte("server:\n  host: \"192.0.2.10\"\n  port: 11434\napi_endpoints: [\"/api/*\"]\n"), 0o644)
 	os.WriteFile(bad, []byte("proxy_port: [not, a, port]\n"), 0o644)
 	t.Cleanup(func() { cfg = Config{} })
 
 	if err := loadConfig(good); err != nil {
 		t.Fatal(err)
 	}
-	if cfg.LmStudio.Host != "192.0.2.10" || cfg.LmStudio.Port != 11434 || cfg.ProxyPort != 11436 {
+	if cfg.Server.Host != "192.0.2.10" || cfg.Server.Port != 11434 || cfg.ProxyPort != 11436 {
 		t.Errorf("cfg = %+v, want upstream 192.0.2.10:11434 and default port", cfg)
 	}
 

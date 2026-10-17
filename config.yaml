@@ -8,8 +8,8 @@
 proxy_port: 11436
 
 # Upstream LLM server: LM Studio, Ollama or any OpenAI-compatible HTTP server.
-# The key is named "lm_studio" for backward compatibility, whatever the server.
-lm_studio:
+# (Called "lm_studio" in earlier versions.)
+server:
   # Host and port of the server (default: localhost:1234, LM Studio's default).
   # For Ollama use port 11434 and enable "/api/*" below.
   host: "localhost"

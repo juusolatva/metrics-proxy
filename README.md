@@ -34,16 +34,47 @@ Use `--config` to load another file, e.g. one per upstream server:
 
 Run `./metrics_proxy --help` to list all options.
 
-Point your client at the proxy instead of the LLM server, e.g.
-`http://localhost:11436/v1` instead of `http://localhost:1234/v1`. Keep the
-same path the client used with the server: if it worked with
-`http://localhost:11434/v1`, use `http://localhost:11436/v1`, not
-`http://localhost:11436`.
-
 The default port was 8080 before; it moved to 11436 to stay clear of the
 many programs using 8080 (llama.cpp's `llama-server` among them) and of
 Ollama's 11434 and a second Ollama instance's 11435. Set `proxy_port: 8080`
 to keep the old port.
+
+### Connecting clients
+
+The proxy listens on its own port (`proxy_port`, default 11436) and forwards
+each request to the server with the same path. Clients need the proxy's host
+and port, **plus the same path suffix (such as `/v1`) they would use with the
+server directly**:
+
+1. Find the URL the client uses for the server directly, e.g.
+   `http://localhost:11434/v1`.
+2. Replace only the host and port with the proxy's, e.g. `localhost:11436`
+   (or the address of the machine running the proxy).
+3. Keep the path at the end exactly as it was, e.g. `/v1`.
+
+| Client / API | URL directly to the server | URL through the proxy |
+|---|---|---|
+| OpenAI-compatible client (OpenAI SDK, most IDE tools) with Ollama | `http://localhost:11434/v1` | `http://localhost:11436/v1` |
+| OpenAI-compatible client with LM Studio | `http://localhost:1234/v1` | `http://localhost:11436/v1` |
+| Ollama-native client (Ollama libraries, `OLLAMA_HOST`) | `http://localhost:11434` | `http://localhost:11436` |
+| LM Studio native REST API | `http://localhost:1234/api/v1` | `http://localhost:11436/api/v1` |
+
+Ollama-native requests (`/api/chat`, `/api/generate`) are only metered when
+`"/api/*"` is in `api_endpoints` (see [Configuration](#configuration)).
+
+> **Don't forget the `/v1`.** OpenAI-compatible clients append paths such as
+> `/models` and `/chat/completions` to the base URL. With
+> `http://localhost:11436` as the base URL they request `/models` instead of
+> `/v1/models`, the server answers `404`, and the proxy logs
+> `[Proxy] GET /models 404 (…, not metered)`.
+
+Check the connection with `curl http://localhost:11436/v1/models`. It should
+return the server's model list, and the proxy should log a
+`[Proxy] GET /v1/models 200` line.
+
+One proxy forwards to one server. To meter several servers (e.g. Ollama and
+LM Studio), run one proxy per server, each with its own config file
+(`--config`) and `proxy_port`.
 
 ### Output
 
@@ -105,7 +136,7 @@ Requests cut off this way are logged as `incomplete`.
 ```yaml
 proxy_port: 11436         # port the proxy listens on
 
-lm_studio:                # upstream LLM server (any supported server type)
+server:                   # upstream LLM server (any supported server type)
   host: "localhost"
   port: 1234
 
@@ -143,7 +174,8 @@ config for LM Studio on `localhost:1234`. Unknown or misspelled keys are an
 error naming the key and line, e.g.
 `line 3: field histroy_points not found in type main.MetricsConfig`. This
 includes the removed `metrics.mode` and `metrics.refresh_interval_ms`
-settings, so delete them from older config files.
+settings, so delete them from older config files. Older files also need
+`lm_studio:` renamed to `server:`.
 
 ### Debug output
 
