@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/csv"
+	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"math"
@@ -161,6 +163,78 @@ func TestParseConfigFile(t *testing.T) {
 	}
 	if len(c.APIEndpoints) == 0 {
 		t.Error("config.yaml defines no api_endpoints")
+	}
+}
+
+func TestParseConfigIgnoresRemovedKeys(t *testing.T) {
+	// metrics.mode and refresh_interval_ms were removed; old files must load.
+	c, err := parseConfig([]byte("metrics:\n  mode: \"periodic\"\n  refresh_interval_ms: 500\n  history_points: 3\n"))
+	if err != nil {
+		t.Fatalf("old config with removed keys rejected: %v", err)
+	}
+	if c.Metrics.HistoryPoints != 3 {
+		t.Errorf("HistoryPoints = %d, want 3", c.Metrics.HistoryPoints)
+	}
+}
+
+func TestParseFlags(t *testing.T) {
+	tests := []struct {
+		args       []string
+		wantConfig string
+		wantCSV    string
+		wantErr    string // substring of the printed output; "" means success
+	}{
+		{nil, "config.yaml", "", ""},
+		{[]string{"--config", "/etc/metrics_proxy.yaml"}, "/etc/metrics_proxy.yaml", "", ""},
+		{[]string{"--config=conf/ollama.yaml", "--csv", "stats.csv"}, "conf/ollama.yaml", "stats.csv", ""},
+		{[]string{"-config", "x.yaml"}, "x.yaml", "", ""},
+		{[]string{"--config"}, "", "", "flag needs an argument"},
+		{[]string{"--config="}, "", "", "must not be empty"},
+		{[]string{"ollama.yaml"}, "", "", `unexpected argument "ollama.yaml"`},
+		{[]string{"--conf", "x.yaml"}, "", "", "flag provided but not defined"},
+	}
+	for _, tt := range tests {
+		var output bytes.Buffer
+		o, err := parseFlags(tt.args, &output)
+		if tt.wantErr == "" {
+			if err != nil || o.configPath != tt.wantConfig || o.csvPath != tt.wantCSV {
+				t.Errorf("%q: got %+v, %v; want config %q, csv %q", tt.args, o, err, tt.wantConfig, tt.wantCSV)
+			}
+			continue
+		}
+		if err == nil || !strings.Contains(output.String(), tt.wantErr) {
+			t.Errorf("%q: err %v, output %q; want an error mentioning %q", tt.args, err, output.String(), tt.wantErr)
+		}
+	}
+
+	var output bytes.Buffer
+	if _, err := parseFlags([]string{"--help"}, &output); !errors.Is(err, flag.ErrHelp) {
+		t.Errorf("--help: err = %v, want flag.ErrHelp", err)
+	}
+	if help := output.String(); !strings.Contains(help, "--config file") || !strings.Contains(help, `(default "config.yaml")`) || !strings.Contains(help, "--csv file") {
+		t.Errorf("help output missing flags or default:\n%s", help)
+	}
+}
+
+func TestLoadConfigFromPath(t *testing.T) {
+	dir := t.TempDir()
+	good := filepath.Join(dir, "ollama.yaml")
+	bad := filepath.Join(dir, "bad.yaml")
+	os.WriteFile(good, []byte("lm_studio:\n  host: \"10.0.0.4\"\n  port: 11434\napi_endpoints: [\"/api/*\"]\n"), 0o644)
+	os.WriteFile(bad, []byte("proxy_port: [not, a, port]\n"), 0o644)
+	t.Cleanup(func() { cfg = Config{} })
+
+	if err := loadConfig(good); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LmStudio.Host != "10.0.0.4" || cfg.LmStudio.Port != 11434 || cfg.ProxyPort != 8080 {
+		t.Errorf("cfg = %+v, want upstream 10.0.0.4:11434 and default port", cfg)
+	}
+
+	for _, path := range []string{filepath.Join(dir, "missing.yaml"), bad, dir} {
+		if err := loadConfig(path); err == nil || !strings.Contains(err.Error(), path) {
+			t.Errorf("loadConfig(%q) = %v, want an error naming the file", path, err)
+		}
 	}
 }
 

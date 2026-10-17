@@ -41,10 +41,11 @@ type LmStudioConfig struct {
 	Port int    `yaml:"port"`
 }
 
+// MetricsConfig holds metrics settings. The former "mode" and
+// "refresh_interval_ms" keys were never implemented and are now ignored
+// (parseConfig doesn't reject unknown keys, so old config files still load).
 type MetricsConfig struct {
-	Mode              string `yaml:"mode"`
-	RefreshIntervalMs int    `yaml:"refresh_interval_ms"`
-	HistoryPoints     int    `yaml:"history_points"`
+	HistoryPoints int `yaml:"history_points"`
 }
 
 type LoggingConfig struct {
@@ -109,27 +110,32 @@ var (
 )
 
 func main() {
-	csvPath := flag.String("csv", "", "append per-query statistics to this CSV `file`")
-	flag.Usage = flagUsage
-	flag.Parse()
+	opts, err := parseFlags(os.Args[1:], os.Stderr)
+	if errors.Is(err, flag.ErrHelp) {
+		os.Exit(0)
+	}
+	if err != nil {
+		os.Exit(2) // parseFlags has printed the error and usage
+	}
 
 	fmt.Println("=== LLM Metrics Proxy ===")
 
 	// Load configuration
-	if err := loadConfig(); err != nil {
+	if err := loadConfig(opts.configPath); err != nil {
 		fmt.Printf("Error loading config: %v\n", err)
 		os.Exit(1)
 	}
+	fmt.Printf("Loaded config from %s\n", opts.configPath)
 
-	if *csvPath != "" {
-		rec, err := openCSVLog(*csvPath)
+	if opts.csvPath != "" {
+		rec, err := openCSVLog(opts.csvPath)
 		if err != nil {
 			fmt.Printf("Error opening CSV file: %v\n", err)
 			os.Exit(1)
 		}
 		csvLog = rec
 		defer rec.Close()
-		fmt.Printf("Writing statistics to %s\n", *csvPath)
+		fmt.Printf("Writing statistics to %s\n", opts.csvPath)
 	}
 
 	target := upstreamURL()
@@ -154,24 +160,64 @@ func main() {
 
 // flagUsage prints the flags in the GNU style (--name). The flag package
 // accepts both -name and --name, but its default help shows -name.
-func flagUsage() {
-	w := flag.CommandLine.Output()
+func flagUsage(fs *flag.FlagSet) {
+	w := fs.Output()
 	fmt.Fprintf(w, "Usage: %s [options]\n\nOptions:\n", filepath.Base(os.Args[0]))
-	flag.VisitAll(func(f *flag.Flag) {
+	fs.VisitAll(func(f *flag.Flag) {
 		arg, usage := flag.UnquoteUsage(f)
+		if f.DefValue != "" {
+			usage += fmt.Sprintf(" (default %q)", f.DefValue)
+		}
 		fmt.Fprintf(w, "  --%s %s\n    \t%s\n", f.Name, arg, usage)
 	})
 }
 
-func loadConfig() error {
-	data, err := os.ReadFile("config.yaml")
+// options holds the command-line flags.
+type options struct {
+	configPath string
+	csvPath    string
+}
+
+// parseFlags parses the command-line arguments (without the program name).
+// Errors, and the usage for --help, are printed to output; --help returns
+// flag.ErrHelp. Relative paths are resolved against the working directory.
+func parseFlags(args []string, output io.Writer) (options, error) {
+	var o options
+	fs := flag.NewFlagSet("metrics_proxy", flag.ContinueOnError)
+	fs.SetOutput(output)
+	fs.Usage = func() { flagUsage(fs) }
+	fs.StringVar(&o.configPath, "config", "config.yaml", "read the configuration from `file`")
+	fs.StringVar(&o.csvPath, "csv", "", "append per-query statistics to this CSV `file`")
+
+	if err := fs.Parse(args); err != nil {
+		return o, err
+	}
+	// Positional arguments are not used; reject them rather than silently
+	// ignoring e.g. "metrics_proxy my.yaml".
+	if fs.NArg() > 0 {
+		err := fmt.Errorf("unexpected argument %q", fs.Arg(0))
+		fmt.Fprintln(output, err)
+		fs.Usage()
+		return o, err
+	}
+	if o.configPath == "" {
+		err := errors.New("--config: file path must not be empty")
+		fmt.Fprintln(output, err)
+		return o, err
+	}
+	return o, nil
+}
+
+// loadConfig reads and parses the configuration file at path into cfg.
+func loadConfig(path string) error {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("failed to read config file: %w", err)
 	}
 
 	c, err := parseConfig(data)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s: %w", path, err)
 	}
 	cfg = c
 	return nil

@@ -52,7 +52,11 @@ metrics_proxy/
   ```bash
   go run .
   ```
-  *Note: The application expects `config.yaml` to reside in the current working directory from which the command is executed.*
+  *Note: Without `--config`, the application reads `config.yaml` from the current working directory.*
+- **Use another config file**:
+  ```bash
+  go run . --config /path/to/ollama.yaml
+  ```
 - **Save per-query statistics to CSV** (command-line flag, not a `config.yaml` setting):
   ```bash
   go run . --csv stats.csv
@@ -99,13 +103,13 @@ Parser tests should use the captured payloads in `testdata/` rather than hand-wr
 
 ## 4. Configuration Reference (`config.yaml`)
 
-Configuration is unmarshaled directly into the `Config` struct via `loadConfig()`.
+Configuration is read from the file given by `--config` (default `config.yaml`) and unmarshaled into the `Config` struct via `loadConfig(path)` / `parseConfig()`.
 
 ```yaml
 # Port the proxy server listens on
 proxy_port: 8080
 
-# Upstream LM Studio instance connection settings
+# Upstream LLM server (LM Studio, Ollama or OpenAI-compatible; key name kept for compatibility)
 lm_studio:
   host: "localhost"
   port: 1234
@@ -115,21 +119,20 @@ api_endpoints:
   - "/api/v1/*"  # LM Studio native REST API
   - "/v1/*"      # OpenAI-compatible API
 
-# Metrics collection and display settings
+# Metrics settings
 metrics:
-  mode: "realtime"          # "realtime" or "periodic"
-  refresh_interval_ms: 1000 # Snapshot refresh interval in milliseconds
   history_points: 10        # Recent queries to average tokens/sec over
 
 # Logging settings
 logging:
-  debug: false
+  debug: false              # Not implemented yet
 ```
 
 ### Configuration Notes
-- `loadConfig()` hardcodes the relative path `"config.yaml"`. Changing directories before starting the process will cause a file read error.
-- `parseConfig()` applies defaults for unset fields: `proxy_port` 8080, `lm_studio` `localhost:1234`, `history_points` 10.
-- Several configuration fields (`metrics.mode`, `metrics.refresh_interval_ms`, and `logging.debug`) are defined in the structs and parsed from YAML, but do not yet have corresponding runtime behavior implemented in `main.go`.
+- The config path comes from `--config` (`parseFlags()`), default `config.yaml`. Relative paths are resolved against the working directory, not the binary's location. A missing, unreadable or invalid file exits with status 1 and an error naming the file. Positional arguments (e.g. `metrics_proxy my.yaml`) are rejected with exit status 2 instead of being ignored.
+- `parseConfig()` applies defaults for unset fields: `proxy_port` 8080, `lm_studio` `localhost:1234`, `history_points` 10. `api_endpoints` has no default: a file without it forwards nothing (every request gets 404).
+- `parseConfig()` uses non-strict YAML decoding, so unknown keys are ignored. That keeps old files loading after a key is removed: `metrics.mode` and `metrics.refresh_interval_ms` were dropped (never implemented), and `TestParseConfigIgnoresRemovedKeys` guards it. The flip side is that a typo in a key name is silently ignored.
+- `logging.debug` is parsed but has no runtime behavior yet.
 - The `lm_studio` key names the upstream regardless of server type; to front Ollama, point it at `localhost:11434` and add `"/api/*"` (Ollama native `/api/chat`, `/api/generate`) to `api_endpoints`. Keep the key name for backward compatibility; an alias (e.g. `upstream`) would have to fall back to it.
 
 ---
@@ -147,8 +150,8 @@ All application logic is currently contained in `main.go`:
 
 ### Execution Flow
 1. **Startup (`main`)**:
-   - Parses command-line flags (`flag`); the only one is `--csv <file>`. Document and show flags GNU-style (`--name`). `flagUsage()` prints `--help` that way, and the `flag` package also accepts the single-dash form.
-   - Loads configuration via `loadConfig()` / `parseConfig()`.
+   - Parses command-line flags with `parseFlags()` (own `flag.FlagSet`, `ContinueOnError`, testable): `--config <file>` and `--csv <file>`. Document and show flags GNU-style (`--name`). `flagUsage()` prints `--help` that way, and the `flag` package also accepts the single-dash form.
+   - Loads configuration via `loadConfig(opts.configPath)` / `parseConfig()` and prints which file was loaded.
    - With `--csv`, opens the file via `openCSVLog()`: append mode, created if missing, header (`csvHeader`) written only when the file is empty. An open error exits with status 1. The file is closed (deferred) after `runProxy()` returns.
    - Builds `proxy` targeting `upstreamURL()`.
    - Names the upstream in the startup banner via `detectBackend()`: probes `/api/version` (Ollama), `/api/v1/models` (LM Studio), `/v1/models` (OpenAI-compatible) with a 2 s timeout, checking the JSON body for a known key because LM Studio answers unknown endpoints with `200` and an error body. Falls back to "upstream … (server type not detected)" and stops probing on the first connection error. Only affects the banner.
@@ -193,7 +196,7 @@ All application logic is currently contained in `main.go`:
 4. **Do not buffer response bodies before forwarding**:
    - Bodies must stay streamed through `meteredBody`; reading the body in `ModifyResponse` would also hold back response headers and break SSE. `TestProxyStreamsSSEWithoutBuffering` guards this.
 5. **Unimplemented configuration**:
-   - `metrics.mode`, `metrics.refresh_interval_ms` and `logging.debug` are parsed but have no effect.
+   - `logging.debug` is parsed but has no effect. (`metrics.mode` and `metrics.refresh_interval_ms` were removed; old files containing them still load.)
 6. **Shutdown waits for in-flight requests**:
    - The first signal waits up to `shutdownTimeout` (60 s, a constant, not configurable) for running generations; a second signal aborts them. Tests drive `serve()` directly with their own contexts and timeout (`startServe`), not real signals. Aggregates are in memory only and are lost on exit; with `--csv`, per-query rows are kept in the file.
    - `--csv` does not check an existing file's header. Appending to a CSV with different columns (e.g. from a future version) mixes formats.

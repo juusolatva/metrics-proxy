@@ -25,8 +25,14 @@ go build -o metrics_proxy .
 ./metrics_proxy
 ```
 
-The proxy reads `config.yaml` from the current working directory, so start it
-from the repository root (or wherever your `config.yaml` is).
+By default the proxy reads `config.yaml` from the current working directory.
+Use `--config` to load another file, e.g. one per upstream server:
+
+```bash
+./metrics_proxy --config ~/metrics_proxy/ollama.yaml
+```
+
+Run `./metrics_proxy --help` to list all options.
 
 Point your client at the proxy instead of the LLM server, e.g.
 `http://localhost:8080/v1` instead of `http://localhost:1234/v1`.
@@ -83,7 +89,7 @@ Requests cut off this way are logged as `incomplete`.
 
 ## Configuration
 
-`config.yaml`:
+`config.yaml` (or the file given with `--config`):
 
 ```yaml
 proxy_port: 8080          # port the proxy listens on
@@ -103,8 +109,10 @@ metrics:
 To front Ollama, set the upstream to `localhost:11434` and add `"/api/*"` to
 `api_endpoints`.
 
-`metrics.mode`, `metrics.refresh_interval_ms` and `logging.debug` are accepted
-but have no effect yet.
+Unset values fall back to the defaults shown above, except `api_endpoints`:
+without it, nothing is forwarded. `logging.debug` is accepted but has no
+effect yet. The old `metrics.mode` and `metrics.refresh_interval_ms` settings
+have been removed; config files that still contain them load fine.
 
 ## Limitations
 
