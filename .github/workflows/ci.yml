@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: "0 5 * * 1" # weekly: new vulnerability advisories and Go releases without a push
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -16,6 +19,7 @@ jobs:
   test:
     name: Test (Go ${{ matrix.go-version || 'from go.mod' }})
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -26,6 +30,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0 # full history for Sonar blame and new-code detection
+          persist-credentials: false
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -44,16 +49,26 @@ jobs:
       - name: Test
         run: go test -race -covermode=atomic -coverprofile=coverage.out -v ./...
 
+      # SONAR_TOKEN is not available to pull requests from forks or Dependabot,
+      # and scheduled runs have no new code to analyze.
       - name: SonarQube Cloud scan
-        if: matrix.go-version == 'stable'
+        if: >-
+          matrix.go-version == 'stable' &&
+          (github.event_name == 'push' ||
+           (github.event_name == 'pull_request' &&
+            github.event.pull_request.head.repo.full_name == github.repository &&
+            github.event.pull_request.user.login != 'dependabot[bot]'))
         uses: SonarSource/sonarqube-scan-action@d209202bc7d53ff1cc128f7f907dac145c9d6ae9 # v8.3.0
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 
   golangci-lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -61,16 +76,19 @@ jobs:
 
       - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          version: v2.15.0
+          version: v2.15.0 # not updated by Dependabot
 
   govulncheck:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: stable
 
       - name: govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./... # not updated by Dependabot

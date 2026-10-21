@@ -32,9 +32,11 @@ metrics_proxy/
 ├── README.md          # Minimal project overview
 ├── CLAUDE.md          # Includes this file (`@AGENTS.md`)
 ├── .gitattributes     # Keeps testdata/ byte-exact (no CRLF conversion)
+├── .gitignore         # Build output, test binaries (go test -c), coverage.out
 ├── .golangci.yml      # golangci-lint v2 config (standard linters; errcheck off in tests)
 ├── sonar-project.properties  # SonarQube Cloud analysis settings (CI-based analysis, coverage)
 ├── .github/
+│   ├── dependabot.yml       # Weekly update PRs for GitHub Actions (SHA pins) and Go modules
 │   └── workflows/ci.yml     # CI: fmt, vet, tests + coverage, SonarQube Cloud, golangci-lint, govulncheck
 ├── docs/
 │   └── windows-testing.md   # Checklist for testing on Windows 11
@@ -112,7 +114,9 @@ Testing on Windows: see `docs/windows-testing.md`.
   ```bash
   go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
   ```
-- **CI** (`.github/workflows/ci.yml`, on pushes to `main` and on pull requests): `gofmt -s -l`, `go mod verify`, `go vet` and `go test -race` with coverage on the Go version from `go.mod` and on `stable`; the `stable` run uploads `coverage.out` to SonarQube Cloud. golangci-lint and govulncheck run on `stable`.
+- **CI** (`.github/workflows/ci.yml`, on pushes to `main`, on pull requests, weekly on Mondays and manually via `workflow_dispatch`): `gofmt -s -l`, `go mod verify`, `go vet` and `go test -race` with coverage on the Go version from `go.mod` and on `stable`; the `stable` run uploads `coverage.out` to SonarQube Cloud on pushes and on pull requests from this repository, except Dependabot's (forks and Dependabot get no `SONAR_TOKEN`; scheduled runs have no new code). golangci-lint and govulncheck run on `stable`. Jobs have `timeout-minutes`, and checkouts use `persist-credentials: false`. Actions are pinned by commit SHA with a version comment.
+- **Dependabot** (`.github/dependabot.yml`): weekly PRs for GitHub Actions (grouped) and Go modules, skipping releases younger than 7 days (`cooldown`). It doesn't update the golangci-lint and govulncheck versions in `ci.yml`; bump those by hand, together with the commands in this file, README.md and `.serena/memories/`.
+- **CodeQL** runs as GitHub's default setup (a repository setting, not a workflow file).
 
 ### Dependencies
 - **Tidy dependencies**:
@@ -212,7 +216,7 @@ All application logic is currently contained in `main.go`:
 8. **Debug Logging (`debugf`, `logging.debug`)**:
    - `debugf()` prints `[DEBUG] …` lines to `out` only when `cfg.Logging.Debug` is set. Each forwarded request gets an ID from `requestSeq` (`requestInfo.id`), and its lines start with `req N:`.
    - Startup: the effective config after defaults, and each `detectBackend()` probe's result (status, non-JSON body, missing or found key, connection error).
-   - `handleRequest`: method, request URI and client address.
+   - `handleRequest`: method, request URI, client address and whether the path is metered.
    - `meterResponse`: upstream URL, status, time to response headers, Content-Type, and whether the body is inspected (not for unknown Content-Types or `101` upgrades).
    - `meteredBody.debugSummary()` (from `finish()`): whether the body reached EOF, its byte count and stream time; the capture's `captureDiag` (parser name; JSON documents parsed, invalid, or skipped for exceeding `maxCaptureBytes`); the basis of an estimated TPS (returned by `completeDerived()`); and hints when nothing counts as inference, or when an SSE stream has no usage (the `include_usage` hint).
    - The counters live in each capture (`captureDiag.count()` from `mergeJSON`'s return value, `lineSplitter.oversized`). `mergeJSON` returns `false` for non-objects; a type error on the whole document (`UnmarshalTypeError.Field == ""`) counts as invalid, a field-level one doesn't. When adding a capture, implement `diag()`.
@@ -242,7 +246,7 @@ All application logic is currently contained in `main.go`:
 8. **Single upstream, no auth/TLS options**:
    - The upstream is always `http://host:port`; there is no HTTPS upstream, API key injection, or per-endpoint routing.
 9. **Not yet tested on Windows**:
-   - The binary and tests cross-compile (`GOOS=windows go build ./... && GOOS=windows go vet ./... && GOOS=windows go test -c .`), but nothing has been run on Windows. `docs/windows-testing.md` lists what to check (Ctrl+C handling, Excel's CSV lock and separators, paths, firewall and reserved ports, slow refused connections in two tests).
+   - The binary and tests cross-compile (`GOOS=windows go build ./... && GOOS=windows go vet ./... && GOOS=windows go test -c -o /dev/null .`), but nothing has been run on Windows. `docs/windows-testing.md` lists what to check (Ctrl+C handling, Excel's CSV lock and separators, paths, firewall and reserved ports, slow refused connections in two tests).
 
 ---
 
@@ -252,11 +256,11 @@ All application logic is currently contained in `main.go`:
 - **Maintain Concurrency Safety**: Ensure `metrics.mu` write locks are held when updating state and read locks when reading state. Avoid holding locks across network I/O.
 - **Configuration Compatibility**: New options must be optional with sane defaults, so existing files keep working. Config parsing is strict: removing or renaming a key makes files that still use it fail with an "unknown field" error. The project has a single user so far, so renames and removals don't need aliases or deprecation periods (as with `metrics.mode` and `lm_studio` → `server`); note them in README.md and `config.yaml` comments.
 - **Testing**: Whenever fixing bugs or adding features, write corresponding unit tests using `net/http/httptest` to verify proxying, metrics parsing, and concurrent safety.
-- **SonarCloud**: Analyzed by the CI workflow (project `juusolatva_metrics_proxy`, public; settings in `sonar-project.properties`, token in the `SONAR_TOKEN` repository secret). Automatic Analysis must stay disabled in SonarQube Cloud, or the CI scan fails. Rules hit so far:
+- **SonarCloud**: Analyzed by the CI workflow (project `juusolatva_metrics_proxy`, public; settings in `sonar-project.properties`, token in the `SONAR_TOKEN` repository secret). Automatic Analysis must stay disabled in SonarQube Cloud, or the CI scan fails. Pull requests from forks and Dependabot skip the scan (no token). Rules hit so far:
   - Keep each function's cognitive complexity at 15 or less, tests included (`go:S3776`). Move loop bodies, handlers and checks into named helpers. Check locally with `go run github.com/uudashr/gocognit/cmd/gocognit@v1.1.3 -over 15 .`, which scores function literals somewhat higher than Sonar.
   - Defer a context's cancel function in the function that creates it (`godre:S8188`).
   - Close response bodies with `defer resp.Body.Close()` right after the error check (`godre:S8208`).
-- **golangci-lint**: Must report `0 issues` (CI fails otherwise; config in `.golangci.yml`). `errcheck` is on for non-test code, apart from the `std-error-handling` preset (unchecked `Close`, `fmt.Fprint*` etc.). Where an error is deliberately ignored, discard it explicitly with a reason, e.g. `_ = r.w.Write(row) // write errors are sticky; returned by r.w.Error()`, rather than adding `//nolint`.
+- **golangci-lint**: Must report `0 issues` (CI fails otherwise; config in `.golangci.yml`). `errcheck` is on for non-test code, apart from the `std-error-handling` preset (unchecked `Close`, `fmt.Fprint*` etc.). Where an error is deliberately ignored, discard it explicitly with a reason, e.g. `_ = r.w.Write(row) // write errors are sticky; returned by r.w.Error()`, rather than adding `//nolint`. Exception: a discarded receive from a `chan error` (`<-errc` in `serve()`) is flagged by errcheck, and `_ = <-errc` by staticcheck S1005, so it keeps `//nolint:errcheck` with a reason.
 - **Git Hygiene**: Do not commit build artifacts (`metrics_proxy`, `.exe`) or temporary files.
 - **Merges**: Before committing a merge, run `git diff --check` and `go build ./... && go test -race ./...`; conflict markers have been committed to `main` before (merge `6a83ff7`, fixed afterwards).
 - **Keep docs in sync**: Behavior, config or limitation changes must update this file, `README.md`, `config.yaml` comments, and the affected `.serena/memories/` (committed, reviewed like code).

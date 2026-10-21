@@ -189,7 +189,7 @@ Set `logging.debug: true` to see how the proxy arrived at each query's
 numbers. That is useful when a value is missing or looks wrong:
 
 ```
-[DEBUG] req 2: POST /v1/chat/completions from [::1]:37316
+[DEBUG] req 2: POST /v1/chat/completions from [::1]:37316 (metered: true)
 [DEBUG] req 2: upstream http://192.0.2.20:1234/v1/chat/completions -> 200 after 0.00s, Content-Type "text/event-stream"
 [DEBUG] req 2: body ended at EOF after 2797 bytes, stream time 0.03s
 [DEBUG] req 2: parsed as SSE: 10 JSON document(s), 0 invalid, 0 skipped as larger than 16 MiB
@@ -233,9 +233,12 @@ go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 
 The parser tests use real responses captured from LM Studio and Ollama in
 `testdata/`. GitHub Actions (`.github/workflows/ci.yml`) runs these checks on
-pushes to `main` and on pull requests, with the tests on both the Go version
-from `go.mod` and the latest stable Go, and sends the results and test
-coverage to SonarQube Cloud.
+pushes to `main`, on pull requests and weekly, with the tests on both the Go
+version from `go.mod` and the latest stable Go, and sends the results and test
+coverage to SonarQube Cloud (not for pull requests from forks or Dependabot,
+which can't use the token). Dependabot (`.github/dependabot.yml`) proposes
+weekly updates to the GitHub Actions and Go modules; the golangci-lint and
+govulncheck versions are bumped by hand.
 
 See [AGENTS.md](AGENTS.md) for architecture and contribution guidelines.
 

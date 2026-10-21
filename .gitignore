@@ -1,2 +1,7 @@
 metrics_proxy.exe
 /metrics_proxy
+
+# go test -c output, coverage from the CI test command
+*.test
+*.test.exe
+coverage.out

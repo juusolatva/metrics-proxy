@@ -1,6 +1,6 @@
 # SonarCloud
 
-- Project `juusolatva_metrics_proxy` (org `juusolatva`), public. Analyzed by CI (`.github/workflows/ci.yml`, job `test`, `stable` matrix entry) with `sonar-project.properties`; Automatic Analysis is disabled (CI scan fails while it is on). Coverage: `coverage.out` from `go test -coverprofile`. `*_test.go` files are classified as tests (`sonar.tests`), `testdata/` is excluded. Token: repository secret `SONAR_TOKEN`.
+- Project `juusolatva_metrics_proxy` (org `juusolatva`), public. Analyzed by CI (`.github/workflows/ci.yml`, job `test`, `stable` matrix entry) with `sonar-project.properties`; Automatic Analysis is disabled (CI scan fails while it is on). Coverage: `coverage.out` from `go test -coverprofile`. `*_test.go` files are classified as tests (`sonar.tests`), `testdata/` is excluded. Token: repository secret `SONAR_TOKEN`; not available to fork or Dependabot PRs, so the scan step is skipped for them (and for scheduled runs).
 - Read open issues without auth: `curl -s "https://sonarcloud.io/api/issues/search?componentKeys=juusolatva_metrics_proxy&resolved=false&ps=100"`. Line numbers refer to the last analyzed (pushed) commit; compare with `git show HEAD:<file>`.
 - Rules hit so far (fixed 2026-10-17):
   - `godre:S8188`: a `context.WithCancel` cancel function must be deferred in the creating function. Signal-driven cancels are created in `main` with `defer cancel()` and passed to `setupSignalHandling`.
