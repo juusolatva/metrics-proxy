@@ -236,12 +236,11 @@ func loadConfig(path string) error {
 }
 
 // parseConfig unmarshals YAML configuration and fills in defaults for unset
-// fields. Unknown keys (typos, removed settings) are errors.
+// fields. Unknown keys (typos, removed settings), duplicate keys and a second
+// YAML document are errors.
 func parseConfig(data []byte) (Config, error) {
-	var c Config
-	dec := yaml.NewDecoder(bytes.NewReader(data))
-	dec.KnownFields(true)                                             // reject misspelled and unsupported keys
-	if err := dec.Decode(&c); err != nil && !errors.Is(err, io.EOF) { // EOF: empty file
+	c, err := decodeConfig(data)
+	if err != nil {
 		return c, fmt.Errorf("failed to parse config file: %w", err)
 	}
 
@@ -259,6 +258,30 @@ func parseConfig(data []byte) (Config, error) {
 	}
 	if c.Metrics.HistoryPoints <= 0 {
 		c.Metrics.HistoryPoints = 10
+	}
+	return c, nil
+}
+
+// decodeConfig decodes the YAML document in data; an empty file gives the zero
+// Config. Settings after a "---" separator are rejected rather than ignored.
+func decodeConfig(data []byte) (Config, error) {
+	var c Config
+	l, err := yaml.NewLoader(bytes.NewReader(data),
+		yaml.WithKnownFields(), // reject misspelled and unsupported keys
+		yaml.WithUniqueKeys(),  // reject duplicate keys (the v4 default, pinned here)
+	)
+	if err != nil {
+		return c, err
+	}
+	if err := l.Load(&c); err != nil && !errors.Is(err, io.EOF) { // EOF: empty file
+		return c, err
+	}
+	var next yaml.Node
+	if err := l.Load(&next); !errors.Is(err, io.EOF) {
+		if err != nil {
+			return c, err // e.g. text after a "..." document end marker
+		}
+		return c, fmt.Errorf("line %d: a second YAML document starts here; a config file holds one", next.Line)
 	}
 	return c, nil
 }
