@@ -201,6 +201,38 @@ func TestParseConfigRejectsUnknownKeys(t *testing.T) {
 	}
 }
 
+// TestParseConfigYAMLRules pins the YAML behavior parseConfig relies on from
+// the pre-release go.yaml.in/yaml/v4, so that a dependency bump changing it
+// fails here instead of changing how config files load.
+func TestParseConfigYAMLRules(t *testing.T) {
+	// YAML 1.1 booleans; explicit document start and end markers.
+	for data, want := range map[string]bool{
+		"forward_unmatched: no\n": false, "forward_unmatched: off\n": false,
+		"forward_unmatched: yes\n": true, "---\nforward_unmatched: on\n...\n": true,
+	} {
+		c, err := parseConfig([]byte(data))
+		if err != nil {
+			t.Fatalf("%q: %v", data, err)
+		}
+		if c.forwardsUnmatched() != want {
+			t.Errorf("%q: forwardsUnmatched() = %t, want %t", data, !want, want)
+		}
+	}
+
+	for _, tt := range []struct{ data, want string }{
+		{"proxy_port: 1\nproxy_port: 2\n", `line 2: mapping key "proxy_port" already defined at line 1`},
+		{"server:\n  port: 1\n  port: 2\n", `line 3: mapping key "port" already defined at line 2`},
+		{"proxy_port: 11436\n---\nserver:\n  port: 11434\n", "line 2: a second YAML document starts here"},
+		{"proxy_port: 11436\n...\nserver: {}\n", "L3.C1"}, // content after the document end marker
+		{"server:\n\thost: x\n", "L2.C1"},                 // tab indentation: syntax errors give L<line>.C<column>
+		{"proxy_port: x\nlogging:\n  debug: maybe\n", "line 1: cannot construct !!str `x` into int; line 3:"},
+	} {
+		if _, err := parseConfig([]byte(tt.data)); err == nil || !strings.Contains(err.Error(), tt.want) {
+			t.Errorf("%q: err = %v, want it to contain %q", tt.data, err, tt.want)
+		}
+	}
+}
+
 func TestParseFlags(t *testing.T) {
 	tests := []struct {
 		args       []string

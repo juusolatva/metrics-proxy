@@ -183,6 +183,14 @@ includes the removed `metrics.mode` and `metrics.refresh_interval_ms`
 settings, so delete them from older config files. Older files also need
 `lm_studio:` renamed to `server:`.
 
+Duplicate keys are an error too. A config file holds a single YAML
+document: settings after a `---` separator, which earlier versions silently
+ignored, now fail with `line 2: a second YAML document starts here`. Wrong
+value types are listed on one line, separated by `; `, e.g.
+``line 1: cannot construct !!str `x` into int; line 3: …``. Syntax errors give
+the position as `L<line>.C<column>`; tab indentation, for example, gives
+`go-yaml load error in scanner (while scanning for the next token) at L3.C1: found character that cannot start any token`.
+
 ### Debug output
 
 Set `logging.debug: true` to see how the proxy arrived at each query's
