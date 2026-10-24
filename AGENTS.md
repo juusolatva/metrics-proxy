@@ -151,6 +151,9 @@ api_endpoints:
 # Forward other paths unmetered (false: answer 404 without forwarding)
 forward_unmatched: true
 
+# Forward model management and WebSocket requests (false: answer 403)
+forward_management: false
+
 # Metrics settings
 metrics:
   history_points: 10        # Recent queries to average tokens/sec over
@@ -166,6 +169,7 @@ logging:
 - `parseConfig()` decodes strictly via `decodeConfig()` (`yaml.NewLoader` with `yaml.WithKnownFields()` and `yaml.WithUniqueKeys()`; not the legacy `yaml.NewDecoder` shim): unknown keys, i.e. typos or removed settings, fail with `field <key> not found in type main.<Struct>` and the line number (`TestParseConfigRejectsUnknownKeys`). Duplicate keys fail too. A second YAML document (after `---`) fails with `line N: a second YAML document starts here`, and content after a `...` end marker with a syntax error; until 2026-10-22 both were silently dropped. `metrics.mode` and `metrics.refresh_interval_ms` were removed (never implemented), so old files containing them now fail to load until the keys are deleted. Removing or renaming a key has the same effect, so mention it in README.md.
 - The yaml module is a pre-release, and its error wording changed between RCs (rc.6: type errors on one line joined by `; `, syntax errors as `go-yaml load error in <stage> … at L<line>.C<column>`). `TestParseConfigYAMLRules` pins what the config relies on (YAML 1.1 booleans such as `no`/`on`, duplicate keys, single document, error positions); when a yaml bump fails it, update README.md's error examples along with the test.
 - `logging.debug` enables `[DEBUG]` output (see §5, "Debug Logging").
+- `forward_management` (`Config.ForwardManagement`, plain `bool`, default `false`) controls whether management requests and protocol upgrades are forwarded (see §5, "Request Routing"). It was added on 2026-10-24 as a security fix: the proxy listens on all interfaces without authentication, and Ollama and LM Studio rely on listening only on localhost to keep their management APIs private. Until then, management requests and upgrades were forwarded like any other request.
 - The `server` key (`Config.Server`, `ServerConfig`) names the upstream regardless of server type; to front Ollama, point it at `localhost:11434` and add `"/api/*"` (Ollama native `/api/chat`, `/api/generate`) to `api_endpoints`. It was called `lm_studio` until 2026-10-17 and was renamed without an alias, since the project has a single user; old files fail with `field lm_studio not found`.
 
 ---
@@ -191,6 +195,10 @@ All application logic is currently contained in `main.go`:
    - `main` creates two cancelable contexts, `stop` and `force`, with `defer cancel()`. `setupSignalHandling(stopNow, forceNow)` calls the first cancel on the first `SIGINT`/`SIGTERM` and the second on the next. Keep context creation and `defer cancel()` in `main`: SonarCloud rule `godre:S8188` flags cancel functions that aren't deferred where they're created.
    - `runProxy()` listens on `cfg.ProxyPort` and hands the `http.Server` (handler `handleRequest`) to `serve()`. No read/write timeouts (generations can take minutes; an expiring `ReadTimeout` cancels the request context), only `ReadHeaderTimeout`/`IdleTimeout`.
 2. **Request Routing (`handleRequest`)**:
+   - First, unless `cfg.ForwardManagement`, `refuseManagement()` answers `403 Forbidden` without contacting the upstream, with a `[Proxy] … not forwarded: METHOD PATH (forward_management: false)` line, for:
+     - management paths: `isManagementEndpoint()` matches the decoded path, after `path.Clean` and lowercasing, against `managementEndpoints`, exactly or below (`e` or `e + "/"`). The list holds Ollama's `/api/pull`, `/api/push`, `/api/create`, `/api/copy`, `/api/delete`, `/api/blobs` and the ollama.com account endpoints `/api/me` (shows the signed-in account), `/api/signout`, `/api/user/keys`, plus LM Studio's `/api/v1/models/load`, `/unload` and `/download`. These are refused even when they match `api_endpoints` (Ollama's `"/api/*"`) or `forward_unmatched` is false. Ollama's `/api/web_search`, `/api/web_fetch` and `/api/experimental/*` variants are deliberately not listed: like cloud models through `/api/chat`, they run queries on the account but don't change models or the account.
+     - protocol upgrades: `offersUpgrade()` is true when an `Upgrade` header offers any protocol other than `h2c`, on any path. An upgraded connection is a tunnel whose later requests never reach `handleRequest`. LM Studio's SDK API (lmstudio-js/-python) runs over WebSocket on the server port (`/llm`, `/embedding`, `/system`, `/diagnostics`, `/files`, `/repository`, `/plugins`, `/runtime`; `/llm` loads models, `/repository` downloads them), so SDK clients need `forward_management: true`. Upgrades are refused in general rather than by namespace list, so namespaces added later are covered too. The proxy never metered upgraded connections anyway.
+     - Otherwise it deletes the request's `Upgrade` header, which at that point can only offer `h2c` (Java's `HttpClient` adds it to ordinary `http://` requests and stays on HTTP/1.1 when the server doesn't switch). Without that header `ReverseProxy` can't tunnel, so the request goes out as plain HTTP/1.1. With `forward_management: true` nothing is refused or removed.
    - Validates incoming path against `cfg.APIEndpoints` using `isAPIEndpoint()` (prefix match, trailing `*` stripped).
    - Paths that match are metered. Others are forwarded unmetered when `cfg.forwardsUnmatched()` (default), otherwise answered with `404 Not Found` and a `[Proxy] Non-API request` line, without contacting the upstream.
    - Stores a `requestInfo` (request ID, start time, method, path, `metered`) in the request context and calls `proxy.ServeHTTP`.
@@ -246,6 +254,8 @@ All application logic is currently contained in `main.go`:
    - `go.mod` declares Go 1.21. Avoid standard library APIs newer than 1.21 (e.g. `http.ServeMux` method/wildcard patterns from 1.22) unless the `go` directive is bumped. The `min`/`max` builtins (1.21) are fine.
 8. **Single upstream, no auth/TLS options**:
    - The upstream is always `http://host:port`; there is no HTTPS upstream, API key injection, or per-endpoint routing.
+   - Clients aren't authenticated, and the proxy listens on all interfaces (the user's LLM clients run on other LAN machines). Anyone who can reach `proxy_port` can query the upstream with the proxy's localhost identity. Only `managementEndpoints` and protocol upgrades are held back (`forward_management`). Queries can still load and unload models (a chat request loads its model; Ollama's `keep_alive: 0` unloads it), and the list must be extended by hand when an upstream adds management endpoints.
+   - With `forward_management: false`, LM Studio SDK clients (WebSocket) can't be used through the proxy.
 9. **Not yet tested on Windows**:
    - The binary and tests cross-compile (`GOOS=windows go build ./... && GOOS=windows go vet ./... && GOOS=windows go test -c -o /dev/null .`), but nothing has been run on Windows. `docs/windows-testing.md` lists what to check (Ctrl+C handling, Excel's CSV lock and separators, paths, firewall and reserved ports, slow refused connections in two tests).
 

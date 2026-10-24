@@ -173,6 +173,15 @@ func TestParseConfigDefaults(t *testing.T) {
 	}
 }
 
+func TestParseConfigForwardManagement(t *testing.T) {
+	if c, err := parseConfig(nil); err != nil || c.ForwardManagement {
+		t.Errorf("empty config: ForwardManagement = %t, %v; want false by default", c.ForwardManagement, err)
+	}
+	if c, err := parseConfig([]byte("forward_management: true\n")); err != nil || !c.ForwardManagement {
+		t.Errorf("forward_management: true: ForwardManagement = %t, %v; want true", c.ForwardManagement, err)
+	}
+}
+
 func TestParseConfigFile(t *testing.T) {
 	data, err := os.ReadFile("config.yaml")
 	if err != nil {
@@ -930,6 +939,209 @@ func TestNonAPIPathNotForwarded(t *testing.T) {
 	}
 	if hits.Load() != 0 {
 		t.Error("non-API request was forwarded upstream")
+	}
+}
+
+func TestIsManagementEndpoint(t *testing.T) {
+	for p, want := range map[string]bool{
+		"/api/pull": true, "/api/pull/": true, "/API/Pull": true, "//api/pull": true, "/api/../api/delete": true,
+		"/v1/../api/push": true, "/api/copy": true, "/api/create": true, "/api/blobs/sha256:0": true,
+		"/api/me": true, "/api/signout": true, "/api/user/keys/x": true,
+		"/api/v1/models/load": true, "/api/v1/models/unload": true, "/api/v1/models/download/status/1": true,
+		"/api/chat": false, "/api/generate": false, "/api/embed": false, "/api/tags": false, "/api/show": false,
+		"/api/ps": false, "/api/version": false, "/api/pullx": false, "/api/web_search": false, "/api/web_fetch": false,
+		"/api/v1/models": false, "/api/v1/chat": false, "/v1/models": false, "/v1/chat/completions": false,
+		"/": false, "*": false, "": false,
+	} {
+		if got := isManagementEndpoint(p); got != want {
+			t.Errorf("isManagementEndpoint(%q) = %t, want %t", p, got, want)
+		}
+	}
+}
+
+// startCountingUpstream starts a fake upstream that counts the requests
+// reaching it. It accepts WebSocket handshakes, as LM Studio's SDK API does,
+// and echoes the first 4 bytes sent over the upgraded connection. Other
+// requests get a JSON body and an X-Upgrade-Seen header with the Upgrade
+// header they arrived with.
+func startCountingUpstream(t *testing.T) (*url.URL, *atomic.Int32) {
+	t.Helper()
+	hits := &atomic.Int32{}
+	target := startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+			echoUpgraded(t, w)
+			return
+		}
+		w.Header().Set("X-Upgrade-Seen", r.Header.Get("Upgrade"))
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"status":"success"}`)
+	}))
+	return target, hits
+}
+
+// echoUpgraded switches the connection to a WebSocket and echoes 4 bytes.
+func echoUpgraded(t *testing.T, w http.ResponseWriter) {
+	conn, brw, err := http.NewResponseController(w).Hijack()
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	defer conn.Close()
+	brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+	brw.Flush()
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(brw, buf); err == nil {
+		brw.Write(buf)
+		brw.Flush()
+	}
+}
+
+// sendRequest sends a request with the given header name/value pairs and
+// returns the response, with its body read and closed. The body of a 101
+// (an upgraded connection, which doesn't end) is closed unread.
+func sendRequest(t *testing.T, method, url string, header ...string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(method, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i+1 < len(header); i += 2 {
+		req.Header.Set(header[i], header[i+1])
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		io.Copy(io.Discard, resp.Body)
+	}
+	resp.Body.Close()
+	return resp
+}
+
+// webSocketHandshake holds the headers of a WebSocket opening handshake.
+var webSocketHandshake = []string{
+	"Connection", "Upgrade", "Upgrade", "websocket",
+	"Sec-WebSocket-Version", "13", "Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==", // betterleaks:allow (RFC 6455 sample nonce, not a secret)
+}
+
+func TestManagementEndpointNotForwarded(t *testing.T) {
+	target, hits := startCountingUpstream(t)
+	srv, logs := startProxy(t, target)
+	cfg.APIEndpoints = []string{"/api/*", "/v1/*"} // documented Ollama setup; "/api/*" matches the management paths too
+
+	for _, rq := range [][2]string{
+		{"DELETE", "/api/delete"}, {"POST", "/api/pull"}, {"POST", "/api/push"}, {"POST", "/api/copy"},
+		{"POST", "/api/create"}, {"HEAD", "/api/blobs/sha256:0"}, {"POST", "/api/me"}, {"POST", "/api/signout"},
+		{"POST", "/api/%70ull"}, {"POST", "/api/../api/pull"}, {"POST", "//api/pull"}, {"POST", "/API/PULL"},
+		{"POST", "/api/pull/"}, {"POST", "/api/v1/models/load"}, {"POST", "/api/v1/models/download"},
+	} {
+		if resp := sendRequest(t, rq[0], srv.URL+rq[1]); resp.StatusCode != http.StatusForbidden {
+			t.Errorf("%s %s: status = %d, want 403", rq[0], rq[1], resp.StatusCode)
+		}
+	}
+	if n := hits.Load(); n != 0 {
+		t.Errorf("%d management request(s) reached the upstream", n)
+	}
+	if want := "[Proxy] Management request not forwarded: DELETE /api/delete (forward_management: false)"; !strings.Contains(logs.String(), want) {
+		t.Errorf("logs missing %q:\n%s", want, logs)
+	}
+
+	// Queries and listings are still forwarded.
+	for _, rq := range [][2]string{
+		{"POST", "/api/chat"}, {"GET", "/api/tags"}, {"POST", "/api/show"}, {"GET", "/api/version"},
+		{"GET", "/api/v1/models"}, {"GET", "/v1/models"},
+	} {
+		if resp := sendRequest(t, rq[0], srv.URL+rq[1]); resp.StatusCode != http.StatusOK {
+			t.Errorf("%s %s: status = %d, want the upstream's 200", rq[0], rq[1], resp.StatusCode)
+		}
+	}
+	if n := hits.Load(); n != 6 {
+		t.Errorf("upstream got %d requests, want 6", n)
+	}
+}
+
+func TestUpgradeNotForwarded(t *testing.T) {
+	target, hits := startCountingUpstream(t)
+	srv, logs := startProxy(t, target) // forward_unmatched unset (true), as by default
+
+	// LM Studio SDK namespaces and a metered path.
+	for _, p := range []string{"/llm", "/repository", "/system", "/v1/chat/completions"} {
+		if resp := sendRequest(t, http.MethodGet, srv.URL+p, webSocketHandshake...); resp.StatusCode != http.StatusForbidden {
+			t.Errorf("WebSocket handshake to %s: status = %d, want 403", p, resp.StatusCode)
+		}
+	}
+	for _, upgrade := range []string{"WebSocket", "h2c, websocket"} {
+		header := append(append([]string{}, webSocketHandshake...), "Upgrade", upgrade, "Connection", "keep-alive, Upgrade")
+		if resp := sendRequest(t, http.MethodGet, srv.URL+"/llm", header...); resp.StatusCode != http.StatusForbidden {
+			t.Errorf("Upgrade %q: status = %d, want 403", upgrade, resp.StatusCode)
+		}
+	}
+	if n := hits.Load(); n != 0 {
+		t.Errorf("%d upgrade request(s) reached the upstream", n)
+	}
+	if want := "[Proxy] Protocol upgrade not forwarded: GET /llm (forward_management: false)"; !strings.Contains(logs.String(), want) {
+		t.Errorf("logs missing %q:\n%s", want, logs)
+	}
+
+	// An h2c offer (Java's HttpClient sends one with ordinary requests) is
+	// dropped and the request forwarded as plain HTTP/1.1.
+	resp := sendRequest(t, http.MethodGet, srv.URL+"/v1/models",
+		"Connection", "Upgrade, HTTP2-Settings", "Upgrade", "h2c", "HTTP2-Settings", "AAMAAABkAARAAAAAAAIAAAAA")
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("X-Upgrade-Seen") != "" {
+		t.Errorf("h2c offer: status = %d, upstream saw Upgrade %q; want 200 and no Upgrade", resp.StatusCode, resp.Header.Get("X-Upgrade-Seen"))
+	}
+}
+
+func TestManagementForwardedWhenEnabled(t *testing.T) {
+	target, hits := startCountingUpstream(t)
+	srv, logs := startProxy(t, target)
+	cfg.APIEndpoints = []string{"/api/*", "/v1/*"}
+	cfg.ForwardManagement = true
+
+	for _, p := range []string{"/api/pull", "/api/delete", "/api/v1/models/load"} {
+		if resp := sendRequest(t, http.MethodPost, srv.URL+p); resp.StatusCode != http.StatusOK {
+			t.Errorf("POST %s: status = %d, want the upstream's 200", p, resp.StatusCode)
+		}
+	}
+	resp := sendRequest(t, http.MethodGet, srv.URL+"/v1/models", "Connection", "Upgrade", "Upgrade", "h2c")
+	if got := resp.Header.Get("X-Upgrade-Seen"); got != "h2c" {
+		t.Errorf("h2c offer: upstream saw Upgrade %q, want it forwarded unchanged", got)
+	}
+	if n := hits.Load(); n != 4 {
+		t.Errorf("upstream got %d requests, want 4", n)
+	}
+	if strings.Contains(logs.String(), "not forwarded") {
+		t.Errorf("requests refused with forward_management: true:\n%s", logs)
+	}
+	checkWebSocketTunnel(t, srv.URL+"/llm")
+}
+
+// checkWebSocketTunnel opens a WebSocket through the proxy and checks that
+// bytes sent over it come back from the upstream.
+func checkWebSocketTunnel(t *testing.T, url string) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < len(webSocketHandshake); i += 2 {
+		req.Header.Set(webSocketHandshake[i], webSocketHandshake[i+1])
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	conn, ok := resp.Body.(io.ReadWriteCloser)
+	if resp.StatusCode != http.StatusSwitchingProtocols || !ok {
+		t.Fatalf("status = %d, writable body %t; want 101 and an upgraded connection", resp.StatusCode, ok)
+	}
+	conn.Write([]byte("ping"))
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(conn, buf); err != nil || string(buf) != "ping" {
+		t.Errorf("echo over the tunnel = %q, %v; want \"ping\"", buf, err)
 	}
 }
 

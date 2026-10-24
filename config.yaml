@@ -27,6 +27,23 @@ api_endpoints:
 # false answers them with 404 without forwarding.
 forward_unmatched: true
 
+# Forward requests that manage the server instead of querying it (default:
+# false). The proxy has no authentication, so anyone who can reach it could
+# otherwise use them even when the server itself only listens on localhost.
+# While false, these are answered with 403 without forwarding, even when they
+# match api_endpoints:
+# - Ollama: /api/pull, /api/push, /api/create, /api/copy, /api/delete,
+#   /api/blobs, and the ollama.com account endpoints /api/me, /api/signout,
+#   /api/user/keys. Queries that use the account (cloud models, /api/web_search,
+#   /api/web_fetch) are forwarded like other queries.
+# - LM Studio: /api/v1/models/load, /api/v1/models/unload,
+#   /api/v1/models/download.
+# - WebSocket and other protocol upgrades on any path, as used by LM Studio's
+#   SDK (lmstudio-js, lmstudio-python): set true to use the SDK through the
+#   proxy. An "Upgrade: h2c" offer (sent by Java's HttpClient) is dropped and
+#   the request forwarded as plain HTTP/1.1.
+forward_management: false
+
 # Metrics settings
 metrics:
   # Number of recent queries to average tokens/sec over (default: 10)

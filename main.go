@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -34,9 +35,13 @@ type Config struct {
 	APIEndpoints []string     `yaml:"api_endpoints"`
 	// ForwardUnmatched forwards paths outside APIEndpoints without metering
 	// them instead of answering 404. Unset means true (forwardsUnmatched).
-	ForwardUnmatched *bool         `yaml:"forward_unmatched"`
-	Metrics          MetricsConfig `yaml:"metrics"`
-	Logging          LoggingConfig `yaml:"logging"`
+	ForwardUnmatched *bool `yaml:"forward_unmatched"`
+	// ForwardManagement forwards requests that manage the upstream instead of
+	// querying it (managementEndpoints) and protocol upgrades such as
+	// WebSocket. Off by default: they are answered with 403 (refuseManagement).
+	ForwardManagement bool          `yaml:"forward_management"`
+	Metrics           MetricsConfig `yaml:"metrics"`
+	Logging           LoggingConfig `yaml:"logging"`
 }
 
 // forwardsUnmatched reports whether paths outside APIEndpoints are forwarded.
@@ -131,8 +136,8 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Printf("Loaded config from %s\n", opts.configPath)
-	debugf("config: proxy_port=%d upstream=%s:%d api_endpoints=%q forward_unmatched=%t history_points=%d",
-		cfg.ProxyPort, cfg.Server.Host, cfg.Server.Port, cfg.APIEndpoints, cfg.forwardsUnmatched(), cfg.Metrics.HistoryPoints)
+	debugf("config: proxy_port=%d upstream=%s:%d api_endpoints=%q forward_unmatched=%t forward_management=%t history_points=%d",
+		cfg.ProxyPort, cfg.Server.Host, cfg.Server.Port, cfg.APIEndpoints, cfg.forwardsUnmatched(), cfg.ForwardManagement, cfg.Metrics.HistoryPoints)
 
 	if opts.csvPath != "" {
 		rec, err := openCSVLog(opts.csvPath)
@@ -432,6 +437,73 @@ func isAPIEndpoint(path string) bool {
 	return false
 }
 
+// managementEndpoints are upstream API paths that change which models the
+// server has or runs, or concern its ollama.com account, rather than query
+// it. Unless forward_management is set they are not forwarded, even when they
+// match api_endpoints (such as Ollama's "/api/*"). Queries that use the
+// account (cloud models, Ollama's web search and fetch) are forwarded like
+// any other query.
+var managementEndpoints = []string{
+	// Ollama native API: model management, then the signed-in account
+	"/api/pull", "/api/push", "/api/create", "/api/copy", "/api/delete", "/api/blobs",
+	"/api/me", "/api/signout", "/api/user/keys",
+	// LM Studio native REST API
+	"/api/v1/models/load", "/api/v1/models/unload", "/api/v1/models/download",
+}
+
+// isManagementEndpoint reports whether the (decoded) request path is one of
+// managementEndpoints or below one. The path is cleaned and lowercased first,
+// so dot segments, repeated or trailing slashes and case variants that an
+// upstream router may accept match too.
+func isManagementEndpoint(p string) bool {
+	p = path.Clean("/" + strings.ToLower(p))
+	for _, e := range managementEndpoints {
+		if p == e || strings.HasPrefix(p, e+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// offersUpgrade reports whether h's Upgrade header offers a protocol other
+// than h2c, i.e. asks to turn the connection into a tunnel (WebSocket).
+func offersUpgrade(h http.Header) bool {
+	for _, v := range h.Values("Upgrade") {
+		for _, p := range strings.Split(v, ",") {
+			if p = strings.TrimSpace(p); p != "" && !strings.EqualFold(p, "h2c") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// refuseManagement answers r with 403 Forbidden, without contacting the
+// upstream, if it is a management request or asks for a protocol upgrade, and
+// reports whether it did. It runs while forward_management is false.
+//
+// An upgraded connection is a tunnel to the upstream: requests sent over it
+// don't pass through handleRequest. LM Studio's SDK API runs over WebSocket
+// (/llm, /repository, ...) and loads and downloads models that way. An
+// Upgrade header offering only h2c is removed instead: clients such as Java's
+// HttpClient add it to ordinary requests and stay on HTTP/1.1 when the
+// server doesn't switch, so the request is forwarded as plain HTTP/1.1.
+func refuseManagement(w http.ResponseWriter, r *http.Request) bool {
+	var what string
+	switch {
+	case isManagementEndpoint(r.URL.Path):
+		what = "Management request"
+	case offersUpgrade(r.Header):
+		what = "Protocol upgrade"
+	default:
+		r.Header.Del("Upgrade") // at most an h2c offer; the upstream can't switch without it
+		return false
+	}
+	fmt.Fprintf(out, "[Proxy] %s not forwarded: %s %s (forward_management: false)\n", what, r.Method, r.URL.Path)
+	http.Error(w, what+" not forwarded by the proxy (forward_management: false)", http.StatusForbidden)
+	return true
+}
+
 // requestInfo describes an incoming request; it travels to the response
 // side of the proxy via the request context.
 type requestInfo struct {
@@ -457,6 +529,9 @@ type requestInfoKey struct{}
 
 // handleRequest processes incoming requests
 func handleRequest(w http.ResponseWriter, r *http.Request) {
+	if !cfg.ForwardManagement && refuseManagement(w, r) {
+		return
+	}
 	metered := isAPIEndpoint(r.URL.Path)
 	if !metered && !cfg.forwardsUnmatched() {
 		fmt.Fprintf(out, "[Proxy] Non-API request: %s %s\n", r.Method, r.URL.Path)

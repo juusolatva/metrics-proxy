@@ -152,6 +152,8 @@ api_endpoints:            # path prefixes to meter
 
 forward_unmatched: true   # forward other paths unmetered (false: answer 404)
 
+forward_management: false # forward model management and WebSocket requests (false: answer 403)
+
 metrics:
   history_points: 10      # recent queries to average tokens/sec over
 
@@ -174,6 +176,40 @@ The time is until the response headers arrived. A `404` there comes from the
 upstream and usually means the client's base URL lacks a path such as `/v1`.
 Set `forward_unmatched: false` to answer such requests with `404` without
 forwarding them, as earlier versions did.
+
+### Management requests
+
+The proxy listens on all network interfaces and has no authentication, so
+anyone who can reach `proxy_port` can use the server through it, even when the
+server itself only accepts connections from localhost (the default for Ollama
+and LM Studio). Restrict access to the port with a firewall if needed.
+
+Requests that manage the server instead of querying it are therefore not
+forwarded by default. They are answered with `403 Forbidden`, even when they
+match `api_endpoints` (such as Ollama's `"/api/*"`), and logged:
+
+```
+[Proxy] Management request not forwarded: DELETE /api/delete (forward_management: false)
+```
+
+- Ollama: `/api/pull`, `/api/push`, `/api/create`, `/api/copy`, `/api/delete`
+  and `/api/blobs`, and the ollama.com account endpoints `/api/me`,
+  `/api/signout` and `/api/user/keys`. Queries that use the account (cloud
+  models, `/api/web_search`, `/api/web_fetch`) are forwarded like other
+  queries; sign the server out of ollama.com if clients shouldn't use it.
+- LM Studio: `/api/v1/models/load`, `/api/v1/models/unload` and
+  `/api/v1/models/download`.
+- WebSocket connections and other protocol upgrades, on any path
+  (`[Proxy] Protocol upgrade not forwarded: …`). LM Studio's SDK
+  (`lmstudio-js`, `lmstudio-python`) talks to the server over WebSocket and
+  loads and downloads models that way, so SDK clients only work through the
+  proxy with `forward_management: true`. An `Upgrade: h2c` offer, which Java's
+  `HttpClient` adds to ordinary requests, is dropped instead, and the request
+  is forwarded as plain HTTP/1.1.
+
+Model lists (`/api/tags`, `/api/ps`, `/api/v1/models`, `/v1/models`) and
+model details (`/api/show`) are forwarded as before. Set
+`forward_management: true` to forward management requests too.
 
 Unset values fall back to the defaults shown above; an empty file is a valid
 config for LM Studio on `localhost:1234`. Unknown or misspelled keys are an
@@ -224,6 +260,9 @@ apart. Request and response bodies are never logged.
   (`/api/v1/...`). Ollama (native and OpenAI-compatible) and LM Studio's
   OpenAI-compatible API don't report it, so their lines have no `TTFT`.
 - One upstream over plain HTTP; no HTTPS upstream or API key injection.
+- No client authentication: anyone who can reach the proxy can run queries on
+  the server (see [Management requests](#management-requests)). Queries can
+  also load and unload models, e.g. a chat request loads its model.
 - Running totals and averages are kept in memory only and are lost when the
   proxy stops. Use `--csv` to keep per-query statistics.
 - Not yet tested on Windows. It builds for Windows, and
