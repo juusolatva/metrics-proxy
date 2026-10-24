@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/signal"
@@ -41,9 +42,13 @@ type Config struct {
 	// ForwardManagement forwards requests that manage the upstream instead of
 	// querying it (managementEndpoints) and protocol upgrades such as
 	// WebSocket. Off by default: they are answered with 403 (refuseManagement).
-	ForwardManagement bool          `yaml:"forward_management"`
-	Metrics           MetricsConfig `yaml:"metrics"`
-	Logging           LoggingConfig `yaml:"logging"`
+	ForwardManagement bool `yaml:"forward_management"`
+	// AllowedHosts lists further names clients may give in the Host header,
+	// besides those allowedHost always accepts. "*.example" matches the
+	// subdomains of example, "*" any host.
+	AllowedHosts []string      `yaml:"allowed_hosts"`
+	Metrics      MetricsConfig `yaml:"metrics"`
+	Logging      LoggingConfig `yaml:"logging"`
 }
 
 // forwardsUnmatched reports whether paths outside APIEndpoints are forwarded.
@@ -138,8 +143,8 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Printf("Loaded config from %s\n", opts.configPath)
-	debugf("config: proxy_port=%d upstream=%s:%d api_endpoints=%q forward_unmatched=%t forward_management=%t history_points=%d",
-		cfg.ProxyPort, cfg.Server.Host, cfg.Server.Port, cfg.APIEndpoints, cfg.forwardsUnmatched(), cfg.ForwardManagement, cfg.Metrics.HistoryPoints)
+	debugf("config: proxy_port=%d upstream=%s:%d api_endpoints=%q forward_unmatched=%t forward_management=%t allowed_hosts=%q history_points=%d",
+		cfg.ProxyPort, cfg.Server.Host, cfg.Server.Port, cfg.APIEndpoints, cfg.forwardsUnmatched(), cfg.ForwardManagement, cfg.AllowedHosts, cfg.Metrics.HistoryPoints)
 
 	if opts.csvPath != "" {
 		rec, err := openCSVLog(opts.csvPath)
@@ -480,6 +485,49 @@ func offersUpgrade(h http.Header) bool {
 	return false
 }
 
+// localSuffixes are domains reserved for local use (RFC 6761, RFC 6762,
+// ICANN's .internal, RFC 8375), which public DNS can't answer for. ".lan" is
+// left out: it is not reserved and could still be delegated.
+var localSuffixes = []string{".localhost", ".local", ".internal", ".home.arpa"}
+
+// hostName returns the host in a Host header value (host or host:port)
+// without port, IPv6 brackets and trailing dot, in lowercase.
+func hostName(hostport string) string {
+	host, _, err := net.SplitHostPort(hostport)
+	if err != nil {
+		host = strings.TrimSuffix(strings.TrimPrefix(hostport, "["), "]") // no port
+	}
+	return strings.ToLower(strings.TrimSuffix(host, "."))
+}
+
+// allowedHost reports whether host (from hostName) names the proxy in a way
+// a DNS rebinding attack can't. The proxy replaces the Host header when
+// forwarding, so the upstream's own check never sees it. Like Ollama's own
+// check, it accepts an empty host, IP addresses, localhost, names in
+// localSuffixes and this machine's hostname, plus cfg.AllowedHosts.
+func allowedHost(host string) bool {
+	if _, err := netip.ParseAddr(host); err == nil || host == "" {
+		return true // an IP address involves no DNS lookup to rebind
+	}
+	if host == "localhost" || hasSuffix(host, localSuffixes) {
+		return true
+	}
+	if name, err := os.Hostname(); err == nil && host == strings.ToLower(name) {
+		return true
+	}
+	return cfg.allowsHost(host)
+}
+
+// hasSuffix reports whether s ends with one of suffixes.
+func hasSuffix(s string, suffixes []string) bool {
+	for _, suffix := range suffixes {
+		if strings.HasSuffix(s, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
 // refuseManagement answers r with 403 Forbidden, without contacting the
 // upstream, if it is a management request or asks for a protocol upgrade, and
 // reports whether it did. It runs while forward_management is false.
@@ -504,6 +552,18 @@ func refuseManagement(w http.ResponseWriter, r *http.Request) bool {
 	fmt.Fprintf(out, "[Proxy] %s not forwarded: %s %s (forward_management: false)\n", what, r.Method, escapeControls(r.URL.Path))
 	http.Error(w, what+" not forwarded by the proxy (forward_management: false)", http.StatusForbidden)
 	return true
+}
+
+// allowsHost reports whether host (lowercase, without port) matches an
+// allowed_hosts entry.
+func (c Config) allowsHost(host string) bool {
+	for _, entry := range c.AllowedHosts {
+		entry = strings.ToLower(entry)
+		if entry == "*" || entry == host || strings.HasPrefix(entry, "*.") && strings.HasSuffix(host, entry[1:]) {
+			return true
+		}
+	}
+	return false
 }
 
 // requestInfo describes an incoming request; it travels to the response
@@ -585,6 +645,12 @@ type requestInfoKey struct{}
 
 // handleRequest processes incoming requests
 func handleRequest(w http.ResponseWriter, r *http.Request) {
+	if host := hostName(r.Host); !allowedHost(host) {
+		fmt.Fprintf(out, "[Proxy] Rejected %s %s: Host %q not allowed (add %q to allowed_hosts if clients use this name)\n",
+			r.Method, escapeControls(r.URL.Path), r.Host, host)
+		http.Error(w, "Forbidden: Host not allowed", http.StatusForbidden)
+		return
+	}
 	if !cfg.ForwardManagement && refuseManagement(w, r) {
 		return
 	}

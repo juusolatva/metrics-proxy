@@ -44,6 +44,18 @@ forward_unmatched: true
 #   the request forwarded as plain HTTP/1.1.
 forward_management: false
 
+# Host names clients may use for the proxy (the request's Host header). IP
+# addresses, localhost, this machine's hostname and names ending in
+# .localhost, .local, .internal or .home.arpa always work; requests naming
+# any other host get 403 Forbidden, which stops web pages from reaching the
+# proxy and the server through DNS rebinding. List other names clients use
+# here, without port (default: none). "*.example" allows all names under
+# example, e.g. "*.lan" for a router's .lan names; "*" allows any host and
+# turns the check off.
+# allowed_hosts:
+#   - "llm.example.com"
+#   - "*.lan"
+
 # Metrics settings
 metrics:
   # Number of recent queries to average tokens/sec over (default: 10)

@@ -55,7 +55,8 @@ server directly**:
 1. Find the URL the client uses for the server directly, e.g.
    `http://localhost:11434/v1`.
 2. Replace only the host and port with the proxy's, e.g. `localhost:11436`
-   (or the address of the machine running the proxy).
+   (or the address of the machine running the proxy; host names other than
+   its hostname may need [`allowed_hosts`](#host-names)).
 3. Keep the path at the end exactly as it was, e.g. `/v1`.
 
 | Client / API | URL directly to the server | URL through the proxy |
@@ -163,6 +164,7 @@ api_endpoints:            # path prefixes to meter
 forward_unmatched: true   # forward other paths unmetered (false: answer 404)
 
 forward_management: false # forward model management and WebSocket requests (false: answer 403)
+allowed_hosts: []         # further host names clients use, see "Host names" below
 
 metrics:
   history_points: 10      # recent queries to average tokens/sec over
@@ -236,6 +238,39 @@ value types are listed on one line, separated by `; `, e.g.
 ``line 1: cannot construct !!str `x` into int; line 3: …``. Syntax errors give
 the position as `L<line>.C<column>`; tab indentation, for example, gives
 `go-yaml load error in scanner (while scanning for the next token) at L3.C1: found character that cannot start any token`.
+
+### Host names
+
+The proxy only forwards requests whose `Host` header (the host name in the
+URL the client uses) can't come from a DNS rebinding attack, in which a web
+page you visit points its own domain at the proxy and reads your server's
+API. These always work:
+
+- IP addresses, e.g. `http://192.0.2.10:11436` or `http://[::1]:11436`
+- `localhost` and names ending in `.localhost`
+- this machine's hostname (as printed by `hostname`)
+- names ending in `.local`, `.internal` or `.home.arpa`, which are reserved
+  for local networks
+
+Requests naming any other host get `403 Forbidden` and are logged without
+being forwarded:
+
+```
+[Proxy] Rejected GET /api/tags: Host "homelab.lan:11436" not allowed (add "homelab.lan" to allowed_hosts if clients use this name)
+```
+
+If clients reach the proxy by another name, e.g. from your own DNS or your
+router (`.lan` is not reserved, so it isn't built in), list it:
+
+```yaml
+allowed_hosts:
+  - "llm.example.com"     # this name only (any port)
+  - "*.lan"               # all names ending in .lan
+```
+
+`"*"` allows any host and turns the check off, as before this check was
+added. The proxy has no authentication, so this doesn't protect it from
+clients that can reach its port directly.
 
 ### Debug output
 

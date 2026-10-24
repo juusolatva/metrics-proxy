@@ -1697,3 +1697,104 @@ func checkEscapedLogs(t *testing.T, logs *syncBuffer, wantLines int, want ...str
 		}
 	}
 }
+
+// TestAllowedHost checks which Host header values are accepted: names a DNS
+// rebinding attack can't use, plus allowed_hosts.
+func TestAllowedHost(t *testing.T) {
+	t.Cleanup(func() { cfg = Config{} })
+	cfg = Config{}
+	hostname, err := os.Hostname()
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkAllowedHosts(t, true, "", "127.0.0.1:11436", "192.0.2.10", "192.0.2.10:11436", "[::1]:11436", "[::1]", "::1",
+		"[2001:db8::1]:80", "localhost", "LocalHost:11436", "localhost.:11436", "app.localhost", "printer.local:11436",
+		"llm.internal", "homelab.home.arpa", hostname, strings.ToUpper(hostname)+":11436")
+	checkAllowedHosts(t, false, "evil.example", "evil.example:11436", "evil.example.:11436", "[evil.example]",
+		"localhost.evil.example", "127.0.0.1.nip.io", "evil-localhost", "llm-proxy-test.lan")
+
+	cfg.AllowedHosts = []string{"llm.example.com", "*.LAN"}
+	checkAllowedHosts(t, true, "LLM.example.com:11436", "llm.example.com.", "llm-proxy-test.lan", "a.b.lan:11436")
+	checkAllowedHosts(t, false, "evil.example", "lan", "x.llm.example.com", "llm.example.com.evil.example")
+
+	cfg.AllowedHosts = []string{"*"}
+	checkAllowedHosts(t, true, "evil.example:11436")
+}
+
+func checkAllowedHosts(t *testing.T, want bool, hosts ...string) {
+	t.Helper()
+	for _, h := range hosts {
+		if got := allowedHost(hostName(h)); got != want {
+			t.Errorf("allowedHost(hostName(%q)) = %t, want %t (allowed_hosts %q)", h, got, want, cfg.AllowedHosts)
+		}
+	}
+}
+
+// getWithHost sends a GET request with the given Host header and returns the
+// response status.
+func getWithHost(t *testing.T, url, host string) int {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = host
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	readAll(t, resp.Body)
+	return resp.StatusCode
+}
+
+// TestProxyRejectsRebindingHost sends requests as a DNS rebinding page would
+// (Host naming the attacker's domain): they must get 403 without reaching the
+// upstream, while local names and allowed_hosts are forwarded.
+func TestProxyRejectsRebindingHost(t *testing.T) {
+	var hits atomic.Int32
+	target := startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"models":[]}`)
+	}))
+	srv, logs := startProxy(t, target)
+	cfg.AllowedHosts = []string{"llm.example.com"}
+
+	for _, path := range []string{"/api/tags", "/v1/models"} { // unmetered and metered
+		if status := getWithHost(t, srv.URL+path, "evil.example:11436"); status != http.StatusForbidden {
+			t.Errorf("%s with Host evil.example: status = %d, want 403", path, status)
+		}
+	}
+	if n := hits.Load(); n != 0 {
+		t.Errorf("upstream got %d request(s) with a rejected Host, want 0", n)
+	}
+	want := `[Proxy] Rejected GET /api/tags: Host "evil.example:11436" not allowed (add "evil.example" to allowed_hosts`
+	if !strings.Contains(logs.String(), want) {
+		t.Errorf("logs missing %q:\n%s", want, logs)
+	}
+
+	hostname, _ := os.Hostname()
+	accepted := []string{"localhost:11436", "192.0.2.10:11436", "[::1]:11436", hostname, "llm.example.com:11436"}
+	for _, host := range accepted {
+		if status := getWithHost(t, srv.URL+"/api/tags", host); status != http.StatusOK {
+			t.Errorf("Host %q: status = %d, want 200", host, status)
+		}
+	}
+	if n := hits.Load(); n != int32(len(accepted)) {
+		t.Errorf("upstream got %d request(s), want %d", n, len(accepted))
+	}
+}
+
+func TestParseConfigAllowedHosts(t *testing.T) {
+	c, err := parseConfig([]byte("allowed_hosts: [\"llm.example.com\", \"*.lan\"]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(c.AllowedHosts) != "[llm.example.com *.lan]" {
+		t.Errorf("AllowedHosts = %q", c.AllowedHosts)
+	}
+	if c, err := parseConfig(nil); err != nil || len(c.AllowedHosts) != 0 {
+		t.Errorf("default AllowedHosts = %q, %v; want none", c.AllowedHosts, err)
+	}
+}
