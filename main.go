@@ -13,9 +13,11 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -23,6 +25,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"go.yaml.in/yaml/v4"
 )
@@ -34,9 +38,17 @@ type Config struct {
 	APIEndpoints []string     `yaml:"api_endpoints"`
 	// ForwardUnmatched forwards paths outside APIEndpoints without metering
 	// them instead of answering 404. Unset means true (forwardsUnmatched).
-	ForwardUnmatched *bool         `yaml:"forward_unmatched"`
-	Metrics          MetricsConfig `yaml:"metrics"`
-	Logging          LoggingConfig `yaml:"logging"`
+	ForwardUnmatched *bool `yaml:"forward_unmatched"`
+	// ForwardManagement forwards requests that manage the upstream instead of
+	// querying it (managementEndpoints) and protocol upgrades such as
+	// WebSocket. Off by default: they are answered with 403 (refuseManagement).
+	ForwardManagement bool `yaml:"forward_management"`
+	// AllowedHosts lists further names clients may give in the Host header,
+	// besides those allowedHost always accepts. "*.example" matches the
+	// subdomains of example, "*" any host.
+	AllowedHosts []string      `yaml:"allowed_hosts"`
+	Metrics      MetricsConfig `yaml:"metrics"`
+	Logging      LoggingConfig `yaml:"logging"`
 }
 
 // forwardsUnmatched reports whether paths outside APIEndpoints are forwarded.
@@ -131,8 +143,8 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Printf("Loaded config from %s\n", opts.configPath)
-	debugf("config: proxy_port=%d upstream=%s:%d api_endpoints=%q forward_unmatched=%t history_points=%d",
-		cfg.ProxyPort, cfg.Server.Host, cfg.Server.Port, cfg.APIEndpoints, cfg.forwardsUnmatched(), cfg.Metrics.HistoryPoints)
+	debugf("config: proxy_port=%d upstream=%s:%d api_endpoints=%q forward_unmatched=%t forward_management=%t allowed_hosts=%q history_points=%d",
+		cfg.ProxyPort, cfg.Server.Host, cfg.Server.Port, cfg.APIEndpoints, cfg.forwardsUnmatched(), cfg.ForwardManagement, cfg.AllowedHosts, cfg.Metrics.HistoryPoints)
 
 	if opts.csvPath != "" {
 		rec, err := openCSVLog(opts.csvPath)
@@ -432,6 +444,128 @@ func isAPIEndpoint(path string) bool {
 	return false
 }
 
+// managementEndpoints are upstream API paths that change which models the
+// server has or runs, or concern its ollama.com account, rather than query
+// it. Unless forward_management is set they are not forwarded, even when they
+// match api_endpoints (such as Ollama's "/api/*"). Queries that use the
+// account (cloud models, Ollama's web search and fetch) are forwarded like
+// any other query.
+var managementEndpoints = []string{
+	// Ollama native API: model management, then the signed-in account
+	"/api/pull", "/api/push", "/api/create", "/api/copy", "/api/delete", "/api/blobs",
+	"/api/me", "/api/signout", "/api/user/keys",
+	// LM Studio native REST API
+	"/api/v1/models/load", "/api/v1/models/unload", "/api/v1/models/download",
+}
+
+// isManagementEndpoint reports whether the (decoded) request path is one of
+// managementEndpoints or below one. The path is cleaned and lowercased first,
+// so dot segments, repeated or trailing slashes and case variants that an
+// upstream router may accept match too.
+func isManagementEndpoint(p string) bool {
+	p = path.Clean("/" + strings.ToLower(p))
+	for _, e := range managementEndpoints {
+		if p == e || strings.HasPrefix(p, e+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// offersUpgrade reports whether h's Upgrade header offers a protocol other
+// than h2c, i.e. asks to turn the connection into a tunnel (WebSocket).
+func offersUpgrade(h http.Header) bool {
+	for _, v := range h.Values("Upgrade") {
+		for _, p := range strings.Split(v, ",") {
+			if p = strings.TrimSpace(p); p != "" && !strings.EqualFold(p, "h2c") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// localSuffixes are domains reserved for local use (RFC 6761, RFC 6762,
+// ICANN's .internal, RFC 8375), which public DNS can't answer for. ".lan" is
+// left out: it is not reserved and could still be delegated.
+var localSuffixes = []string{".localhost", ".local", ".internal", ".home.arpa"}
+
+// hostName returns the host in a Host header value (host or host:port)
+// without port, IPv6 brackets and trailing dot, in lowercase.
+func hostName(hostport string) string {
+	host, _, err := net.SplitHostPort(hostport)
+	if err != nil {
+		host = strings.TrimSuffix(strings.TrimPrefix(hostport, "["), "]") // no port
+	}
+	return strings.ToLower(strings.TrimSuffix(host, "."))
+}
+
+// allowedHost reports whether host (from hostName) names the proxy in a way
+// a DNS rebinding attack can't. The proxy replaces the Host header when
+// forwarding, so the upstream's own check never sees it. Like Ollama's own
+// check, it accepts an empty host, IP addresses, localhost, names in
+// localSuffixes and this machine's hostname, plus cfg.AllowedHosts.
+func allowedHost(host string) bool {
+	if _, err := netip.ParseAddr(host); err == nil || host == "" {
+		return true // an IP address involves no DNS lookup to rebind
+	}
+	if host == "localhost" || hasSuffix(host, localSuffixes) {
+		return true
+	}
+	if name, err := os.Hostname(); err == nil && host == strings.ToLower(name) {
+		return true
+	}
+	return cfg.allowsHost(host)
+}
+
+// hasSuffix reports whether s ends with one of suffixes.
+func hasSuffix(s string, suffixes []string) bool {
+	for _, suffix := range suffixes {
+		if strings.HasSuffix(s, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// refuseManagement answers r with 403 Forbidden, without contacting the
+// upstream, if it is a management request or asks for a protocol upgrade, and
+// reports whether it did. It runs while forward_management is false.
+//
+// An upgraded connection is a tunnel to the upstream: requests sent over it
+// don't pass through handleRequest. LM Studio's SDK API runs over WebSocket
+// (/llm, /repository, ...) and loads and downloads models that way. An
+// Upgrade header offering only h2c is removed instead: clients such as Java's
+// HttpClient add it to ordinary requests and stay on HTTP/1.1 when the
+// server doesn't switch, so the request is forwarded as plain HTTP/1.1.
+func refuseManagement(w http.ResponseWriter, r *http.Request) bool {
+	var what string
+	switch {
+	case isManagementEndpoint(r.URL.Path):
+		what = "Management request"
+	case offersUpgrade(r.Header):
+		what = "Protocol upgrade"
+	default:
+		r.Header.Del("Upgrade") // at most an h2c offer; the upstream can't switch without it
+		return false
+	}
+	fmt.Fprintf(out, "[Proxy] %s not forwarded: %s %s (forward_management: false)\n", what, r.Method, escapeControls(r.URL.Path))
+	http.Error(w, what+" not forwarded by the proxy (forward_management: false)", http.StatusForbidden)
+	return true
+}
+
+// allowsHost reports whether host (lowercase, without port) matches an
+// allowed_hosts entry.
+func (c Config) allowsHost(host string) bool {
+	for _, entry := range c.AllowedHosts {
+		entry = strings.ToLower(entry)
+		if entry == "*" || entry == host || strings.HasPrefix(entry, "*.") && strings.HasSuffix(host, entry[1:]) {
+			return true
+		}
+	}
+	return false
+}
+
 // requestInfo describes an incoming request; it travels to the response
 // side of the proxy via the request context.
 type requestInfo struct {
@@ -453,19 +587,87 @@ func debugf(format string, args ...any) {
 	}
 }
 
+// escapeControls makes text from clients or the upstream (paths, URLs, model
+// names, errors) safe to print to the terminal or log, so it can't send escape
+// sequences or start fake lines. Control characters (C0, DEL, C1), the Unicode
+// line and paragraph separators and the bidirectional text controls (which
+// can reorder how the rest of a line is displayed) are written as Go escapes
+// (\n, \x1b, \u009b, \u2028, \u202e), and bytes that aren't valid UTF-8 as
+// \xNN. Everything else is kept as is: backslashes, printable non-ASCII text
+// and other invisible format characters such as the zero-width joiner in
+// emoji. Text with nothing to escape is returned without copying.
+func escapeControls(s string) string {
+	var b []byte // nil until something needs escaping
+	done := 0    // s[:done] has been written to b
+	for i := 0; i < len(s); {
+		if c := s[i]; c >= ' ' && c < 0x7f {
+			i++ // printable ASCII, the common case
+			continue
+		}
+		n, escape := escapeAt(s, i)
+		if escape {
+			if b == nil {
+				b = make([]byte, 0, len(s)+16)
+			}
+			b = appendGoEscape(append(b, s[done:i]...), s[i:i+n])
+			done = i + n
+		}
+		i += n
+	}
+	if b == nil {
+		return s
+	}
+	return string(append(b, s[done:]...))
+}
+
+// escapeAt returns the length of the rune (or invalid UTF-8 byte) at s[i] and
+// whether escapeControls escapes it.
+func escapeAt(s string, i int) (int, bool) {
+	if c := s[i]; c < utf8.RuneSelf {
+		return 1, c < ' ' || c == 0x7f
+	}
+	r, n := utf8.DecodeRuneInString(s[i:])
+	if r == utf8.RuneError && n == 1 {
+		return 1, true
+	}
+	return n, unicode.IsControl(r) || unicode.In(r, unicode.Bidi_Control, unicode.Zl, unicode.Zp)
+}
+
+// appendGoEscape appends the Go escape of c, a single rune or invalid UTF-8
+// byte, as strconv.QuoteToASCII writes it but without the quotes.
+func appendGoEscape(b []byte, c string) []byte {
+	start := len(b)
+	b = strconv.AppendQuoteToASCII(b, c)
+	return append(b[:start], b[start+1:len(b)-1]...)
+}
+
 type requestInfoKey struct{}
 
 // handleRequest processes incoming requests
 func handleRequest(w http.ResponseWriter, r *http.Request) {
+	if host := hostName(r.Host); !allowedHost(host) {
+		fmt.Fprintf(out, "[Proxy] Rejected %s %s: Host %q not allowed (add %q to allowed_hosts if clients use this name)\n",
+			r.Method, escapeControls(r.URL.Path), r.Host, host)
+		http.Error(w, "Forbidden: Host not allowed", http.StatusForbidden)
+		return
+	}
+	if !cfg.ForwardManagement && refuseManagement(w, r) {
+		return
+	}
 	metered := isAPIEndpoint(r.URL.Path)
 	if !metered && !cfg.forwardsUnmatched() {
-		fmt.Fprintf(out, "[Proxy] Non-API request: %s %s\n", r.Method, r.URL.Path)
+		fmt.Fprintf(out, "[Proxy] Non-API request: %s %s\n", r.Method, escapeControls(r.URL.Path))
 		http.NotFound(w, r)
 		return
 	}
 
 	info := &requestInfo{id: requestSeq.Add(1), start: time.Now(), method: r.Method, path: r.URL.Path, metered: metered}
-	debugf("req %d: %s %s from %s (metered: %t)", info.id, r.Method, r.URL.RequestURI(), r.RemoteAddr, metered)
+	// debugf's arguments are evaluated even when it prints nothing; don't
+	// escape a client's (possibly long) request URI unless it is printed.
+	if cfg.Logging.Debug {
+		debugf("req %d: %s %s from %s (metered: %t)",
+			info.id, r.Method, escapeControls(r.URL.RequestURI()), r.RemoteAddr, metered)
+	}
 	ctx := context.WithValue(r.Context(), requestInfoKey{}, info)
 	proxy.ServeHTTP(w, r.WithContext(ctx))
 }
@@ -496,12 +698,14 @@ func meterResponse(resp *http.Response) error {
 		return nil
 	}
 	contentType := resp.Header.Get("Content-Type")
-	debugf("req %d: upstream %s -> %d after %.2fs, Content-Type %q",
-		info.id, resp.Request.URL, resp.StatusCode, time.Since(info.start).Seconds(), contentType)
+	if cfg.Logging.Debug { // only escape the URL when it is printed (see handleRequest)
+		debugf("req %d: upstream %s -> %d after %.2fs, Content-Type %q",
+			info.id, escapeControls(resp.Request.URL.String()), resp.StatusCode, time.Since(info.start).Seconds(), contentType)
+	}
 	if !info.metered {
 		// Logged when the headers arrive; the body is passed through as is.
 		fmt.Fprintf(out, "[Proxy] %s %s %d (%.2fs, not metered)\n",
-			info.method, info.path, resp.StatusCode, time.Since(info.start).Seconds())
+			info.method, escapeControls(info.path), resp.StatusCode, time.Since(info.start).Seconds())
 		return nil
 	}
 	// A 101 response body is used for the upgraded connection and must not be wrapped.
@@ -525,7 +729,7 @@ func meterResponse(resp *http.Response) error {
 
 // proxyError reports upstream failures to the client as 502 Bad Gateway.
 func proxyError(w http.ResponseWriter, r *http.Request, err error) {
-	fmt.Fprintf(out, "[ERROR] %s %s: %v\n", r.Method, r.URL.Path, err)
+	fmt.Fprintf(out, "[ERROR] %s %s: %s\n", r.Method, escapeControls(r.URL.Path), escapeControls(err.Error()))
 	http.Error(w, "Failed to connect to the upstream LLM server", http.StatusBadGateway)
 }
 
@@ -626,7 +830,7 @@ func (b *meteredBody) debugSummary(data MetricsData, streamTime time.Duration, b
 func recordQuery(info *requestInfo, status int, data MetricsData, complete bool) {
 	if !data.hasInference() {
 		fmt.Fprintf(out, "[Proxy] %s %s %d (%.2fs)\n",
-			info.method, info.path, status, data.Duration.Seconds())
+			info.method, escapeControls(info.path), status, data.Duration.Seconds())
 		return
 	}
 
@@ -1123,10 +1327,10 @@ func formatMetricsLine(now time.Time, info *requestInfo, status int, data Metric
 	var b strings.Builder
 
 	fmt.Fprintf(&b, "[%s] #%d %s %s %d",
-		now.Format("15:04:05"), snap.QueryCount, info.method, info.path, status)
+		now.Format("15:04:05"), snap.QueryCount, info.method, escapeControls(info.path), status)
 
 	if data.ModelName != "" {
-		fmt.Fprintf(&b, " | Model: %s", truncateString(data.ModelName, 30))
+		fmt.Fprintf(&b, " | Model: %s", escapeControls(truncateString(data.ModelName, 30)))
 	}
 	if data.PromptTokens > 0 || data.CompletionTokens > 0 {
 		fmt.Fprintf(&b, " | Tokens: %d in / %d out", data.PromptTokens, data.CompletionTokens)

@@ -16,11 +16,14 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // syncBuffer is a goroutine-safe buffer for capturing status output.
@@ -170,6 +173,15 @@ func TestParseConfigDefaults(t *testing.T) {
 		if c.forwardsUnmatched() != want {
 			t.Errorf("%q: forwardsUnmatched() = %t, want %t", data, !want, want)
 		}
+	}
+}
+
+func TestParseConfigForwardManagement(t *testing.T) {
+	if c, err := parseConfig(nil); err != nil || c.ForwardManagement {
+		t.Errorf("empty config: ForwardManagement = %t, %v; want false by default", c.ForwardManagement, err)
+	}
+	if c, err := parseConfig([]byte("forward_management: true\n")); err != nil || !c.ForwardManagement {
+		t.Errorf("forward_management: true: ForwardManagement = %t, %v; want true", c.ForwardManagement, err)
 	}
 }
 
@@ -933,6 +945,209 @@ func TestNonAPIPathNotForwarded(t *testing.T) {
 	}
 }
 
+func TestIsManagementEndpoint(t *testing.T) {
+	for p, want := range map[string]bool{
+		"/api/pull": true, "/api/pull/": true, "/API/Pull": true, "//api/pull": true, "/api/../api/delete": true,
+		"/v1/../api/push": true, "/api/copy": true, "/api/create": true, "/api/blobs/sha256:0": true,
+		"/api/me": true, "/api/signout": true, "/api/user/keys/x": true,
+		"/api/v1/models/load": true, "/api/v1/models/unload": true, "/api/v1/models/download/status/1": true,
+		"/api/chat": false, "/api/generate": false, "/api/embed": false, "/api/tags": false, "/api/show": false,
+		"/api/ps": false, "/api/version": false, "/api/pullx": false, "/api/web_search": false, "/api/web_fetch": false,
+		"/api/v1/models": false, "/api/v1/chat": false, "/v1/models": false, "/v1/chat/completions": false,
+		"/": false, "*": false, "": false,
+	} {
+		if got := isManagementEndpoint(p); got != want {
+			t.Errorf("isManagementEndpoint(%q) = %t, want %t", p, got, want)
+		}
+	}
+}
+
+// startCountingUpstream starts a fake upstream that counts the requests
+// reaching it. It accepts WebSocket handshakes, as LM Studio's SDK API does,
+// and echoes the first 4 bytes sent over the upgraded connection. Other
+// requests get a JSON body and an X-Upgrade-Seen header with the Upgrade
+// header they arrived with.
+func startCountingUpstream(t *testing.T) (*url.URL, *atomic.Int32) {
+	t.Helper()
+	hits := &atomic.Int32{}
+	target := startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+			echoUpgraded(t, w)
+			return
+		}
+		w.Header().Set("X-Upgrade-Seen", r.Header.Get("Upgrade"))
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"status":"success"}`)
+	}))
+	return target, hits
+}
+
+// echoUpgraded switches the connection to a WebSocket and echoes 4 bytes.
+func echoUpgraded(t *testing.T, w http.ResponseWriter) {
+	conn, brw, err := http.NewResponseController(w).Hijack()
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	defer conn.Close()
+	brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+	brw.Flush()
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(brw, buf); err == nil {
+		brw.Write(buf)
+		brw.Flush()
+	}
+}
+
+// sendRequest sends a request with the given header name/value pairs and
+// returns the response, with its body read and closed. The body of a 101
+// (an upgraded connection, which doesn't end) is closed unread.
+func sendRequest(t *testing.T, method, url string, header ...string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(method, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i+1 < len(header); i += 2 {
+		req.Header.Set(header[i], header[i+1])
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		io.Copy(io.Discard, resp.Body)
+	}
+	resp.Body.Close()
+	return resp
+}
+
+// webSocketHandshake holds the headers of a WebSocket opening handshake.
+var webSocketHandshake = []string{
+	"Connection", "Upgrade", "Upgrade", "websocket",
+	"Sec-WebSocket-Version", "13", "Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==", // betterleaks:allow (RFC 6455 sample nonce, not a secret)
+}
+
+func TestManagementEndpointNotForwarded(t *testing.T) {
+	target, hits := startCountingUpstream(t)
+	srv, logs := startProxy(t, target)
+	cfg.APIEndpoints = []string{"/api/*", "/v1/*"} // documented Ollama setup; "/api/*" matches the management paths too
+
+	for _, rq := range [][2]string{
+		{"DELETE", "/api/delete"}, {"POST", "/api/pull"}, {"POST", "/api/push"}, {"POST", "/api/copy"},
+		{"POST", "/api/create"}, {"HEAD", "/api/blobs/sha256:0"}, {"POST", "/api/me"}, {"POST", "/api/signout"},
+		{"POST", "/api/%70ull"}, {"POST", "/api/../api/pull"}, {"POST", "//api/pull"}, {"POST", "/API/PULL"},
+		{"POST", "/api/pull/"}, {"POST", "/api/v1/models/load"}, {"POST", "/api/v1/models/download"},
+	} {
+		if resp := sendRequest(t, rq[0], srv.URL+rq[1]); resp.StatusCode != http.StatusForbidden {
+			t.Errorf("%s %s: status = %d, want 403", rq[0], rq[1], resp.StatusCode)
+		}
+	}
+	if n := hits.Load(); n != 0 {
+		t.Errorf("%d management request(s) reached the upstream", n)
+	}
+	if want := "[Proxy] Management request not forwarded: DELETE /api/delete (forward_management: false)"; !strings.Contains(logs.String(), want) {
+		t.Errorf("logs missing %q:\n%s", want, logs)
+	}
+
+	// Queries and listings are still forwarded.
+	for _, rq := range [][2]string{
+		{"POST", "/api/chat"}, {"GET", "/api/tags"}, {"POST", "/api/show"}, {"GET", "/api/version"},
+		{"GET", "/api/v1/models"}, {"GET", "/v1/models"},
+	} {
+		if resp := sendRequest(t, rq[0], srv.URL+rq[1]); resp.StatusCode != http.StatusOK {
+			t.Errorf("%s %s: status = %d, want the upstream's 200", rq[0], rq[1], resp.StatusCode)
+		}
+	}
+	if n := hits.Load(); n != 6 {
+		t.Errorf("upstream got %d requests, want 6", n)
+	}
+}
+
+func TestUpgradeNotForwarded(t *testing.T) {
+	target, hits := startCountingUpstream(t)
+	srv, logs := startProxy(t, target) // forward_unmatched unset (true), as by default
+
+	// LM Studio SDK namespaces and a metered path.
+	for _, p := range []string{"/llm", "/repository", "/system", "/v1/chat/completions"} {
+		if resp := sendRequest(t, http.MethodGet, srv.URL+p, webSocketHandshake...); resp.StatusCode != http.StatusForbidden {
+			t.Errorf("WebSocket handshake to %s: status = %d, want 403", p, resp.StatusCode)
+		}
+	}
+	for _, upgrade := range []string{"WebSocket", "h2c, websocket"} {
+		header := append(append([]string{}, webSocketHandshake...), "Upgrade", upgrade, "Connection", "keep-alive, Upgrade")
+		if resp := sendRequest(t, http.MethodGet, srv.URL+"/llm", header...); resp.StatusCode != http.StatusForbidden {
+			t.Errorf("Upgrade %q: status = %d, want 403", upgrade, resp.StatusCode)
+		}
+	}
+	if n := hits.Load(); n != 0 {
+		t.Errorf("%d upgrade request(s) reached the upstream", n)
+	}
+	if want := "[Proxy] Protocol upgrade not forwarded: GET /llm (forward_management: false)"; !strings.Contains(logs.String(), want) {
+		t.Errorf("logs missing %q:\n%s", want, logs)
+	}
+
+	// An h2c offer (Java's HttpClient sends one with ordinary requests) is
+	// dropped and the request forwarded as plain HTTP/1.1.
+	resp := sendRequest(t, http.MethodGet, srv.URL+"/v1/models",
+		"Connection", "Upgrade, HTTP2-Settings", "Upgrade", "h2c", "HTTP2-Settings", "AAMAAABkAARAAAAAAAIAAAAA")
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("X-Upgrade-Seen") != "" {
+		t.Errorf("h2c offer: status = %d, upstream saw Upgrade %q; want 200 and no Upgrade", resp.StatusCode, resp.Header.Get("X-Upgrade-Seen"))
+	}
+}
+
+func TestManagementForwardedWhenEnabled(t *testing.T) {
+	target, hits := startCountingUpstream(t)
+	srv, logs := startProxy(t, target)
+	cfg.APIEndpoints = []string{"/api/*", "/v1/*"}
+	cfg.ForwardManagement = true
+
+	for _, p := range []string{"/api/pull", "/api/delete", "/api/v1/models/load"} {
+		if resp := sendRequest(t, http.MethodPost, srv.URL+p); resp.StatusCode != http.StatusOK {
+			t.Errorf("POST %s: status = %d, want the upstream's 200", p, resp.StatusCode)
+		}
+	}
+	resp := sendRequest(t, http.MethodGet, srv.URL+"/v1/models", "Connection", "Upgrade", "Upgrade", "h2c")
+	if got := resp.Header.Get("X-Upgrade-Seen"); got != "h2c" {
+		t.Errorf("h2c offer: upstream saw Upgrade %q, want it forwarded unchanged", got)
+	}
+	if n := hits.Load(); n != 4 {
+		t.Errorf("upstream got %d requests, want 4", n)
+	}
+	if strings.Contains(logs.String(), "not forwarded") {
+		t.Errorf("requests refused with forward_management: true:\n%s", logs)
+	}
+	checkWebSocketTunnel(t, srv.URL+"/llm")
+}
+
+// checkWebSocketTunnel opens a WebSocket through the proxy and checks that
+// bytes sent over it come back from the upstream.
+func checkWebSocketTunnel(t *testing.T, url string) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < len(webSocketHandshake); i += 2 {
+		req.Header.Set(webSocketHandshake[i], webSocketHandshake[i+1])
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	conn, ok := resp.Body.(io.ReadWriteCloser)
+	if resp.StatusCode != http.StatusSwitchingProtocols || !ok {
+		t.Fatalf("status = %d, writable body %t; want 101 and an upgraded connection", resp.StatusCode, ok)
+	}
+	conn.Write([]byte("ping"))
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(conn, buf); err != nil || string(buf) != "ping" {
+		t.Errorf("echo over the tunnel = %q, %v; want \"ping\"", buf, err)
+	}
+}
+
 func TestNonInferenceResponseNotCounted(t *testing.T) {
 	target := startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1328,5 +1543,258 @@ func TestTruncateString(t *testing.T) {
 	}
 	if got := truncateString("ääääää", 5); got != "ää..." {
 		t.Errorf("got %q, want rune-safe truncation", got)
+	}
+}
+
+func TestEscapeControls(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"", ""},
+		{"/v1/chat/completions?stream=true", "/v1/chat/completions?stream=true"},
+		{"\x1b[2J\x1b]0;title\a", `\x1b[2J\x1b]0;title\a`},
+		{"/a\r\n[12:00:00] #1 fake", `/a\r\n[12:00:00] #1 fake`},
+		{"\x00\t\x7f", `\x00\t\x7f`},
+		{"\u009b31m\u0085", `\u009b31m\u0085`},                                                         // C1: CSI, NEL
+		{"a\u2028b\u2029c", `a\u2028b\u2029c`},                                                         // line and paragraph separators
+		{"\u202eabc\u202c\u2066\u2069\u200f\u061c", `\u202eabc\u202c\u2066\u2069\u200f\u061c`},         // bidi controls
+		{"\xff\xc0x\xe2\x80", `\xff\xc0x\xe2\x80`},                                                     // invalid UTF-8
+		{`C:\dir\x1b "q"`, `C:\dir\x1b "q"`},                                                           // backslashes and quotes kept
+		{"qwen3:4b-\u00e4-\u65e5\u672c-\ufffd", "qwen3:4b-\u00e4-\u65e5\u672c-\ufffd"},                 // printable non-ASCII, real U+FFFD
+		{"\U0001f469\u200d\U0001f4bb soft\u00adhyphen", "\U0001f469\u200d\U0001f4bb soft\u00adhyphen"}, // other format characters
+	}
+	for _, tt := range tests {
+		if got := escapeControls(tt.in); got != tt.want {
+			t.Errorf("escapeControls(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+// TestEscapeControlsLossless escapes every byte, every rune up to U+00FF and
+// the escaped separators and bidi controls on their own. The result must have
+// nothing left to escape and unquote back to the input as a Go string.
+func TestEscapeControlsLossless(t *testing.T) {
+	var inputs []string
+	for c := 0; c < 256; c++ {
+		inputs = append(inputs, string([]byte{byte(c)}), string(rune(c)))
+	}
+	for _, r := range []rune{0x061c, 0x200e, 0x200f, 0x2028, 0x2029, 0x202a, 0x202e, 0x2066, 0x2069} {
+		inputs = append(inputs, string(r))
+	}
+	for _, in := range inputs {
+		checkEscapedLossless(t, in)
+	}
+}
+
+func checkEscapedLossless(t *testing.T, in string) {
+	t.Helper()
+	got := escapeControls(in)
+	if unsafeInLog(got) {
+		t.Errorf("escapeControls(%q) = %q, still contains characters to escape", in, got)
+	}
+	if !unsafeInLog(in) && got != in {
+		t.Errorf("escapeControls(%q) = %q, want it unchanged", in, got)
+	}
+	if in == `"` || in == `\` {
+		return // kept as is, so not a valid Go string body
+	}
+	if back, err := strconv.Unquote(`"` + got + `"`); err != nil || back != in {
+		t.Errorf("escapeControls(%q) = %q, unquotes to %q (%v)", in, got, back, err)
+	}
+}
+
+// unsafeInLog reports whether s contains what escapeControls escapes:
+// invalid UTF-8, control characters, line or paragraph separators, or bidi
+// controls.
+func unsafeInLog(s string) bool {
+	return !utf8.ValidString(s) || strings.IndexFunc(s, func(r rune) bool {
+		return unicode.IsControl(r) || unicode.In(r, unicode.Bidi_Control, unicode.Zl, unicode.Zp)
+	}) >= 0
+}
+
+// Status lines print the path of every request, so text with nothing to
+// escape must not be copied.
+func TestEscapeControlsCleanTextNotCopied(t *testing.T) {
+	clean := "/v1/chat/completions?model=qwen3:4b&q=\u00e4\u65e5\u672c"
+	if allocs := testing.AllocsPerRun(100, func() { _ = escapeControls(clean) }); allocs != 0 {
+		t.Errorf("escapeControls allocated %v times for text with nothing to escape", allocs)
+	}
+}
+
+// injectedPath decodes to a clear-screen escape sequence, CR LF, a fake
+// status line and a bidi override; injectedLog is how it must be printed.
+const (
+	injectedPath = "/x%1b[2J%0d%0a[12:00:00]%20fake%e2%80%ae"
+	injectedLog  = `/x\x1b[2J\r\n[12:00:00] fake\u202e`
+)
+
+func TestLogEscapesControlCharacters(t *testing.T) {
+	t.Run("not metered, debug", testEscapedNotMetered)
+	t.Run("not forwarded", testEscapedNotForwarded)
+	t.Run("upstream unreachable", testEscapedUpstreamError)
+	t.Run("no inference", testEscapedNoInference)
+	t.Run("query and model name", testEscapedQuery)
+}
+
+func testEscapedNotMetered(t *testing.T) {
+	srv, logs := startProxy(t, startUpstream(t, http.NotFoundHandler()))
+	cfg.Logging.Debug = true
+	postAndDrain(t, srv.URL+injectedPath+"?q=\u009b") // raw C1 CSI in the query
+	checkEscapedLogs(t, logs, 3, "[Proxy] POST "+injectedLog+" 404 (", `?q=\u009b from `, " -> 404 after ")
+}
+
+func testEscapedNotForwarded(t *testing.T) {
+	srv, logs := startProxy(t, startUpstream(t, http.NotFoundHandler()))
+	forward := false
+	cfg.ForwardUnmatched = &forward
+	postAndDrain(t, srv.URL+injectedPath)
+	checkEscapedLogs(t, logs, 1, "[Proxy] Non-API request: POST "+injectedLog+"\n")
+}
+
+func testEscapedUpstreamError(t *testing.T) {
+	up := httptest.NewServer(http.NotFoundHandler())
+	target, _ := url.Parse(up.URL)
+	up.Close()
+	srv, logs := startProxy(t, target)
+	postAndDrain(t, srv.URL+"/v1"+injectedPath)
+	checkEscapedLogs(t, logs, 1, "[ERROR] POST /v1"+injectedLog+": ")
+}
+
+func testEscapedNoInference(t *testing.T) {
+	srv, logs := startProxy(t, startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"object":"list","data":[]}`)
+	})))
+	postAndDrain(t, srv.URL+"/v1"+injectedPath)
+	checkEscapedLogs(t, logs, 1, "[Proxy] POST /v1"+injectedLog+" 200 (")
+}
+
+func testEscapedQuery(t *testing.T) {
+	srv, logs := startProxy(t, startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"model":"m\u001b[2J\r\n[12:00:00] #9\u202e",`+
+			`"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`)
+	})))
+	postAndDrain(t, srv.URL+"/v1"+injectedPath)
+	checkEscapedLogs(t, logs, 1, " POST /v1"+injectedLog+` 200 | Model: m\x1b[2J\r\n[12:00:00] #9\u202e | Tokens: 1 in / 2 out`)
+}
+
+// checkEscapedLogs waits for wantLines log lines, then checks that they
+// contain each of want and nothing that escapeControls escapes.
+func checkEscapedLogs(t *testing.T, logs *syncBuffer, wantLines int, want ...string) {
+	t.Helper()
+	waitFor(t, fmt.Sprintf("%d log lines", wantLines), func() bool {
+		return strings.Count(logs.String(), "\n") >= wantLines
+	})
+	got := logs.String()
+	if n := strings.Count(got, "\n"); n != wantLines {
+		t.Errorf("got %d log lines, want %d: %q", n, wantLines, got)
+	}
+	if unsafeInLog(strings.ReplaceAll(got, "\n", "")) {
+		t.Errorf("logs contain unescaped control characters: %q", got)
+	}
+	for _, w := range want {
+		if !strings.Contains(got, w) {
+			t.Errorf("logs missing %q: %q", w, got)
+		}
+	}
+}
+
+// TestAllowedHost checks which Host header values are accepted: names a DNS
+// rebinding attack can't use, plus allowed_hosts.
+func TestAllowedHost(t *testing.T) {
+	t.Cleanup(func() { cfg = Config{} })
+	cfg = Config{}
+	hostname, err := os.Hostname()
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkAllowedHosts(t, true, "", "127.0.0.1:11436", "192.0.2.10", "192.0.2.10:11436", "[::1]:11436", "[::1]", "::1",
+		"[2001:db8::1]:80", "localhost", "LocalHost:11436", "localhost.:11436", "app.localhost", "printer.local:11436",
+		"llm.internal", "homelab.home.arpa", hostname, strings.ToUpper(hostname)+":11436")
+	checkAllowedHosts(t, false, "evil.example", "evil.example:11436", "evil.example.:11436", "[evil.example]",
+		"localhost.evil.example", "127.0.0.1.nip.io", "evil-localhost", "llm-proxy-test.lan")
+
+	cfg.AllowedHosts = []string{"llm.example.com", "*.LAN"}
+	checkAllowedHosts(t, true, "LLM.example.com:11436", "llm.example.com.", "llm-proxy-test.lan", "a.b.lan:11436")
+	checkAllowedHosts(t, false, "evil.example", "lan", "x.llm.example.com", "llm.example.com.evil.example")
+
+	cfg.AllowedHosts = []string{"*"}
+	checkAllowedHosts(t, true, "evil.example:11436")
+}
+
+func checkAllowedHosts(t *testing.T, want bool, hosts ...string) {
+	t.Helper()
+	for _, h := range hosts {
+		if got := allowedHost(hostName(h)); got != want {
+			t.Errorf("allowedHost(hostName(%q)) = %t, want %t (allowed_hosts %q)", h, got, want, cfg.AllowedHosts)
+		}
+	}
+}
+
+// getWithHost sends a GET request with the given Host header and returns the
+// response status.
+func getWithHost(t *testing.T, url, host string) int {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = host
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	readAll(t, resp.Body)
+	return resp.StatusCode
+}
+
+// TestProxyRejectsRebindingHost sends requests as a DNS rebinding page would
+// (Host naming the attacker's domain): they must get 403 without reaching the
+// upstream, while local names and allowed_hosts are forwarded.
+func TestProxyRejectsRebindingHost(t *testing.T) {
+	var hits atomic.Int32
+	target := startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"models":[]}`)
+	}))
+	srv, logs := startProxy(t, target)
+	cfg.AllowedHosts = []string{"llm.example.com"}
+
+	for _, path := range []string{"/api/tags", "/v1/models"} { // unmetered and metered
+		if status := getWithHost(t, srv.URL+path, "evil.example:11436"); status != http.StatusForbidden {
+			t.Errorf("%s with Host evil.example: status = %d, want 403", path, status)
+		}
+	}
+	if n := hits.Load(); n != 0 {
+		t.Errorf("upstream got %d request(s) with a rejected Host, want 0", n)
+	}
+	want := `[Proxy] Rejected GET /api/tags: Host "evil.example:11436" not allowed (add "evil.example" to allowed_hosts`
+	if !strings.Contains(logs.String(), want) {
+		t.Errorf("logs missing %q:\n%s", want, logs)
+	}
+
+	hostname, _ := os.Hostname()
+	accepted := []string{"localhost:11436", "192.0.2.10:11436", "[::1]:11436", hostname, "llm.example.com:11436"}
+	for _, host := range accepted {
+		if status := getWithHost(t, srv.URL+"/api/tags", host); status != http.StatusOK {
+			t.Errorf("Host %q: status = %d, want 200", host, status)
+		}
+	}
+	if n := hits.Load(); n != int32(len(accepted)) {
+		t.Errorf("upstream got %d request(s), want %d", n, len(accepted))
+	}
+}
+
+func TestParseConfigAllowedHosts(t *testing.T) {
+	c, err := parseConfig([]byte("allowed_hosts: [\"llm.example.com\", \"*.lan\"]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(c.AllowedHosts) != "[llm.example.com *.lan]" {
+		t.Errorf("AllowedHosts = %q", c.AllowedHosts)
+	}
+	if c, err := parseConfig(nil); err != nil || len(c.AllowedHosts) != 0 {
+		t.Errorf("default AllowedHosts = %q, %v; want none", c.AllowedHosts, err)
 	}
 }

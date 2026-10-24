@@ -55,7 +55,8 @@ server directly**:
 1. Find the URL the client uses for the server directly, e.g.
    `http://localhost:11434/v1`.
 2. Replace only the host and port with the proxy's, e.g. `localhost:11436`
-   (or the address of the machine running the proxy).
+   (or the address of the machine running the proxy; host names other than
+   its hostname may need [`allowed_hosts`](#host-names)).
 3. Keep the path at the end exactly as it was, e.g. `/v1`.
 
 | Client / API | URL directly to the server | URL through the proxy |
@@ -101,6 +102,12 @@ data (such as `/v1/models` or errors) are logged as `[Proxy]` lines and not
 counted. If the upstream can't be reached, the client gets
 `502 Bad Gateway` and the proxy logs an `[ERROR]` line.
 
+Paths, model names and error messages come from clients and the server, so
+characters in them that could control the terminal or start a fake line are
+printed as Go escapes: control characters (e.g. `\x1b`, `\n`), invalid UTF-8
+(`\xff`), the Unicode line and paragraph separators and bidirectional text
+controls (e.g. `\u202e`). Other text, including non-ASCII, is printed as is.
+
 `TPS` is the rate reported by the server. When the server doesn't report one,
 the proxy estimates it and marks it `(est.)`, e.g. `TPS: 40.98 (est.)`. `TTFT`
 (time to first token) only appears when the server reports it (see
@@ -127,6 +134,10 @@ Values the server didn't report (tokens, TPS, TTFT) are left empty.
 `tps_estimated` is `true` when the TPS was estimated by the proxy (shown as
 `(est.)` in the terminal), and `complete` is `false` for responses that were
 cut off. Only per-query values are saved; the running averages are not.
+Paths and model names are saved as received, without the escaping used in the
+terminal: fields with line breaks are quoted, but other control characters
+are kept. View the file in a spreadsheet or with `cat -v` rather than printing
+it raw to a terminal.
 
 ### Stopping
 
@@ -152,6 +163,9 @@ api_endpoints:            # path prefixes to meter
 
 forward_unmatched: true   # forward other paths unmetered (false: answer 404)
 
+forward_management: false # forward model management and WebSocket requests (false: answer 403)
+allowed_hosts: []         # further host names clients use, see "Host names" below
+
 metrics:
   history_points: 10      # recent queries to average tokens/sec over
 
@@ -175,6 +189,40 @@ upstream and usually means the client's base URL lacks a path such as `/v1`.
 Set `forward_unmatched: false` to answer such requests with `404` without
 forwarding them, as earlier versions did.
 
+### Management requests
+
+The proxy listens on all network interfaces and has no authentication, so
+anyone who can reach `proxy_port` can use the server through it, even when the
+server itself only accepts connections from localhost (the default for Ollama
+and LM Studio). Restrict access to the port with a firewall if needed.
+
+Requests that manage the server instead of querying it are therefore not
+forwarded by default. They are answered with `403 Forbidden`, even when they
+match `api_endpoints` (such as Ollama's `"/api/*"`), and logged:
+
+```
+[Proxy] Management request not forwarded: DELETE /api/delete (forward_management: false)
+```
+
+- Ollama: `/api/pull`, `/api/push`, `/api/create`, `/api/copy`, `/api/delete`
+  and `/api/blobs`, and the ollama.com account endpoints `/api/me`,
+  `/api/signout` and `/api/user/keys`. Queries that use the account (cloud
+  models, `/api/web_search`, `/api/web_fetch`) are forwarded like other
+  queries; sign the server out of ollama.com if clients shouldn't use it.
+- LM Studio: `/api/v1/models/load`, `/api/v1/models/unload` and
+  `/api/v1/models/download`.
+- WebSocket connections and other protocol upgrades, on any path
+  (`[Proxy] Protocol upgrade not forwarded: …`). LM Studio's SDK
+  (`lmstudio-js`, `lmstudio-python`) talks to the server over WebSocket and
+  loads and downloads models that way, so SDK clients only work through the
+  proxy with `forward_management: true`. An `Upgrade: h2c` offer, which Java's
+  `HttpClient` adds to ordinary requests, is dropped instead, and the request
+  is forwarded as plain HTTP/1.1.
+
+Model lists (`/api/tags`, `/api/ps`, `/api/v1/models`, `/v1/models`) and
+model details (`/api/show`) are forwarded as before. Set
+`forward_management: true` to forward management requests too.
+
 Unset values fall back to the defaults shown above; an empty file is a valid
 config for LM Studio on `localhost:1234`. Unknown or misspelled keys are an
 error naming the key and line, e.g.
@@ -190,6 +238,39 @@ value types are listed on one line, separated by `; `, e.g.
 ``line 1: cannot construct !!str `x` into int; line 3: …``. Syntax errors give
 the position as `L<line>.C<column>`; tab indentation, for example, gives
 `go-yaml load error in scanner (while scanning for the next token) at L3.C1: found character that cannot start any token`.
+
+### Host names
+
+The proxy only forwards requests whose `Host` header (the host name in the
+URL the client uses) can't come from a DNS rebinding attack, in which a web
+page you visit points its own domain at the proxy and reads your server's
+API. These always work:
+
+- IP addresses, e.g. `http://192.0.2.10:11436` or `http://[::1]:11436`
+- `localhost` and names ending in `.localhost`
+- this machine's hostname (as printed by `hostname`)
+- names ending in `.local`, `.internal` or `.home.arpa`, which are reserved
+  for local networks
+
+Requests naming any other host get `403 Forbidden` and are logged without
+being forwarded:
+
+```
+[Proxy] Rejected GET /api/tags: Host "homelab.lan:11436" not allowed (add "homelab.lan" to allowed_hosts if clients use this name)
+```
+
+If clients reach the proxy by another name, e.g. from your own DNS or your
+router (`.lan` is not reserved, so it isn't built in), list it:
+
+```yaml
+allowed_hosts:
+  - "llm.example.com"     # this name only (any port)
+  - "*.lan"               # all names ending in .lan
+```
+
+`"*"` allows any host and turns the check off, as before this check was
+added. The proxy has no authentication, so this doesn't protect it from
+clients that can reach its port directly.
 
 ### Debug output
 
@@ -224,6 +305,9 @@ apart. Request and response bodies are never logged.
   (`/api/v1/...`). Ollama (native and OpenAI-compatible) and LM Studio's
   OpenAI-compatible API don't report it, so their lines have no `TTFT`.
 - One upstream over plain HTTP; no HTTPS upstream or API key injection.
+- No client authentication: anyone who can reach the proxy can run queries on
+  the server (see [Management requests](#management-requests)). Queries can
+  also load and unload models, e.g. a chat request loads its model.
 - Running totals and averages are kept in memory only and are lost when the
   proxy stops. Use `--csv` to keep per-query statistics.
 - Not yet tested on Windows. It builds for Windows, and
