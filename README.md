@@ -101,6 +101,12 @@ data (such as `/v1/models` or errors) are logged as `[Proxy]` lines and not
 counted. If the upstream can't be reached, the client gets
 `502 Bad Gateway` and the proxy logs an `[ERROR]` line.
 
+Paths, model names and error messages come from clients and the server, so
+characters in them that could control the terminal or start a fake line are
+printed as Go escapes: control characters (e.g. `\x1b`, `\n`), invalid UTF-8
+(`\xff`), the Unicode line and paragraph separators and bidirectional text
+controls (e.g. `\u202e`). Other text, including non-ASCII, is printed as is.
+
 `TPS` is the rate reported by the server. When the server doesn't report one,
 the proxy estimates it and marks it `(est.)`, e.g. `TPS: 40.98 (est.)`. `TTFT`
 (time to first token) only appears when the server reports it (see
@@ -127,6 +133,10 @@ Values the server didn't report (tokens, TPS, TTFT) are left empty.
 `tps_estimated` is `true` when the TPS was estimated by the proxy (shown as
 `(est.)` in the terminal), and `complete` is `false` for responses that were
 cut off. Only per-query values are saved; the running averages are not.
+Paths and model names are saved as received, without the escaping used in the
+terminal: fields with line breaks are quoted, but other control characters
+are kept. View the file in a spreadsheet or with `cat -v` rather than printing
+it raw to a terminal.
 
 ### Stopping
 

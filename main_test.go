@@ -16,11 +16,14 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // syncBuffer is a goroutine-safe buffer for capturing status output.
@@ -1540,5 +1543,157 @@ func TestTruncateString(t *testing.T) {
 	}
 	if got := truncateString("ääääää", 5); got != "ää..." {
 		t.Errorf("got %q, want rune-safe truncation", got)
+	}
+}
+
+func TestEscapeControls(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"", ""},
+		{"/v1/chat/completions?stream=true", "/v1/chat/completions?stream=true"},
+		{"\x1b[2J\x1b]0;title\a", `\x1b[2J\x1b]0;title\a`},
+		{"/a\r\n[12:00:00] #1 fake", `/a\r\n[12:00:00] #1 fake`},
+		{"\x00\t\x7f", `\x00\t\x7f`},
+		{"\u009b31m\u0085", `\u009b31m\u0085`},                                                         // C1: CSI, NEL
+		{"a\u2028b\u2029c", `a\u2028b\u2029c`},                                                         // line and paragraph separators
+		{"\u202eabc\u202c\u2066\u2069\u200f\u061c", `\u202eabc\u202c\u2066\u2069\u200f\u061c`},         // bidi controls
+		{"\xff\xc0x\xe2\x80", `\xff\xc0x\xe2\x80`},                                                     // invalid UTF-8
+		{`C:\dir\x1b "q"`, `C:\dir\x1b "q"`},                                                           // backslashes and quotes kept
+		{"qwen3:4b-\u00e4-\u65e5\u672c-\ufffd", "qwen3:4b-\u00e4-\u65e5\u672c-\ufffd"},                 // printable non-ASCII, real U+FFFD
+		{"\U0001f469\u200d\U0001f4bb soft\u00adhyphen", "\U0001f469\u200d\U0001f4bb soft\u00adhyphen"}, // other format characters
+	}
+	for _, tt := range tests {
+		if got := escapeControls(tt.in); got != tt.want {
+			t.Errorf("escapeControls(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+// TestEscapeControlsLossless escapes every byte, every rune up to U+00FF and
+// the escaped separators and bidi controls on their own. The result must have
+// nothing left to escape and unquote back to the input as a Go string.
+func TestEscapeControlsLossless(t *testing.T) {
+	var inputs []string
+	for c := 0; c < 256; c++ {
+		inputs = append(inputs, string([]byte{byte(c)}), string(rune(c)))
+	}
+	for _, r := range []rune{0x061c, 0x200e, 0x200f, 0x2028, 0x2029, 0x202a, 0x202e, 0x2066, 0x2069} {
+		inputs = append(inputs, string(r))
+	}
+	for _, in := range inputs {
+		checkEscapedLossless(t, in)
+	}
+}
+
+func checkEscapedLossless(t *testing.T, in string) {
+	t.Helper()
+	got := escapeControls(in)
+	if unsafeInLog(got) {
+		t.Errorf("escapeControls(%q) = %q, still contains characters to escape", in, got)
+	}
+	if !unsafeInLog(in) && got != in {
+		t.Errorf("escapeControls(%q) = %q, want it unchanged", in, got)
+	}
+	if in == `"` || in == `\` {
+		return // kept as is, so not a valid Go string body
+	}
+	if back, err := strconv.Unquote(`"` + got + `"`); err != nil || back != in {
+		t.Errorf("escapeControls(%q) = %q, unquotes to %q (%v)", in, got, back, err)
+	}
+}
+
+// unsafeInLog reports whether s contains what escapeControls escapes:
+// invalid UTF-8, control characters, line or paragraph separators, or bidi
+// controls.
+func unsafeInLog(s string) bool {
+	return !utf8.ValidString(s) || strings.IndexFunc(s, func(r rune) bool {
+		return unicode.IsControl(r) || unicode.In(r, unicode.Bidi_Control, unicode.Zl, unicode.Zp)
+	}) >= 0
+}
+
+// Status lines print the path of every request, so text with nothing to
+// escape must not be copied.
+func TestEscapeControlsCleanTextNotCopied(t *testing.T) {
+	clean := "/v1/chat/completions?model=qwen3:4b&q=\u00e4\u65e5\u672c"
+	if allocs := testing.AllocsPerRun(100, func() { _ = escapeControls(clean) }); allocs != 0 {
+		t.Errorf("escapeControls allocated %v times for text with nothing to escape", allocs)
+	}
+}
+
+// injectedPath decodes to a clear-screen escape sequence, CR LF, a fake
+// status line and a bidi override; injectedLog is how it must be printed.
+const (
+	injectedPath = "/x%1b[2J%0d%0a[12:00:00]%20fake%e2%80%ae"
+	injectedLog  = `/x\x1b[2J\r\n[12:00:00] fake\u202e`
+)
+
+func TestLogEscapesControlCharacters(t *testing.T) {
+	t.Run("not metered, debug", testEscapedNotMetered)
+	t.Run("not forwarded", testEscapedNotForwarded)
+	t.Run("upstream unreachable", testEscapedUpstreamError)
+	t.Run("no inference", testEscapedNoInference)
+	t.Run("query and model name", testEscapedQuery)
+}
+
+func testEscapedNotMetered(t *testing.T) {
+	srv, logs := startProxy(t, startUpstream(t, http.NotFoundHandler()))
+	cfg.Logging.Debug = true
+	postAndDrain(t, srv.URL+injectedPath+"?q=\u009b") // raw C1 CSI in the query
+	checkEscapedLogs(t, logs, 3, "[Proxy] POST "+injectedLog+" 404 (", `?q=\u009b from `, " -> 404 after ")
+}
+
+func testEscapedNotForwarded(t *testing.T) {
+	srv, logs := startProxy(t, startUpstream(t, http.NotFoundHandler()))
+	forward := false
+	cfg.ForwardUnmatched = &forward
+	postAndDrain(t, srv.URL+injectedPath)
+	checkEscapedLogs(t, logs, 1, "[Proxy] Non-API request: POST "+injectedLog+"\n")
+}
+
+func testEscapedUpstreamError(t *testing.T) {
+	up := httptest.NewServer(http.NotFoundHandler())
+	target, _ := url.Parse(up.URL)
+	up.Close()
+	srv, logs := startProxy(t, target)
+	postAndDrain(t, srv.URL+"/v1"+injectedPath)
+	checkEscapedLogs(t, logs, 1, "[ERROR] POST /v1"+injectedLog+": ")
+}
+
+func testEscapedNoInference(t *testing.T) {
+	srv, logs := startProxy(t, startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"object":"list","data":[]}`)
+	})))
+	postAndDrain(t, srv.URL+"/v1"+injectedPath)
+	checkEscapedLogs(t, logs, 1, "[Proxy] POST /v1"+injectedLog+" 200 (")
+}
+
+func testEscapedQuery(t *testing.T) {
+	srv, logs := startProxy(t, startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"model":"m\u001b[2J\r\n[12:00:00] #9\u202e",`+
+			`"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`)
+	})))
+	postAndDrain(t, srv.URL+"/v1"+injectedPath)
+	checkEscapedLogs(t, logs, 1, " POST /v1"+injectedLog+` 200 | Model: m\x1b[2J\r\n[12:00:00] #9\u202e | Tokens: 1 in / 2 out`)
+}
+
+// checkEscapedLogs waits for wantLines log lines, then checks that they
+// contain each of want and nothing that escapeControls escapes.
+func checkEscapedLogs(t *testing.T, logs *syncBuffer, wantLines int, want ...string) {
+	t.Helper()
+	waitFor(t, fmt.Sprintf("%d log lines", wantLines), func() bool {
+		return strings.Count(logs.String(), "\n") >= wantLines
+	})
+	got := logs.String()
+	if n := strings.Count(got, "\n"); n != wantLines {
+		t.Errorf("got %d log lines, want %d: %q", n, wantLines, got)
+	}
+	if unsafeInLog(strings.ReplaceAll(got, "\n", "")) {
+		t.Errorf("logs contain unescaped control characters: %q", got)
+	}
+	for _, w := range want {
+		if !strings.Contains(got, w) {
+			t.Errorf("logs missing %q: %q", w, got)
+		}
 	}
 }
