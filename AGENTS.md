@@ -280,6 +280,6 @@ All application logic is currently contained in `main.go`:
   - Defer a context's cancel function in the function that creates it (`godre:S8188`).
   - Close response bodies with `defer resp.Body.Close()` right after the error check (`godre:S8208`).
 - **golangci-lint**: Must report `0 issues` (CI fails otherwise; config in `.golangci.yml`). `errcheck` is on for non-test code, apart from the `std-error-handling` preset (unchecked `Close`, `fmt.Fprint*` etc.). Where an error is deliberately ignored, discard it explicitly with a reason, e.g. `_ = r.w.Write(row) // write errors are sticky; returned by r.w.Error()`, rather than adding `//nolint`. Exception: a discarded receive from a `chan error` (`<-errc` in `serve()`) is flagged by errcheck, and `_ = <-errc` by staticcheck S1005, so it keeps `//nolint:errcheck` with a reason.
-- **Git Hygiene**: Do not commit build artifacts (`metrics_proxy`, `.exe`) or temporary files.
+- **Git Hygiene**: Commits are allowed; opening a pull request from a branch is preferred over committing directly to `main`. Do not commit build artifacts (`metrics_proxy`, `.exe`) or temporary files.
 - **Merges**: Before committing a merge, run `git diff --check` and `go build ./... && go test -race ./...`; conflict markers have been committed to `main` before (merge `6a83ff7`, fixed afterwards).
 - **Keep docs in sync**: Behavior, config or limitation changes must update this file, `README.md`, `config.yaml` comments, and the affected `.serena/memories/` (committed, reviewed like code).

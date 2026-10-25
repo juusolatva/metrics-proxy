@@ -7,4 +7,4 @@
 5. `go run github.com/uudashr/gocognit/cmd/gocognit@v1.1.3 -over 15 .` shows no function you added or changed (SonarCloud `go:S3776`).
 6. If behavior, config schema, or known limitations changed: update `AGENTS.md` (architecture §5, limitations §6, config reference §4), `README.md`, `config.yaml` comments, and any affected `.serena/memories/` (they are committed and must not go stale).
 7. After merges/rebases: `git diff --check` and `grep -rn '^<<<<<<<\|^>>>>>>>' --include='*.go' .` print nothing (conflict markers were once committed to `main`).
-8. No build artifacts staged; `.serena/cache/` and `.serena/project.local.yml` must stay untracked.
+8. Commits are allowed; prefer a branch + pull request over committing directly to `main`. No build artifacts staged; `.serena/cache/` and `.serena/project.local.yml` must stay untracked.
