@@ -93,6 +93,20 @@ Testing on Windows: see `docs/windows-testing.md`.
   go test -race -v ./...
   ```
 
+Coverage (2026-10-26): 92.5% of statements. Security checks (`allowedHost`, `hostName`, `hasDotDotSegment`, `isManagementEndpoint`, `offersUpgrade`, `refuseManagement`, `escapeControls`, `csvText`) and the payload captures and parsers are at 100%; keep them there. Deliberately uncovered: `main()`, `setupSignalHandling` (real signals would interfere with other tests), and the defensive no-`requestInfo` branch in `meterResponse`; one branch of `decodeConfig` is uncovered too.
+
+### Testing Backlog
+Planned on 2026-10-26, not yet done. Remove an item from this list once it is done.
+1. **Fuzz tests** (`testing.F`, available since Go 1.18). Seed them from `testdata/` and commit failing inputs under `testdata/fuzz/`. Targets and invariants:
+   - Captures: a body split at random points gives the same `MetricsData` and `captureDiag` as the whole body, never panics, and stays within `maxCaptureBytes`. This generalizes `TestCaptureFixtures`' 1-byte chunks.
+   - `escapeControls`: the output contains no control, bidi or U+2028/U+2029 characters, and unescaping it gives back the input (see `TestEscapeControlsLossless`).
+   - `csvText`: writing and reading the cell with `encoding/csv` gives back the value after the protective apostrophe, and the cell never starts with a formula prefix.
+   - `hostName`, `isManagementEndpoint`, `hasDotDotSegment`: applying them twice changes nothing; a management path stays one under case changes, repeated slashes and `\` separators; no path that cleans to a management endpoint passes both checks.
+   - CI: run each target briefly (`go test -run '^$' -fuzz=FuzzX -fuzztime=30s`) in the weekly scheduled run only, not on every push.
+2. **Windows in CI**: a `windows-latest` job running `go test ./...` (without `-race` or the coverage upload). This automates the path, CSV file and refused-connection items of `docs/windows-testing.md`; Ctrl+C handling and Excel stay manual. Possibly `macos-latest` too.
+3. **More captures** in `testdata/`, each added to `TestCaptureFixtures`: OpenAI Responses API (`/v1/responses`, so far only hand-written `response` wrapper tests), error bodies (Ollama `{"error": …}` as JSON and mid-stream), embeddings (`/api/embed`, `/v1/embeddings`: they carry a model and prompt tokens, so they count as queries; pin whether that is wanted), tool-call and reasoning-model streams, and legacy `/v1/completions`. Record the server versions (LM Studio, Ollama) alongside the capture date in §2. Capturing sends requests to a real server, so ask the user before sending any.
+4. Optional: `BenchmarkSSECapture` over `lm_v1_chat_stream.sse` (parsing runs on every streamed chunk, so a slowdown delays tokens), and a one-off mutation-testing run to find assertions that check nothing.
+
 ### Linting & Formatting
 - **Format code**:
   ```bash
