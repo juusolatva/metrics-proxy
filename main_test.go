@@ -526,7 +526,7 @@ func TestSSECaptureSplitWrites(t *testing.T) {
 	want := whole.finish()
 
 	split := &sseCapture{}
-	for i := 0; i < len(lmStudioV1Stream); i++ {
+	for i := range len(lmStudioV1Stream) {
 		split.Write([]byte{lmStudioV1Stream[i]})
 	}
 	if got := split.finish(); got != want {
@@ -702,7 +702,7 @@ func TestCaptureOversizedInChunks(t *testing.T) {
 
 // Synthetic wrappers exercise hostile inputs not present in the real captures.
 func wrappedMetrics(payload string, depth int) string {
-	for i := 0; i < depth; i++ {
+	for i := range depth {
 		key := "result"
 		if i%2 != 0 {
 			key = "response"
@@ -1831,7 +1831,7 @@ func checkDebugOutput(t *testing.T, target *url.URL, path string, want []string)
 // debugRequestIDs returns the request IDs ("req N:") found in debug lines.
 func debugRequestIDs(logs string) map[string]bool {
 	ids := map[string]bool{}
-	for _, line := range strings.Split(logs, "\n") {
+	for line := range strings.SplitSeq(logs, "\n") {
 		if rest, ok := strings.CutPrefix(line, "[DEBUG] req "); ok {
 			ids[strings.SplitN(rest, ":", 2)[0]] = true
 		}
@@ -1848,10 +1848,8 @@ func TestConcurrentRequests(t *testing.T) {
 
 	const n = 25
 	var wg sync.WaitGroup
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range n {
+		wg.Go(func() {
 			resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{}`))
 			if err != nil {
 				t.Error(err)
@@ -1859,7 +1857,7 @@ func TestConcurrentRequests(t *testing.T) {
 			}
 			io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -2040,7 +2038,7 @@ func TestEscapeControls(t *testing.T) {
 // nothing left to escape and unquote back to the input as a Go string.
 func TestEscapeControlsLossless(t *testing.T) {
 	var inputs []string
-	for c := 0; c < 256; c++ {
+	for c := range 256 {
 		inputs = append(inputs, string([]byte{byte(c)}), string(rune(c)))
 	}
 	for _, r := range []rune{0x061c, 0x200e, 0x200f, 0x2028, 0x2029, 0x202a, 0x202e, 0x2066, 0x2069} {

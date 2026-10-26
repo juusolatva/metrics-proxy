@@ -6,7 +6,7 @@ This document serves as the guide for AI agents and developers working on the `m
 
 ## 1. Project Overview
 
-`metrics_proxy` is a lightweight HTTP reverse proxy written in Go (1.21+). It sits between an LLM client (such as an API client, IDE extension, or web UI) and a local LLM instance (primarily LM Studio; Ollama and other OpenAI-compatible HTTP backends are also targets, see `testdata/`).
+`metrics_proxy` is a lightweight HTTP reverse proxy written in Go (1.26+). It sits between an LLM client (such as an API client, IDE extension, or web UI) and a local LLM instance (primarily LM Studio; Ollama and other OpenAI-compatible HTTP backends are also targets, see `testdata/`).
 
 Its primary responsibilities are:
 - Forwarding matching API requests from clients to the local LLM server.
@@ -24,7 +24,7 @@ The project currently consists of a single-file implementation (`main.go`) with 
 metrics_proxy/
 ├── AGENTS.md          # Agent and developer guidelines (this file)
 ├── config.yaml        # Runtime YAML configuration file
-├── go.mod             # Go module definition (metrics_proxy, Go 1.21)
+├── go.mod             # Go module definition (metrics_proxy, Go 1.26)
 ├── go.sum             # Checksums for external dependencies
 ├── LICENSE            # MIT License
 ├── main.go            # Complete application source (proxy, metrics, config)
@@ -97,7 +97,7 @@ Coverage (2026-10-26): 92.5% of statements. Security checks (`allowedHost`, `hos
 
 ### Backlog
 Planned on 2026-10-26, not yet done. Remove an item from this list once it is done.
-1. **Raise the `go` directive from 1.21 to 1.26**, before items 2 and 5. Nothing forces it: the directive is only the minimum version, builds use the installed toolchain (with its security fixes), and `go.yaml.in/yaml/v4` needs only Go 1.18. But 1.21 has been unsupported since August 2024 (Go supports the two newest releases, 1.27 and 1.26 as of 2026-10-26), so CI's "Test (Go from go.mod)" job tests a toolchain that no longer gets fixes. The directive also selects language semantics: until it is 1.22 or newer, loop variables are shared across iterations even when built with a newer Go (no current code depends on that; `TestConcurrentRequests` doesn't capture `i`). Choose the oldest supported release, not the newest, and don't raise it every release, only when a feature is wanted. Useful after the bump: `testing/synctest` (1.25) to run the shutdown and streaming tests on a fake clock instead of `waitFor` polling and real timeouts, `b.Loop()` and `t.Context()` (1.24), `for i := range n` (1.22). Steps: edit `go.mod` (or `go mod edit -go=1.26`), optionally `go fix ./...`, then update §1, §2 and §6 item 7 of this file, README.md's requirements and `.serena/memories/tech_stack.md`. CI needs no change, since its jobs read the version from `go.mod`.
+1. **`testing/synctest` for timing tests** (Go 1.25): run the shutdown and streaming tests on a fake clock instead of `waitFor` polling and real timeouts. `t.Context()` (1.24) can replace hand-made test contexts where a test needs no cancel of its own.
 2. **Fuzz tests** (`testing.F`, available since Go 1.18). Seed them from `testdata/` and commit failing inputs under `testdata/fuzz/`. Targets and invariants:
    - Captures: a body split at random points gives the same `MetricsData` and `captureDiag` as the whole body, never panics, and stays within `maxCaptureBytes`. This generalizes `TestCaptureFixtures`' 1-byte chunks.
    - `escapeControls`: the output contains no control, bidi or U+2028/U+2029 characters, and unescaping it gives back the input (see `TestEscapeControlsLossless`).
@@ -106,7 +106,7 @@ Planned on 2026-10-26, not yet done. Remove an item from this list once it is do
    - CI: run each target briefly (`go test -run '^$' -fuzz=FuzzX -fuzztime=30s`) in the weekly scheduled run only, not on every push.
 3. **Windows in CI**: a `windows-latest` job running `go test ./...` (without `-race` or the coverage upload). This automates the path, CSV file and refused-connection items of `docs/windows-testing.md`; Ctrl+C handling and Excel stay manual. Possibly `macos-latest` too.
 4. **More captures** in `testdata/`, each added to `TestCaptureFixtures`: OpenAI Responses API (`/v1/responses`, so far only hand-written `response` wrapper tests), error bodies (Ollama `{"error": …}` as JSON and mid-stream), embeddings (`/api/embed`, `/v1/embeddings`: they carry a model and prompt tokens, so they count as queries; pin whether that is wanted), tool-call and reasoning-model streams, and legacy `/v1/completions`. Record the server versions (LM Studio, Ollama) alongside the capture date in §2. Capturing sends requests to a real server, so ask the user before sending any.
-5. Optional: `BenchmarkSSECapture` over `lm_v1_chat_stream.sse` (parsing runs on every streamed chunk, so a slowdown delays tokens), and a one-off mutation-testing run to find assertions that check nothing.
+5. Optional: `BenchmarkSSECapture` (with `b.Loop()`) over `lm_v1_chat_stream.sse` (parsing runs on every streamed chunk, so a slowdown delays tokens), and a one-off mutation-testing run to find assertions that check nothing.
 
 ### Linting & Formatting
 - **Format code**:
@@ -273,7 +273,8 @@ All application logic is currently contained in `main.go`:
    - The first signal waits up to `shutdownTimeout` (60 s, a constant, not configurable) for running generations; a second signal aborts them. Tests drive `serve()` directly with their own contexts and timeout (`startServe`), not real signals. Aggregates are in memory only and are lost on exit; with `--csv`, per-query rows are kept in the file.
    - `--csv` does not check an existing file's header. Appending to a CSV with different columns (e.g. from a future version) mixes formats. Existing rows are not rewritten with formula protection: after upgrading, use a new file or import existing text columns explicitly as text. The protective apostrophe on new rows may be visible in some readers.
 7. **Go version**:
-   - `go.mod` declares Go 1.21. Avoid standard library APIs newer than 1.21 (e.g. `http.ServeMux` method/wildcard patterns from 1.22) unless the `go` directive is bumped. The `min`/`max` builtins (1.21) are fine. A bump to 1.26 is planned (§3, "Backlog", item 1).
+   - `go.mod` declares Go 1.26 (raised from 1.21 on 2026-10-26; Go supports the two newest releases, 1.27 and 1.26 at that time). Avoid standard library APIs and language features newer than 1.26 unless the `go` directive is bumped. CI's "Test (Go from go.mod)" job tests the oldest version the directive allows, and the directive also selects language semantics (e.g. per-iteration loop variables since 1.22).
+   - When bumping, choose the oldest supported release, not the newest, and only when a feature is wanted, not every release. Steps: `go mod edit -go=1.N`, `go fix ./...` (review its rewrites), then update §1, §2 and this item, README.md's requirements and `.serena/memories/tech_stack.md`. CI needs no change, since its jobs read the version from `go.mod`.
 8. **Single upstream, no auth/TLS options**:
    - The upstream is always `http://host:port`; there is no HTTPS upstream, API key injection, or per-endpoint routing.
    - Clients aren't authenticated, and the proxy listens on all interfaces (the user's LLM clients run on other LAN machines). Anyone who can reach `proxy_port` can query the upstream with the proxy's localhost identity. Only `managementEndpoints` and protocol upgrades are held back (`forward_management`). Queries can still load and unload models (a chat request loads its model; Ollama's `keep_alive: 0` unloads it), and the list must be extended by hand when an upstream adds management endpoints.

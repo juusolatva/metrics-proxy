@@ -19,6 +19,7 @@ import (
 	"os/signal"
 	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -491,19 +492,14 @@ func isManagementEndpoint(p string) bool {
 // Clients resolve dot segments before sending, so these paths are refused
 // whatever the configuration.
 func hasDotDotSegment(p string) bool {
-	for _, seg := range strings.FieldsFunc(p, func(r rune) bool { return r == '/' || r == '\\' }) {
-		if seg == ".." {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(strings.FieldsFunc(p, func(r rune) bool { return r == '/' || r == '\\' }), "..")
 }
 
 // offersUpgrade reports whether h's Upgrade header offers a protocol other
 // than h2c, i.e. asks to turn the connection into a tunnel (WebSocket).
 func offersUpgrade(h http.Header) bool {
 	for _, v := range h.Values("Upgrade") {
-		for _, p := range strings.Split(v, ",") {
+		for p := range strings.SplitSeq(v, ",") {
 			if p = strings.TrimSpace(p); p != "" && !strings.EqualFold(p, "h2c") {
 				return true
 			}

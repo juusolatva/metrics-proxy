@@ -22,7 +22,7 @@ never buffered.
 
 ## Requirements
 
-- Go 1.21 or newer
+- Go 1.26 or newer
 
 ## Usage
 
