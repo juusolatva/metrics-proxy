@@ -467,13 +467,32 @@ var managementEndpoints = []string{
 }
 
 // isManagementEndpoint reports whether the (decoded) request path is one of
-// managementEndpoints or below one. The path is cleaned and lowercased first,
-// so dot segments, repeated or trailing slashes and case variants that an
-// upstream router may accept match too.
+// managementEndpoints or below one. Backslashes are read as slashes (as
+// WHATWG URL parsers do), and the path is cleaned and lowercased first, so
+// repeated or trailing slashes and case variants that an upstream router may
+// accept match too. Paths with ".." segments are refused before this check
+// (hasDotDotSegment), since cleaning them can remove the endpoint's prefix.
 func isManagementEndpoint(p string) bool {
-	p = path.Clean("/" + strings.ToLower(p))
+	p = path.Clean("/" + strings.ToLower(strings.ReplaceAll(p, `\`, "/")))
 	for _, e := range managementEndpoints {
 		if p == e || strings.HasPrefix(p, e+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// hasDotDotSegment reports whether the (decoded) request path has a ".."
+// segment, with backslashes also counted as separators. The proxy checks
+// paths after path.Clean but forwards them as sent, so for such a path the
+// two can differ: "/api/blobs/.." is checked as "/api", but a router that
+// leaves dot segments alone can match it as "/api/blobs/{digest}", and one
+// that resolves "\" as a separator can reach a path the check never saw.
+// Clients resolve dot segments before sending, so these paths are refused
+// whatever the configuration.
+func hasDotDotSegment(p string) bool {
+	for _, seg := range strings.FieldsFunc(p, func(r rune) bool { return r == '/' || r == '\\' }) {
+		if seg == ".." {
 			return true
 		}
 	}
@@ -657,6 +676,11 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(out, "[Proxy] Rejected %s %s: Host %q not allowed (add %q to allowed_hosts if clients use this name)\n",
 			r.Method, escapeControls(r.URL.Path), r.Host, host)
 		http.Error(w, "Forbidden: Host not allowed", http.StatusForbidden)
+		return
+	}
+	if hasDotDotSegment(r.URL.Path) {
+		fmt.Fprintf(out, "[Proxy] Rejected %s %s: \"..\" segment in path\n", r.Method, escapeControls(r.URL.Path))
+		http.Error(w, `Bad Request: ".." segment in path`, http.StatusBadRequest)
 		return
 	}
 	if !cfg.ForwardManagement && refuseManagement(w, r) {
