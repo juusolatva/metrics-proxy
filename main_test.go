@@ -1060,7 +1060,7 @@ func TestNonAPIPathNotForwarded(t *testing.T) {
 func TestIsManagementEndpoint(t *testing.T) {
 	for p, want := range map[string]bool{
 		"/api/pull": true, "/api/pull/": true, "/API/Pull": true, "//api/pull": true, "/api/../api/delete": true,
-		"/v1/../api/push": true, "/api/copy": true, "/api/create": true, "/api/blobs/sha256:0": true,
+		"/v1/../api/push": true, `/api\pull`: true, `\api\pull`: true, `/api/v1/models\load`: true, "/api/copy": true, "/api/create": true, "/api/blobs/sha256:0": true,
 		"/api/me": true, "/api/signout": true, "/api/user/keys/x": true,
 		"/api/v1/models/load": true, "/api/v1/models/unload": true, "/api/v1/models/download/status/1": true,
 		"/api/chat": false, "/api/generate": false, "/api/embed": false, "/api/tags": false, "/api/show": false,
@@ -1071,6 +1071,65 @@ func TestIsManagementEndpoint(t *testing.T) {
 		if got := isManagementEndpoint(p); got != want {
 			t.Errorf("isManagementEndpoint(%q) = %t, want %t", p, got, want)
 		}
+	}
+}
+
+func TestHasDotDotSegment(t *testing.T) {
+	for p, want := range map[string]bool{
+		"/api/pull/..": true, "/api/../api/pull": true, "..": true, "/api/blobs/..": true, "/v1/x/../../api/pull": true,
+		`/api/pull\..`: true, `/api/x\..\pull`: true, `\..\api`: true,
+		"/api/pull": false, "/api/pull/": false, "/v1/chat/completions": false, "/": false, "": false,
+		"/api/./pull": false, "/v1/models/a..b": false, "/v1/.../x": false, "/v1/..x": false, "/v1/x..": false,
+	} {
+		if got := hasDotDotSegment(p); got != want {
+			t.Errorf("hasDotDotSegment(%q) = %t, want %t", p, got, want)
+		}
+	}
+}
+
+// Paths with ".." segments are checked after path.Clean but forwarded as
+// sent, so they are refused before the management check, in every
+// configuration ("/api/blobs/.." would otherwise be checked as "/api").
+func TestDotDotPathNotForwarded(t *testing.T) {
+	for _, tc := range []struct {
+		name                       string
+		forwardManagement, forward bool
+	}{
+		{"default", false, true},
+		{"forward_management", true, true},
+		{"forward_unmatched false", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			checkDotDotRefused(t, tc.forwardManagement, tc.forward)
+		})
+	}
+}
+
+func checkDotDotRefused(t *testing.T, forwardManagement, forwardUnmatched bool) {
+	target, hits := startCountingUpstream(t)
+	srv, logs := startProxy(t, target)
+	cfg.APIEndpoints = []string{"/api/*", "/v1/*"}
+	cfg.ForwardManagement = forwardManagement
+	cfg.ForwardUnmatched = &forwardUnmatched
+
+	for _, p := range []string{
+		"/api/pull/..", "/api/pull/%2e%2e", "/api/pull/.%2E", "/api/pull%2F..", "/api/blobs/..",
+		"/api/delete/x/../..", "/api/../api/pull", "/v1/../api/push", "/api/x%5C..%5Cpull", "/v1/../secret",
+	} {
+		if resp := sendRequest(t, "POST", srv.URL+p); resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("POST %s: status = %d, want 400", p, resp.StatusCode)
+		}
+	}
+	if n := hits.Load(); n != 0 {
+		t.Errorf("%d request(s) with \"..\" segments reached the upstream", n)
+	}
+	if want := `[Proxy] Rejected POST /api/pull/..: ".." segment in path`; !strings.Contains(logs.String(), want) {
+		t.Errorf("logs missing %q:\n%s", want, logs)
+	}
+
+	// Dots inside a segment are ordinary characters.
+	if resp := sendRequest(t, "GET", srv.URL+"/v1/models/a..b"); resp.StatusCode != http.StatusOK {
+		t.Errorf("GET /v1/models/a..b: status = %d, want the upstream's 200", resp.StatusCode)
 	}
 }
 
@@ -1149,7 +1208,7 @@ func TestManagementEndpointNotForwarded(t *testing.T) {
 	for _, rq := range [][2]string{
 		{"DELETE", "/api/delete"}, {"POST", "/api/pull"}, {"POST", "/api/push"}, {"POST", "/api/copy"},
 		{"POST", "/api/create"}, {"HEAD", "/api/blobs/sha256:0"}, {"POST", "/api/me"}, {"POST", "/api/signout"},
-		{"POST", "/api/%70ull"}, {"POST", "/api/../api/pull"}, {"POST", "//api/pull"}, {"POST", "/API/PULL"},
+		{"POST", "/api/%70ull"}, {"POST", "/api%5Cpull"}, {"POST", "//api/pull"}, {"POST", "/API/PULL"},
 		{"POST", "/api/pull/"}, {"POST", "/api/v1/models/load"}, {"POST", "/api/v1/models/download"},
 	} {
 		if resp := sendRequest(t, rq[0], srv.URL+rq[1]); resp.StatusCode != http.StatusForbidden {

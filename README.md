@@ -226,6 +226,17 @@ match `api_endpoints` (such as Ollama's `"/api/*"`), and logged:
   is forwarded as plain HTTP/1.1.
 
 Model lists (`/api/tags`, `/api/ps`, `/api/v1/models`, `/v1/models`) and
+Request paths with a `..` segment, such as `/api/blobs/..` (also
+percent-encoded, or with `\` as separator), are answered with
+`400 Bad Request` in every configuration, since the server could resolve them
+to a management endpoint. Clients resolve such segments before sending, so
+ordinary requests aren't affected:
+
+```
+[Proxy] Rejected POST /api/blobs/..: ".." segment in path
+```
+
+Model lists (`/api/tags`, `/api/ps`, `/api/v1/models`, `/v1/models`) and
 model details (`/api/show`) are forwarded as before. Set
 `forward_management: true` to forward management requests too.
 
