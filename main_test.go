@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -673,6 +674,32 @@ func TestCaptureEdgeCases(t *testing.T) {
 	}
 }
 
+// Bodies arriving in chunks cross the size limit partway through. The rest of
+// an oversized JSON body or SSE event is dropped, including SSE data lines
+// that follow the oversized part (they would be parsed as a fragment), and
+// later events still count.
+func TestCaptureOversizedInChunks(t *testing.T) {
+	half := strings.Repeat("x", maxCaptureBytes/2+1)
+	fragment := "data: {\"model\":\"fragment\"}\n"
+	next := "data: {\"model\":\"m\",\"usage\":{\"total_tokens\":4}}\n\n"
+	for _, tt := range []struct {
+		name, contentType, body string
+		want                    MetricsData
+		documents               int
+	}{
+		{"JSON body", "application/json", `{"model":"m","pad":"` + half + half + half + `"}`, MetricsData{}, 0}, // writes continue after the overflow
+		{"SSE data lines of one event", "text/event-stream",
+			"data: " + half + "\ndata: " + half + "\n" + fragment + "\n" + next, MetricsData{ModelName: "m", TotalTokens: 4}, 1},
+		{"SSE oversized line within an event", "text/event-stream",
+			"event: x\ndata: " + half + half + "\n" + fragment + "\n" + next, MetricsData{ModelName: "m", TotalTokens: 4}, 1},
+	} {
+		got, d := parseInChunks(t, tt.contentType, []byte(tt.body), 1<<20)
+		if got != tt.want || d.oversized != 1 || d.documents != tt.documents || d.invalid != 0 {
+			t.Errorf("%s: got %+v, diag %+v; want %+v, 1 oversized, %d document(s)", tt.name, got, d, tt.want, tt.documents)
+		}
+	}
+}
+
 // Synthetic wrappers exercise hostile inputs not present in the real captures.
 func wrappedMetrics(payload string, depth int) string {
 	for i := 0; i < depth; i++ {
@@ -997,6 +1024,110 @@ func TestShutdownAbortsInFlightStream(t *testing.T) {
 	}
 }
 
+// A client that disconnects mid-stream cancels the upstream request. The
+// query is recorded as incomplete with what arrived until then.
+func TestClientDisconnectMidStream(t *testing.T) {
+	target, _ := startStreamingUpstream(t, streamFirst, streamRest)
+	srv, logs := startProxy(t, target)
+	cfg.Logging.Debug = true
+
+	resp, _ := postStream(t, srv.URL)
+	resp.Body.Close()
+	waitFor(t, "incomplete query", func() bool { return strings.Contains(logs.String(), "| incomplete") })
+	for _, want := range []string{"body ended before EOF (client disconnected or shutdown)", "| Model: m |"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("logs missing %q:\n%s", want, logs)
+		}
+	}
+}
+
+func TestShutdownWithoutInFlightRequests(t *testing.T) {
+	p := startServe(t, startUpstream(t, http.NotFoundHandler()), time.Minute)
+	p.stop()
+	if err := p.wait(t, 2*time.Second); err != nil {
+		t.Errorf("serve() = %v, want nil", err)
+	}
+	if logs := p.logs.String(); logs != "\nShutting down\nProxy stopped\n" {
+		t.Errorf("logs = %q, want only the shutdown and stop messages", logs)
+	}
+}
+
+func TestServeReturnsListenerError(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln.Close()
+	ctx := context.Background()
+	if err := serve(ctx, ctx, &http.Server{Handler: http.NotFoundHandler()}, ln, time.Second); !errors.Is(err, net.ErrClosed) {
+		t.Errorf("serve() on a closed listener = %v, want net.ErrClosed", err)
+	}
+}
+
+func TestRunProxyPortInUse(t *testing.T) {
+	startProxy(t, startUpstream(t, http.NotFoundHandler()))
+	busy, err := net.Listen("tcp", ":0") // same wildcard address runProxy listens on
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer busy.Close()
+	cfg.ProxyPort = busy.Addr().(*net.TCPAddr).Port
+
+	ctx := context.Background()
+	if err := runProxy(ctx, ctx); err == nil {
+		t.Errorf("runProxy() on port %d in use: want an error", cfg.ProxyPort)
+	}
+}
+
+func TestRunProxyServesUntilStopped(t *testing.T) {
+	target, hits := startCountingUpstream(t)
+	startProxy(t, target)
+	free, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ProxyPort = free.Addr().(*net.TCPAddr).Port
+	free.Close()
+
+	stopCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	errc := make(chan error, 1)
+	go func() { errc <- runProxy(stopCtx, context.Background()) }()
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/v1/models", cfg.ProxyPort)
+	waitFor(t, "proxy to answer", func() bool {
+		resp, err := http.Get(url)
+		if err != nil {
+			return false
+		}
+		resp.Body.Close()
+		return resp.StatusCode == http.StatusOK
+	})
+	stop()
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Errorf("runProxy() = %v, want nil after stop", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("runProxy() did not return after stop")
+	}
+	if hits.Load() == 0 {
+		t.Error("no request reached the upstream")
+	}
+}
+
+func TestUpstreamURL(t *testing.T) {
+	for host, want := range map[string]string{
+		"localhost": "http://localhost:1234", "192.0.2.1": "http://192.0.2.1:1234", "::1": "http://[::1]:1234",
+	} {
+		cfg.Server = ServerConfig{Host: host, Port: 1234}
+		if got := upstreamURL().String(); got != want {
+			t.Errorf("upstreamURL() for host %q = %q, want %q", host, got, want)
+		}
+	}
+}
+
 func TestNonAPIPathForwardedUnmetered(t *testing.T) {
 	target := startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/tags" {
@@ -1292,6 +1423,26 @@ func TestManagementForwardedWhenEnabled(t *testing.T) {
 	checkWebSocketTunnel(t, srv.URL+"/llm")
 }
 
+// A 101 response body is the upgraded connection. Wrapping it in a
+// meteredBody makes it non-writable and breaks the tunnel, so it must stay
+// unwrapped on metered paths too.
+func TestUpgradeOnMeteredPathNotWrapped(t *testing.T) {
+	target, _ := startCountingUpstream(t)
+	srv, logs := startProxy(t, target)
+	cfg.ForwardManagement = true
+	cfg.Logging.Debug = true
+
+	checkWebSocketTunnel(t, srv.URL+"/v1/realtime")
+	if want := "protocol upgrade, connection not inspected"; !strings.Contains(logs.String(), want) {
+		t.Errorf("logs missing %q:\n%s", want, logs)
+	}
+	metrics.mu.RLock()
+	defer metrics.mu.RUnlock()
+	if metrics.QueryCount != 0 {
+		t.Errorf("QueryCount = %d, want 0 for an upgraded connection", metrics.QueryCount)
+	}
+}
+
 // checkWebSocketTunnel opens a WebSocket through the proxy and checks that
 // bytes sent over it come back from the upstream.
 func checkWebSocketTunnel(t *testing.T, url string) {
@@ -1511,6 +1662,52 @@ func TestProxyWritesQueriesToCSV(t *testing.T) {
 	}
 }
 
+func TestOpenCSVLogErrors(t *testing.T) {
+	if _, err := openCSVLog(t.TempDir()); err == nil {
+		t.Error("openCSVLog(directory): want an error")
+	}
+	if runtime.GOOS != "linux" {
+		t.Skip("header write error needs /dev/full")
+	}
+	// /dev/full opens and is empty, but every write fails, so the header can't be written.
+	if _, err := openCSVLog("/dev/full"); err == nil {
+		t.Error("openCSVLog(/dev/full): want the header write error")
+	}
+}
+
+// A failing CSV write (full disk, removed drive) is logged; proxying and the
+// in-memory metrics carry on.
+func TestCSVWriteErrorLogged(t *testing.T) {
+	target := startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, chatCompletionJSON)
+	}))
+	srv, logs := startProxy(t, target)
+	rec, err := openCSVLog(filepath.Join(t.TempDir(), "stats.csv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec.f.Close() // later writes fail
+	t.Cleanup(func() {
+		rec.Close()
+		if err := rec.Close(); err != nil {
+			t.Errorf("second Close() = %v, want nil", err)
+		}
+	})
+	csvLog = rec
+
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if body := readAll(t, resp.Body); resp.StatusCode != http.StatusOK || body != chatCompletionJSON {
+		t.Errorf("client got %d %q, want the upstream's response", resp.StatusCode, body)
+	}
+	waitForQueries(t, 1)
+	waitFor(t, "CSV error line", func() bool { return strings.Contains(logs.String(), "[ERROR] writing CSV: ") })
+}
+
 func TestCaptureDiag(t *testing.T) {
 	tests := []struct {
 		contentType, body string
@@ -1548,6 +1745,9 @@ func debugTestUpstream(w http.ResponseWriter, r *http.Request) {
 	case "/v1/stream": // streamed without include_usage
 		w.Header().Set("Content-Type", "text/event-stream")
 		io.WriteString(w, "data: {\"model\":\"m\",\"choices\":[]}\n\ndata: oops\n\ndata: [DONE]\n\n")
+	case "/v1/models": // JSON without inference data
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"object":"list","data":[]}`)
 	default:
 		w.Header().Set("Content-Type", "text/plain")
 		io.WriteString(w, "hello")
@@ -1592,6 +1792,10 @@ func TestDebugLogging(t *testing.T) {
 		{"/v1/stream", []string{
 			"parsed as SSE: 1 JSON document(s), 1 invalid, 0 skipped",
 			`must send "stream_options": {"include_usage": true}`,
+		}},
+		{"/v1/models", []string{
+			"parsed as JSON: 1 JSON document(s), 0 invalid, 0 skipped",
+			"no model, token or rate fields found; not counted as a query",
 		}},
 		{"/v1/text", []string{
 			`Content-Type "text/plain"`,
@@ -1737,6 +1941,22 @@ func TestFormatMetricsLineMarksEstimatedTPS(t *testing.T) {
 		line := formatMetricsLine(time.Now(), info, 200, MetricsData{TokensPerSecond: 40, TPSEstimated: tt.est}, snap, true)
 		if !strings.Contains(line, tt.want) {
 			t.Errorf("estimated=%v: line %q does not contain %q", tt.est, line, tt.want)
+		}
+	}
+}
+
+func TestFormatMetricsLineTokens(t *testing.T) {
+	info := &requestInfo{method: "POST", path: "/v1/embeddings"}
+	snap := metricsSnapshot{QueryCount: 1}
+	for _, tt := range []struct {
+		data MetricsData
+		want string
+	}{
+		{MetricsData{PromptTokens: 5, CompletionTokens: 2, TotalTokens: 7}, "| Tokens: 5 in / 2 out |"},
+		{MetricsData{TotalTokens: 7}, "| Tokens: 7 |"}, // only a total reported
+	} {
+		if line := formatMetricsLine(time.Now(), info, 200, tt.data, snap, true); !strings.Contains(line, tt.want) {
+			t.Errorf("%+v: line %q does not contain %q", tt.data, line, tt.want)
 		}
 	}
 }
