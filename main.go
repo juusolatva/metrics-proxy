@@ -1006,6 +1006,8 @@ func (s *lineSplitter) appendLine(p []byte) {
 type sseCapture struct {
 	lines   lineSplitter
 	data    []byte // data field of the event being assembled
+	skip    bool   // part of the event exceeded maxCaptureBytes; drop the rest of it
+	dropped int    // lines.oversized when the last line was processed
 	metrics MetricsData
 	d       captureDiag
 }
@@ -1016,13 +1018,19 @@ func (c *sseCapture) Write(p []byte) (int, error) {
 }
 
 func (c *sseCapture) processLine(line []byte) {
+	if c.lines.oversized != c.dropped {
+		// The splitter dropped an oversized line of this event since the last call.
+		c.dropped, c.skip = c.lines.oversized, true
+	}
 	switch {
 	case len(line) == 0:
 		c.dispatch()
+	case c.skip:
+		// Data lines after the oversized part would be parsed as a fragment.
 	case bytes.HasPrefix(line, []byte("data:")):
 		value := bytes.TrimPrefix(line[len("data:"):], []byte(" "))
 		if len(c.data)+len(value) > maxCaptureBytes {
-			c.data = c.data[:0]
+			c.data, c.skip = c.data[:0], true
 			c.d.oversized++
 			return
 		}
@@ -1036,10 +1044,10 @@ func (c *sseCapture) processLine(line []byte) {
 }
 
 func (c *sseCapture) dispatch() {
-	if len(c.data) > 0 && !bytes.Equal(c.data, []byte("[DONE]")) {
+	if !c.skip && len(c.data) > 0 && !bytes.Equal(c.data, []byte("[DONE]")) {
 		c.d.count(c.metrics.mergeJSON(c.data))
 	}
-	c.data = c.data[:0]
+	c.data, c.skip = c.data[:0], false
 }
 
 func (c *sseCapture) finish() MetricsData {
