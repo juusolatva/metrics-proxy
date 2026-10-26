@@ -769,7 +769,7 @@ func checkProxyWrapperLimit(t *testing.T, contentType string) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if got := readAll(t, resp.Body); got != string(body) {
+	if readAll(t, resp.Body) != string(body) {
 		t.Fatal("inspection changed the forwarded response")
 	}
 	waitForQueries(t, 1)
@@ -1398,7 +1398,7 @@ func checkProxyCSVFormula(t *testing.T, field string) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if got := readAll(t, resp.Body); got != string(body) {
+	if readAll(t, resp.Body) != string(body) {
 		t.Fatal("CSV escaping changed the forwarded response")
 	}
 	// QueryCount can advance before the CSV row is flushed.
