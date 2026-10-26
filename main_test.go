@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/csv"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -672,6 +673,117 @@ func TestCaptureEdgeCases(t *testing.T) {
 	}
 }
 
+// Synthetic wrappers exercise hostile inputs not present in the real captures.
+func wrappedMetrics(payload string, depth int) string {
+	for i := 0; i < depth; i++ {
+		key := "result"
+		if i%2 != 0 {
+			key = "response"
+		}
+		payload = `{"` + key + `":` + payload + `}`
+	}
+	return payload
+}
+
+func metricsBody(contentType, payload string) []byte {
+	if contentType == "text/event-stream" {
+		return []byte("data: " + payload + "\n\n")
+	}
+	return []byte(payload + "\n")
+}
+
+func TestCaptureWrapperDepthLimit(t *testing.T) {
+	for _, contentType := range []string{"application/json", "text/event-stream", "application/x-ndjson"} {
+		t.Run(contentType, func(t *testing.T) { checkWrapperDepthLimit(t, contentType) })
+	}
+}
+
+func checkWrapperDepthLimit(t *testing.T, contentType string) {
+	t.Helper()
+	leaf := `{"model":"inner","pad":"` + strings.Repeat("x", 16<<10) + `"}`
+	for _, depth := range []int{8, 9, 64} {
+		payload := wrappedMetrics(leaf, depth)
+		// The root's own fields remain useful when deeper inspection stops.
+		payload = `{"model":"outer",` + payload[1:]
+		got, diag := parseInChunks(t, contentType, metricsBody(contentType, payload), 1024)
+		want := "inner"
+		if depth > 8 {
+			want = "outer"
+		}
+		if got.ModelName != want || diag.documents != 1 || diag.invalid != 0 {
+			t.Errorf("depth %d: got %+v, diag %+v; want model %q and one valid document", depth, got, diag, want)
+		}
+	}
+}
+
+func TestCaptureWrapperBudgetSharedBySiblings(t *testing.T) {
+	// Root ~12 MiB + three ~6 MiB result decodes leaves too little of the
+	// 32 MiB work budget for the response sibling. Neither branch hits depth 8.
+	pad := strings.Repeat("x", 6<<20)
+	first := wrappedMetrics(`{"model":"first","pad":"`+pad+`"}`, 2)
+	payload := `{"model":"outer","result":` + first + `,"response":{"model":"second","pad":"` + pad + `"}}`
+	for _, contentType := range []string{"application/json", "text/event-stream", "application/x-ndjson"} {
+		got, diag := parseInChunks(t, contentType, metricsBody(contentType, payload), 32<<10)
+		if got.ModelName != "first" || diag.documents != 1 || diag.oversized != 0 {
+			t.Errorf("%s: got %+v, diag %+v; want first and no capture overflow", contentType, got, diag)
+		}
+	}
+}
+
+func TestWrapperParseBudgetBoundary(t *testing.T) {
+	raw := []byte(`{"model":"outer","result":{"model":"first"},"response":{"model":"second"}}`)
+	for _, extra := range []int{-1, 0, len(`{"model":"first"}`), len(`{"model":"first"}`) + len(`{"model":"second"}`)} {
+		remaining := len(raw) + extra
+		var got MetricsData
+		ok := got.mergeJSONBounded(raw, 0, &remaining)
+		want := map[int]string{-1: "", 0: "outer", len(`{"model":"first"}`): "first"}[extra]
+		if extra == len(`{"model":"first"}`)+len(`{"model":"second"}`) {
+			want = "second"
+		}
+		if ok != (extra >= 0) || got.ModelName != want || remaining < 0 {
+			t.Errorf("extra %d: model %q, valid %t, remaining %d; want %q", extra, got.ModelName, ok, remaining, want)
+		}
+	}
+}
+
+func TestProxyForwardsBeyondWrapperLimit(t *testing.T) {
+	for _, contentType := range []string{"application/json", "text/event-stream", "application/x-ndjson"} {
+		t.Run(contentType, func(t *testing.T) { checkProxyWrapperLimit(t, contentType) })
+	}
+}
+
+func checkProxyWrapperLimit(t *testing.T, contentType string) {
+	t.Helper()
+	payload := `{"model":"outer",` + wrappedMetrics(`{"model":"too-deep"}`, 64)[1:]
+	body := metricsBody(contentType, payload)
+	if contentType != "application/json" {
+		body = append(body, metricsBody(contentType, `{"response":{"model":"next"}}`)...)
+	}
+	target := startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", contentType)
+		w.Write(body)
+	}))
+	srv, _ := startProxy(t, target)
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if got := readAll(t, resp.Body); got != string(body) {
+		t.Fatal("inspection changed the forwarded response")
+	}
+	waitForQueries(t, 1)
+	want := "outer"
+	if contentType != "application/json" {
+		want = "next" // later documents get a fresh inspection budget
+	}
+	metrics.mu.RLock()
+	defer metrics.mu.RUnlock()
+	if metrics.ModelName != want {
+		t.Errorf("model = %q, want %q", metrics.ModelName, want)
+	}
+}
+
 func TestProxyOllamaNativeNDJSON(t *testing.T) {
 	stream := readFixture(t, "ol_chat_stream.ndjson")
 	target := startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1222,6 +1334,82 @@ func TestCSVLogAppendsWithSingleHeader(t *testing.T) {
 	}
 	if got := readCSV(t, path); fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Errorf("CSV rows:\n got %q\nwant %q", got, want)
+	}
+}
+
+func TestCSVNeutralizesUntrustedText(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stats.csv")
+	rec, err := openCSVLog(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rec.Close()
+	values := []struct{ raw, want string }{
+		{"=1+1", "'=1+1"}, {"+1+1", "'+1+1"}, {"-1+1", "'-1+1"}, {"@SUM(A1)", "'@SUM(A1)"},
+		{" \t=1+1", "' \t=1+1"}, {"\r+1", "'\r+1"}, {"\n+1", "'\n+1"}, {"\ttext", "'\ttext"},
+		{"\u00a0\ufeff=1", "'\u00a0\ufeff=1"}, {"＝1+1", "'＝1+1"}, {"＋1", "'＋1"}, {"－1", "'－1"}, {"＠SUM(A1)", "'＠SUM(A1)"},
+		{"\xff=1", "'\xff=1"}, {" \x00@SUM(A1)", "' \x00@SUM(A1)"},
+		{"", ""}, {"plain", "plain"}, {"qwen, \"8b\"", "qwen, \"8b\""}, {"/v1/=model", "/v1/=model"}, {"'literal", "'literal"},
+		{"  qwen-ä-日本-👩‍💻", "  qwen-ä-日本-👩‍💻"},
+	}
+	for _, tt := range values {
+		info := &requestInfo{method: tt.raw, path: tt.raw}
+		if err := rec.record(time.Now(), info, 200, MetricsData{ModelName: tt.raw}, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows := readCSV(t, path)
+	for i, tt := range values {
+		for _, column := range []int{1, 2, 4} {
+			if got := rows[i+1][column]; got != tt.want {
+				t.Errorf("input %q, column %d: got %q, want %q", tt.raw, column, got, tt.want)
+			}
+		}
+	}
+}
+
+func TestProxyCSVNeutralizesModelAliases(t *testing.T) {
+	for _, field := range []string{"model", "model_instance_id"} {
+		t.Run(field, func(t *testing.T) { checkProxyCSVFormula(t, field) })
+	}
+}
+
+func checkProxyCSVFormula(t *testing.T, field string) {
+	t.Helper()
+	model := " \t=1+1"
+	body, err := json.Marshal(map[string]string{field: model})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(body)
+	}))
+	srv, _ := startProxy(t, target)
+	path := filepath.Join(t.TempDir(), "stats.csv")
+	rec, err := openCSVLog(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { rec.Close() })
+	csvLog = rec
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if got := readAll(t, resp.Body); got != string(body) {
+		t.Fatal("CSV escaping changed the forwarded response")
+	}
+	// QueryCount can advance before the CSV row is flushed.
+	waitFor(t, "CSV formula row", func() bool { return len(readCSV(t, path)) == 2 })
+	if got := readCSV(t, path)[1][4]; got != "'"+model {
+		t.Errorf("model cell = %q, want %q", got, "'"+model)
+	}
+	metrics.mu.RLock()
+	defer metrics.mu.RUnlock()
+	if metrics.ModelName != model {
+		t.Errorf("CSV escaping changed aggregate model to %q", metrics.ModelName)
 	}
 }
 
