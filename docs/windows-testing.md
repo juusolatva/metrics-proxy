@@ -37,6 +37,11 @@ If there is only time for one pass, these steps cover the likely problems
 
 ## 2. CSV file and Excel
 
+- [ ] **Formula protection:** new method/path/model cells that could start a
+  spreadsheet formula have a protective leading apostrophe (possibly visible
+  depending on import settings). Confirm that a model cell such as `'=1+1`
+  remains text. Existing CSV rows are not rewritten; use a new file after
+  upgrading or import old text columns explicitly as text.
 - [ ] **Open `stats.csv` in Excel while the proxy is running:** Excel locks
   the file, so new rows may fail with `[ERROR] writing CSV`. Check whether
   rows are written again after Excel is closed.

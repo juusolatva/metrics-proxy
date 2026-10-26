@@ -2,6 +2,12 @@
 #
 # Read from ./config.yaml by default; use --config <file> to load another file,
 # e.g. one per upstream server.
+#
+# Metrics inspection has fixed limits (not YAML options): 16 MiB per capture,
+# eight result/response wrapper hops and 32 MiB cumulative decoding per JSON
+# body, SSE event or NDJSON line. Over-limit wrappers are ignored for metrics;
+# response forwarding continues unchanged. --csv text cells are protected
+# against formula interpretation with a leading apostrophe when needed.
 
 # Port the proxy server listens on (default: 11436, next to Ollama's 11434 and
 # a second instance's 11435; earlier versions used 8080)

@@ -113,6 +113,14 @@ type MetricsData struct {
 // but not inspected.
 const maxCaptureBytes = 16 << 20
 
+// Wrapper inspection is separately bounded: each RawMessage decode scans and
+// copies its subtree again. Share the work budget across both wrapper branches
+// of a document, and reset it for the next JSON body, SSE event or NDJSON line.
+const (
+	maxWrapperDepth      = 8
+	maxPayloadParseBytes = 2 * maxCaptureBytes
+)
+
 // shutdownTimeout bounds how long a graceful shutdown waits for in-flight
 // requests; below systemd's default 90 s stop timeout.
 const shutdownTimeout = 60 * time.Second
@@ -1093,6 +1101,17 @@ type llmPayload struct {
 // whether it was a JSON object. Other documents are ignored; a field of
 // unexpected type is skipped without discarding the others.
 func (d *MetricsData) mergeJSON(raw []byte) bool {
+	remaining := maxPayloadParseBytes
+	return d.mergeJSONBounded(raw, 0, &remaining)
+}
+
+// mergeJSONBounded keeps already merged fields when deeper inspection reaches
+// a limit. This only limits metrics inspection; response bytes are forwarded.
+func (d *MetricsData) mergeJSONBounded(raw []byte, depth int, remaining *int) bool {
+	if depth > maxWrapperDepth || len(raw) > *remaining {
+		return false
+	}
+	*remaining -= len(raw)
 	var p llmPayload
 	var typeErr *json.UnmarshalTypeError
 	err := json.Unmarshal(raw, &p)
@@ -1101,11 +1120,16 @@ func (d *MetricsData) mergeJSON(raw []byte) bool {
 		return false
 	}
 	d.merge(&p)
+	for _, wrapped := range []json.RawMessage{p.Result, p.Response} {
+		if len(wrapped) > 0 {
+			d.mergeJSONBounded(wrapped, depth+1, remaining)
+		}
+	}
 	return true
 }
 
-// merge applies the metrics in p, including wrapped payloads, to d. Fields
-// p reports override those already in d; fields it lacks are left as is.
+// merge applies the metrics in p to d. Fields p reports override those already
+// in d; fields it lacks are left as is. mergeJSONBounded handles wrappers.
 func (d *MetricsData) merge(p *llmPayload) {
 	if p.Model != "" {
 		d.ModelName = p.Model
@@ -1135,11 +1159,6 @@ func (d *MetricsData) merge(p *llmPayload) {
 	setFirstPositive(&d.CompletionTokens, p.EvalCount)
 	if p.EvalCount > 0 && p.EvalDuration > 0 {
 		d.TokensPerSecond = float64(p.EvalCount) / time.Duration(p.EvalDuration).Seconds()
-	}
-	for _, raw := range []json.RawMessage{p.Result, p.Response} {
-		if len(raw) > 0 {
-			d.mergeJSON(raw)
-		}
 	}
 }
 
@@ -1281,6 +1300,26 @@ func openCSVLog(path string) (*csvRecorder, error) {
 	return r, nil
 }
 
+// csvText keeps upstream/client text from becoming a spreadsheet formula.
+// Inspect past leading whitespace, controls and format characters, but retain
+// the original value after the protective apostrophe. CSV quoting alone only
+// protects field boundaries, not spreadsheet interpretation.
+func csvText(s string) string {
+	first, _ := utf8.DecodeRuneInString(s)
+	if unicode.IsControl(first) || !utf8.ValidString(s) {
+		return "'" + s
+	}
+	trimmed := strings.TrimLeftFunc(s, func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsControl(r) || unicode.In(r, unicode.Cf)
+	})
+	first, _ = utf8.DecodeRuneInString(trimmed)
+	switch first {
+	case '=', '+', '-', '@', '＝', '＋', '－', '＠':
+		return "'" + s
+	}
+	return s
+}
+
 func (r *csvRecorder) record(now time.Time, info *requestInfo, status int, data MetricsData, complete bool) error {
 	optInt := func(n int) string {
 		if n == 0 {
@@ -1296,7 +1335,7 @@ func (r *csvRecorder) record(now time.Time, info *requestInfo, status int, data 
 		ttft = strconv.FormatFloat(data.TimeToFirstToken.Seconds(), 'f', 3, 64)
 	}
 	row := []string{
-		now.Format("2006-01-02T15:04:05.000Z07:00"), info.method, info.path, strconv.Itoa(status), data.ModelName,
+		now.Format("2006-01-02T15:04:05.000Z07:00"), csvText(info.method), csvText(info.path), strconv.Itoa(status), csvText(data.ModelName),
 		optInt(data.PromptTokens), optInt(data.CompletionTokens), optInt(data.TotalTokens),
 		tps, strconv.FormatBool(data.TPSEstimated), ttft,
 		strconv.FormatFloat(data.Duration.Seconds(), 'f', 3, 64), strconv.FormatBool(complete),

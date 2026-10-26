@@ -134,10 +134,16 @@ Values the server didn't report (tokens, TPS, TTFT) are left empty.
 `tps_estimated` is `true` when the TPS was estimated by the proxy (shown as
 `(est.)` in the terminal), and `complete` is `false` for responses that were
 cut off. Only per-query values are saved; the running averages are not.
-Paths and model names are saved as received, without the escaping used in the
-terminal: fields with line breaks are quoted, but other control characters
-are kept. View the file in a spreadsheet or with `cat -v` rather than printing
-it raw to a terminal.
+Method, path and model cells receive a leading apostrophe when they could be
+interpreted as spreadsheet formulas: `=`, `+`, `-`, `@` (including fullwidth
+variants), also behind leading whitespace, controls or Unicode format characters.
+Text starting with a control character, or containing invalid UTF-8, is protected
+too. Other values are unchanged. The apostrophe may be visible in some readers;
+CSV quoting still handles commas, quotes and line breaks separately.
+Existing rows are not rewritten: after upgrading, use a new CSV file or import
+existing text columns explicitly as text. Control characters are otherwise kept,
+so view the file in a spreadsheet or with `cat -v` rather than printing it raw
+to a terminal.
 
 ### Stopping
 
@@ -292,6 +298,12 @@ apart. Request and response bodies are never logged.
 
 ## Limitations
 
+- Metrics inspection follows at most eight `result`/`response` wrapper hops and
+  decodes at most 32 MiB cumulatively per JSON body, SSE event or NDJSON line.
+  The budget is shared across both wrapper branches and includes the outer
+  document. Fields already read are kept; deeper or over-budget wrappers are
+  ignored. Response forwarding is unaffected. The separate 16 MiB capture
+  limit still applies to bodies, lines and assembled events.
 - Streamed OpenAI-compatible responses only include token counts when the
   client sends `"stream_options": {"include_usage": true}`. Without it, the
   query is recorded with model and duration only.
