@@ -6,6 +6,7 @@ metrics_proxy.exe
 *.test.exe
 coverage.out
 
-# Local audit notes, not for the repository.
+# local notes
 audit.md
 report.md
+plan.md
