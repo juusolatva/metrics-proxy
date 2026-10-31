@@ -5,8 +5,3 @@ metrics_proxy.exe
 *.test
 *.test.exe
 coverage.out
-
-# local notes
-audit.md
-report.md
-plan.md
