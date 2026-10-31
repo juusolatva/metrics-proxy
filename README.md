@@ -17,8 +17,8 @@ Supported upstreams:
 - Other OpenAI-compatible HTTP servers
 
 Both regular JSON responses and streamed responses (SSE and NDJSON) are
-supported. Streams are passed through to the client as they arrive and are
-never buffered.
+supported. Streams are passed through to the client as they arrive, while a
+bounded copy is inspected for metrics.
 
 ## Requirements
 
@@ -97,8 +97,9 @@ Each completed query prints a line like this:
 ```
 
 `Avg` is the average query duration over all queries and the average tokens
-per second over the last `history_points` queries. Requests without inference
-data (such as `/v1/models` or errors) are logged as `[Proxy]` lines and not
+per second over the last `history_points` queries, excluding queries without
+a rate from the TPS average. Requests without inference data (such as
+`/v1/models` or errors) are logged as `[Proxy]` lines and not
 counted. If the upstream can't be reached, the client gets
 `502 Bad Gateway` and the proxy logs an `[ERROR]` line.
 
@@ -120,9 +121,10 @@ the proxy estimates it and marks it `(est.)`, e.g. `TPS: 40.98 (est.)`. `TTFT`
 ```
 
 Each recorded query is appended to the file as one row, as soon as it
-finishes. The file is created with a header row if it doesn't exist; existing
-files are appended to, so restarts keep adding to the same file. Requests
-without inference data (such as `/v1/models`) are not written.
+finishes. A header is written when the file is new or empty; existing files
+are appended to, so restarts keep adding to the same file. The header of an
+existing file is not checked; start a new file if the column format changes.
+Requests without inference data (such as `/v1/models`) are not written.
 
 ```csv
 timestamp,method,path,status,model,prompt_tokens,completion_tokens,total_tokens,tokens_per_second,tps_estimated,ttft_seconds,duration_seconds,complete
@@ -130,7 +132,7 @@ timestamp,method,path,status,model,prompt_tokens,completion_tokens,total_tokens,
 2026-10-17T03:28:30.447+03:00,POST,/v1/chat/completions,200,qwen2.5-coder-0.5b-instruct,32,10,42,234.45,true,,0.043,true
 ```
 
-Values the server didn't report (tokens, TPS, TTFT) are left empty.
+Values that are neither reported nor derived (tokens, TPS, TTFT) are left empty.
 `tps_estimated` is `true` when the TPS was estimated by the proxy (shown as
 `(est.)` in the terminal), and `complete` is `false` for responses that were
 cut off. Only per-query values are saved; the running averages are not.
@@ -225,7 +227,6 @@ match `api_endpoints` (such as Ollama's `"/api/*"`), and logged:
   `HttpClient` adds to ordinary requests, is dropped instead, and the request
   is forwarded as plain HTTP/1.1.
 
-Model lists (`/api/tags`, `/api/ps`, `/api/v1/models`, `/v1/models`) and
 Request paths with a `..` segment, such as `/api/blobs/..` (also
 percent-encoded, or with `\` as separator), are answered with
 `400 Bad Request` in every configuration, since the server could resolve them
@@ -297,7 +298,7 @@ numbers. That is useful when a value is missing or looks wrong:
 ```
 [DEBUG] req 2: POST /v1/chat/completions from [::1]:37316 (metered: true)
 [DEBUG] req 2: upstream http://192.0.2.20:1234/v1/chat/completions -> 200 after 0.00s, Content-Type "text/event-stream"
-[DEBUG] req 2: body ended at EOF after 2797 bytes, stream time 0.03s
+[DEBUG] req 2: body ended at EOF, stream time 0.03s after 2797 bytes
 [DEBUG] req 2: parsed as SSE: 10 JSON document(s), 0 invalid, 0 skipped as larger than 16 MiB
 [DEBUG] req 2: stream has no token usage; OpenAI-compatible clients must send "stream_options": {"include_usage": true}
 [03:52:45] #2 POST /v1/chat/completions 200 | Model: qwen2.5-coder-0.5b-instruct | Time: 0.04s | ...
@@ -342,20 +343,25 @@ apart. Request and response bodies are never logged.
 go test -race ./...
 go vet ./...
 gofmt -s -l .
+go mod verify
 go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 run
 go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 ```
 
 The parser tests use real responses captured from LM Studio and Ollama in
 `testdata/`. GitHub Actions (`.github/workflows/ci.yml`) runs these checks on
-pushes to `main`, on pull requests and weekly, with the tests on both the Go
-version from `go.mod` and the latest stable Go, and sends the results and test
-coverage to SonarQube Cloud (not for pull requests from forks or Dependabot,
-which can't use the token). Dependabot (`.github/dependabot.yml`) proposes
-weekly updates to the GitHub Actions and Go modules; the golangci-lint and
-govulncheck versions are bumped by hand.
+pushes to `main`, on pull requests, weekly and on manual runs, with tests on the Go
+version from `go.mod` and the latest stable Go. The stable Go job uploads test
+coverage to SonarQube Cloud on pushes and pull requests from this repository,
+except Dependabot's. Fork and Dependabot pull requests cannot use the token;
+scheduled and manual runs also skip the scan. Dependabot
+(`.github/dependabot.yml`) proposes weekly updates to the GitHub Actions and
+Go modules; the golangci-lint and govulncheck versions are bumped by hand.
 
-See [AGENTS.md](AGENTS.md) for architecture and contribution guidelines.
+Project guidance lives in [AGENTS.md](AGENTS.md), including architecture,
+contribution guidelines and the testing backlog. [CLAUDE.md](CLAUDE.md) includes
+that guide for Claude. The [Windows checklist](docs/windows-testing.md) covers
+the remaining manual platform checks.
 
 ## License
 

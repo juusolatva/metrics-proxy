@@ -17,7 +17,8 @@ If there is only time for one pass, these steps cover the likely problems
 4. Start the proxy with a config path containing spaces and a CSV file:
    `.\metrics_proxy.exe --config "C:\Users\<you>\metrics proxy\ollama.yaml" --csv stats.csv`
 5. Send one streamed request through it.
-6. Press Ctrl+C in PowerShell while the request is still running.
+6. Press Ctrl+C in PowerShell while the request is still running. Check that
+   it finishes and the proxy stops, then restart the proxy for the next step.
 7. Open `stats.csv` in Excel while the proxy is still running.
 
 ## 1. Stopping the proxy
@@ -85,9 +86,9 @@ If there is only time for one pass, these steps cover the likely problems
   Windows. Without one, run the tests without `-race`.
 - [ ] **Line endings:** Git for Windows converts line endings to CRLF on
   checkout by default. `.gitattributes` marks `testdata/**` as `-text`, so
-  the captured responses stay byte-for-byte; check that a fresh clone's
-  `testdata/` files contain no CR characters (`TestCaptureFixtures` and
-  `TestProxyOllamaNativeNDJSON` should pass). `config.yaml` may still get
+  the captured responses stay byte-for-byte; check that a fresh clone leaves
+  `git diff --exit-code -- testdata` clean and that `TestCaptureFixtures` and
+  `TestProxyOllamaNativeNDJSON` pass. `config.yaml` may still get
   CRLF, which the YAML parser accepts.
 - [ ] **Possibly slow or flaky tests:** two tests connect to a port that has
   just been closed. Windows reports these failures slowly, which could hit

@@ -16,6 +16,8 @@ Its primary responsibilities are:
 
 The project currently consists of a single-file implementation (`main.go`) with minimal external dependencies (`go.yaml.in/yaml/v4`).
 
+Keep durable project guidance in this file. `README.md` covers usage and development commands, `config.yaml` documents runtime settings, and `docs/windows-testing.md` holds the Windows checklist. `CLAUDE.md` includes this guide via `@AGENTS.md`.
+
 ---
 
 ## 2. Repository Structure
@@ -29,10 +31,10 @@ metrics_proxy/
 ├── LICENSE            # MIT License
 ├── main.go            # Complete application source (proxy, metrics, config)
 ├── main_test.go       # httptest-based tests (proxying, streaming, parsing, concurrency)
-├── README.md          # Minimal project overview
+├── README.md          # Usage, configuration, limitations and development commands
 ├── CLAUDE.md          # Includes this file (`@AGENTS.md`)
 ├── .gitattributes     # Keeps testdata/ byte-exact (no CRLF conversion)
-├── .gitignore         # Build output, test binaries (go test -c), coverage.out
+├── .gitignore         # Build output, test binaries, coverage.out and local audit/report/plan notes
 ├── .golangci.yml      # golangci-lint v2 config (standard linters; errcheck off in tests)
 ├── sonar-project.properties  # SonarQube Cloud analysis settings (CI-based analysis, coverage)
 ├── .github/
@@ -40,15 +42,14 @@ metrics_proxy/
 │   └── workflows/ci.yml     # CI: fmt, vet, tests + coverage, SonarQube Cloud, golangci-lint, govulncheck
 ├── docs/
 │   └── windows-testing.md   # Checklist for testing on Windows 11
-├── testdata/          # Real response bodies captured from LM Studio (lm_*) and Ollama (ol_*)
-│   ├── lm_v1_chat.json, lm_v1_chat_stream.sse          # LM Studio native /api/v1/chat
-│   ├── lm_oai.json, lm_oai_stream.sse                  # LM Studio /v1/chat/completions (stream with include_usage)
-│   ├── lm_oai_stream_nousage.sse                       #   … streamed without include_usage
-│   ├── ol_chat.json, ol_chat_stream.ndjson             # Ollama native /api/chat
-│   ├── ol_generate.json, ol_generate_stream.ndjson     # Ollama native /api/generate
-│   ├── ol_oai.json, ol_oai_stream.sse                  # Ollama /v1/chat/completions (stream with include_usage)
-│   └── ol_oai_stream_nousage.sse                       #   … streamed without include_usage
-└── .serena/           # Serena project config + memories (committed); cache/ and project.local.yml are gitignored
+└── testdata/          # Real response bodies captured from LM Studio (lm_*) and Ollama (ol_*)
+    ├── lm_v1_chat.json, lm_v1_chat_stream.sse          # LM Studio native /api/v1/chat
+    ├── lm_oai.json, lm_oai_stream.sse                  # LM Studio /v1/chat/completions (stream with include_usage)
+    ├── lm_oai_stream_nousage.sse                       #   … streamed without include_usage
+    ├── ol_chat.json, ol_chat_stream.ndjson             # Ollama native /api/chat
+    ├── ol_generate.json, ol_generate_stream.ndjson     # Ollama native /api/generate
+    ├── ol_oai.json, ol_oai_stream.sse                  # Ollama /v1/chat/completions (stream with include_usage)
+    └── ol_oai_stream_nousage.sse                       #   … streamed without include_usage
 ```
 
 The current captures were taken on 2026-10-17. All of them used the prompt `Count from 1 to 5, separated by spaces.`, sent directly to the server (not through the proxy). Only response bodies were saved.
@@ -81,7 +82,7 @@ The current captures were taken on 2026-10-17. All of them used the prompt `Coun
 ### Testing
 Tests live in `main_test.go`. They start a fake upstream and the proxy with `httptest`, and reset the global state (`cfg`, `metrics`, `proxy`, `out`, `csvLog`) per test via `startProxy()`. Graceful-shutdown tests run the proxy through `serve()` with their own contexts via `startServe()`. Metrics are recorded on the proxy's goroutine, so tests wait for them with `waitFor`/`waitForQueries` instead of asserting immediately.
 
-Parser tests should use the captured payloads in `testdata/` (read with `readFixture()`) rather than hand-written JSON where possible. `TestCaptureFixtures` feeds every capture whole and in 1-byte chunks, to exercise chunk boundaries, and checks the model, tokens, TPS, TTFT and that no document was invalid. `TestProxyOllamaNativeNDJSON` sends a capture end to end through the proxy. When adding support for a new upstream or endpoint, capture a real response (JSON and streamed) with a `<upstream>_<api>[_stream][_variant].<ext>` name, using `curl -sN -o testdata/<file>` directly against the server, and add it to `TestCaptureFixtures`. Captures are committed; check them for anything private before adding them.
+Parser tests should use the captured payloads in `testdata/` (read with `readFixture()`) rather than hand-written JSON where possible. `TestCaptureFixtures` feeds every capture whole and in 1-byte chunks, to exercise chunk boundaries, and checks the model, tokens, TPS, TTFT and that no document was invalid. `TestProxyOllamaNativeNDJSON` sends a capture end to end through the proxy. When adding support for a new upstream or endpoint, capture a real response (JSON and streamed) with a `<upstream>_<api>[_stream][_variant].<ext>` name, using `curl -sN -o testdata/<file>` directly against the server, and add it to `TestCaptureFixtures`. Before sending capture requests to a real server, show the user the server, model, request body and what will be saved, and wait for approval. Captures are committed; check them for anything private before adding them.
 
 Testing on Windows: see `docs/windows-testing.md`.
 - **Run tests**:
@@ -129,8 +130,8 @@ Planned on 2026-10-26, not yet done. Remove an item from this list once it is do
   ```bash
   go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
   ```
-- **CI** (`.github/workflows/ci.yml`, on pushes to `main`, on pull requests, weekly on Mondays and manually via `workflow_dispatch`): `gofmt -s -l`, `go mod verify`, `go vet` and `go test -race` with coverage on the Go version from `go.mod` and on `stable`; the `stable` run uploads `coverage.out` to SonarQube Cloud on pushes and on pull requests from this repository, except Dependabot's (forks and Dependabot get no `SONAR_TOKEN`; scheduled runs have no new code). golangci-lint and govulncheck run on `stable`. Jobs have `timeout-minutes`, and checkouts use `persist-credentials: false`. Actions are pinned by commit SHA with a version comment.
-- **Dependabot** (`.github/dependabot.yml`): weekly PRs for GitHub Actions (grouped) and Go modules, skipping releases younger than 7 days (`cooldown`). It doesn't update the golangci-lint and govulncheck versions in `ci.yml`; bump those by hand, together with the commands in this file, README.md and `.serena/memories/`.
+- **CI** (`.github/workflows/ci.yml`, on pushes to `main`, on pull requests, weekly on Mondays and manually via `workflow_dispatch`): `gofmt -s -l`, `go mod verify`, `go vet` and `go test -race` with coverage on the Go version from `go.mod` and on `stable`; the `stable` run uploads `coverage.out` to SonarQube Cloud on pushes and on pull requests from this repository, except Dependabot's (forks and Dependabot get no `SONAR_TOKEN`; scheduled and manual runs skip the scan). golangci-lint and govulncheck run on `stable`. Jobs have `timeout-minutes`, and checkouts use `persist-credentials: false`. Actions are pinned by commit SHA with a version comment.
+- **Dependabot** (`.github/dependabot.yml`): weekly PRs for GitHub Actions (grouped) and Go modules, skipping releases younger than 7 days (`cooldown`). It doesn't update the golangci-lint and govulncheck versions in `ci.yml`; bump those by hand, together with the commands in this file and `README.md`.
 - **CodeQL** runs as GitHub's default setup (a repository setting, not a workflow file).
 
 ### Dependencies
@@ -243,7 +244,7 @@ All application logic is currently contained in `main.go`:
    - `serve()` wraps the handler with an in-flight request counter and runs `server.Serve` until `stop` is done.
    - It then calls `server.Shutdown`, which closes the listener and waits for in-flight requests, streamed generations included, to finish normally and be recorded. The wait is bounded by `shutdownTimeout` (60 s, below systemd's default 90 s stop timeout) and aborted early by `force`.
    - On timeout or force it calls `server.Close()`. That cancels the upstream requests, so their bodies end without EOF and are logged as `incomplete`. It waits up to 2 s for those handlers to record, then prints `Proxy stopped` and returns `nil` (exit status 0).
-   - Upgraded (`101`, hijacked) connections are not tracked by `Shutdown` and are dropped.
+   - Upgraded (`101`, hijacked) connections are not closed or awaited by `Shutdown` or `Close`; process exit drops them.
 8. **Debug Logging (`debugf`, `logging.debug`)**:
    - `debugf()` prints `[DEBUG] …` lines to `out` only when `cfg.Logging.Debug` is set. Each forwarded request gets an ID from `requestSeq` (`requestInfo.id`), and its lines start with `req N:`.
    - Startup: the effective config after defaults, and each `detectBackend()` probe's result (status, non-JSON body, missing or found key, connection error).
@@ -274,7 +275,7 @@ All application logic is currently contained in `main.go`:
    - `--csv` does not check an existing file's header. Appending to a CSV with different columns (e.g. from a future version) mixes formats. Existing rows are not rewritten with formula protection: after upgrading, use a new file or import existing text columns explicitly as text. The protective apostrophe on new rows may be visible in some readers.
 7. **Go version**:
    - `go.mod` declares Go 1.26 (raised from 1.21 on 2026-10-26; Go supports the two newest releases, 1.27 and 1.26 at that time). Avoid standard library APIs and language features newer than 1.26 unless the `go` directive is bumped. CI's "Test (Go from go.mod)" job tests the oldest version the directive allows, and the directive also selects language semantics (e.g. per-iteration loop variables since 1.22).
-   - When bumping, choose the oldest supported release, not the newest, and only when a feature is wanted, not every release. Steps: `go mod edit -go=1.N`, `go fix ./...` (review its rewrites), then update §1, §2 and this item, README.md's requirements and `.serena/memories/tech_stack.md`. CI needs no change, since its jobs read the version from `go.mod`.
+   - When bumping, choose the oldest supported release, not the newest, and only when a feature is wanted, not every release. Steps: `go mod edit -go=1.N`, `go fix ./...` (review its rewrites), then update §1, §2, this item and `README.md`'s requirements. CI needs no change, since its jobs read the version from `go.mod`.
 8. **Single upstream, no auth/TLS options**:
    - The upstream is always `http://host:port`; there is no HTTPS upstream, API key injection, or per-endpoint routing.
    - Clients aren't authenticated, and the proxy listens on all interfaces (the user's LLM clients run on other LAN machines). Anyone who can reach `proxy_port` can query the upstream with the proxy's localhost identity. Only `managementEndpoints` and protocol upgrades are held back (`forward_management`). Queries can still load and unload models (a chat request loads its model; Ollama's `keep_alive: 0` unloads it), and the list must be extended by hand when an upstream adds management endpoints.
@@ -288,8 +289,10 @@ All application logic is currently contained in `main.go`:
 ## 7. Guidelines for Modifying Code
 
 - **Standard Library First**: Prefer Go standard library packages (`net/http`, `net/http/httputil`, `sync`, `time`, `encoding/json`) over introducing new dependencies.
+- **Code Layout**: Splitting `main.go` into more files within `package main` is fine; keep a single Go module.
 - **Maintain Concurrency Safety**: Ensure `metrics.mu` write locks are held when updating state and read locks when reading state. Avoid holding locks across network I/O.
 - **Configuration Compatibility**: New options must be optional with sane defaults, so existing files keep working. Config parsing is strict: removing or renaming a key makes files that still use it fail with an "unknown field" error. The project has a single user so far, so renames and removals don't need aliases or deprecation periods (as with `metrics.mode` and `lm_studio` → `server`); note them in README.md and `config.yaml` comments.
+- **CSV Compatibility**: Existing files are appended to without checking their header. Add new columns at the end and document format changes so users can start a new file.
 - **Untrusted Text in Output**: Paths, request URIs, URLs, model names and upstream error messages come from clients or the upstream. Pass them through `escapeControls()` before printing them to `out` (status, `[Proxy]`, `[ERROR]` and `[DEBUG]` lines): it writes control characters (C0, DEL, C1), invalid UTF-8, U+2028/U+2029 and the bidi controls (`unicode.Bidi_Control`) as Go escapes (`\x1b`, `\n`, `\u202e`, `\xff`) and keeps all other text byte-identical, so other format characters such as emoji joiners survive. Clean text is returned without copying. `debugf()` evaluates its arguments even when debug output is off, so wrap a call whose arguments escape client text in `if cfg.Logging.Debug { … }` (as in `handleRequest` and `meterResponse`). `%q` (used for Content-Type) is safe too. CSV uses `csvText` at the export sink to prevent formula interpretation; it preserves the original value after any protective apostrophe. Keep this separate from terminal escaping and from `encoding/csv` field quoting. Forwarded responses and in-memory metrics retain their original text.
 - **Testing**: Whenever fixing bugs or adding features, write corresponding unit tests using `net/http/httptest` to verify proxying, metrics parsing, and concurrent safety.
 - **SonarCloud**: Analyzed by the CI workflow (project `juusolatva_metrics_proxy`, public; settings in `sonar-project.properties`, token in the `SONAR_TOKEN` repository secret). Automatic Analysis must stay disabled in SonarQube Cloud, or the CI scan fails. Pull requests from forks and Dependabot skip the scan (no token). Rules hit so far:
@@ -299,4 +302,4 @@ All application logic is currently contained in `main.go`:
 - **golangci-lint**: Must report `0 issues` (CI fails otherwise; config in `.golangci.yml`). `errcheck` is on for non-test code, apart from the `std-error-handling` preset (unchecked `Close`, `fmt.Fprint*` etc.). Where an error is deliberately ignored, discard it explicitly with a reason, e.g. `_ = r.w.Write(row) // write errors are sticky; returned by r.w.Error()`, rather than adding `//nolint`. Exception: a discarded receive from a `chan error` (`<-errc` in `serve()`) is flagged by errcheck, and `_ = <-errc` by staticcheck S1005, so it keeps `//nolint:errcheck` with a reason.
 - **Git Hygiene**: Commits are allowed; opening a pull request from a branch is preferred over committing directly to `main`. Do not commit build artifacts (`metrics_proxy`, `.exe`) or temporary files.
 - **Merges**: Before committing a merge, run `git diff --check` and `go build ./... && go test -race ./...`; conflict markers have been committed to `main` before (merge `6a83ff7`, fixed afterwards).
-- **Keep docs in sync**: Behavior, config or limitation changes must update this file, `README.md`, `config.yaml` comments, and the affected `.serena/memories/` (committed, reviewed like code).
+- **Keep docs in sync**: Update this file and the affected sections of `README.md`, `config.yaml` comments and `docs/windows-testing.md` when behavior, configuration, workflows or limitations change. Keep tool versions aligned with `.github/workflows/ci.yml` and the Go requirement aligned with `go.mod`.
