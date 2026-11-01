@@ -16,7 +16,7 @@ Its primary responsibilities are:
 
 The project currently consists of a single-file implementation (`main.go`) with minimal external dependencies (`go.yaml.in/yaml/v4`).
 
-Keep durable project guidance in this file. `README.md` covers usage and development commands, `config.yaml` documents runtime settings, and `docs/windows-testing.md` holds the Windows checklist. `CLAUDE.md` includes this guide via `@AGENTS.md`.
+Keep durable project guidance in this file. `README.md` covers usage and development commands, [GLOSSARY.md](GLOSSARY.md) defines domain terminology, `config.yaml` documents runtime settings, and `docs/windows-testing.md` holds the Windows checklist. `CLAUDE.md` includes this guide via `@AGENTS.md`.
 
 ---
 
@@ -25,6 +25,7 @@ Keep durable project guidance in this file. `README.md` covers usage and develop
 ```
 metrics_proxy/
 ├── AGENTS.md          # Agent and developer guidelines (this file)
+├── GLOSSARY.md        # Domain terms for requests, query measurements and aggregates
 ├── config.yaml        # Runtime YAML configuration file
 ├── go.mod             # Go module definition (metrics_proxy, Go 1.26)
 ├── go.sum             # Checksums for external dependencies
