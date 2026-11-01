@@ -91,7 +91,7 @@ type MetricsHistoryPoint struct {
 // recording a query, so it can be displayed without holding metrics.mu.
 type metricsSnapshot struct {
 	QueryCount      int
-	TotalTokens     int
+	TotalTokens     int // cumulative over all queries
 	AvgTimePerQuery time.Duration
 	AvgTokensPerSec float64 // over History, ignoring queries without a rate
 }
