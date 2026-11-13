@@ -299,7 +299,7 @@ func decodeConfig(data []byte) (Config, error) {
 	var next yaml.Node
 	if err := l.Load(&next); !errors.Is(err, io.EOF) {
 		if err != nil {
-			return c, err // e.g. text after a "..." document end marker
+			return c, err // a syntax error in the second document
 		}
 		return c, fmt.Errorf("line %d: a second YAML document starts here; a config file holds one", next.Line)
 	}
