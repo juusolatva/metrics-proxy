@@ -237,8 +237,8 @@ func TestParseConfigYAMLRules(t *testing.T) {
 		{"proxy_port: 1\nproxy_port: 2\n", `line 2: mapping key "proxy_port" already defined at line 1`},
 		{"server:\n  port: 1\n  port: 2\n", `line 3: mapping key "port" already defined at line 2`},
 		{"proxy_port: 11436\n---\nserver:\n  port: 11434\n", "line 2: a second YAML document starts here"},
-		{"proxy_port: 11436\n...\nserver: {}\n", "L3.C1"}, // content after the document end marker
-		{"server:\n\thost: x\n", "L2.C1"},                 // tab indentation: syntax errors give L<line>.C<column>
+		{"proxy_port: 11436\n...\nserver: {}\n", "line 3: a second YAML document starts here"}, // content after the end marker (a syntax error before rc.7)
+		{"server:\n\thost: x\n", "L2.C1"}, // tab indentation: syntax errors give L<line>.C<column>
 		{"proxy_port: x\nlogging:\n  debug: maybe\n", "line 1: cannot construct !!str `x` into int; line 3:"},
 	} {
 		if _, err := parseConfig([]byte(tt.data)); err == nil || !strings.Contains(err.Error(), tt.want) {
