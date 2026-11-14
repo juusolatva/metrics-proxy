@@ -359,9 +359,8 @@ scheduled and manual runs also skip the scan. Dependabot
 Go modules; the golangci-lint and govulncheck versions are bumped by hand.
 
 Project guidance lives in [AGENTS.md](AGENTS.md), including architecture,
-contribution guidelines and the testing backlog. [GLOSSARY.md](GLOSSARY.md)
-defines the terms used for requests, query measurements and aggregates.
-[CLAUDE.md](CLAUDE.md) includes the project guide for Claude. The
+contribution guidelines and the testing backlog. [CLAUDE.md](CLAUDE.md)
+includes the project guide for Claude. The
 [Windows checklist](docs/windows-testing.md) covers the remaining manual
 platform checks.
 
