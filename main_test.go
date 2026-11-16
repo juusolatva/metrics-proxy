@@ -216,8 +216,8 @@ func TestParseConfigRejectsUnknownKeys(t *testing.T) {
 }
 
 // TestParseConfigYAMLRules pins the YAML behavior parseConfig relies on from
-// the pre-release go.yaml.in/yaml/v4, so that a dependency bump changing it
-// fails here instead of changing how config files load.
+// go.yaml.in/yaml/v4, error wording included, so that a dependency bump
+// changing it fails here instead of changing how config files load.
 func TestParseConfigYAMLRules(t *testing.T) {
 	// YAML 1.1 booleans; explicit document start and end markers.
 	for data, want := range map[string]bool{
