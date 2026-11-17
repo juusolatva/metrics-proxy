@@ -152,7 +152,9 @@ to a terminal.
 Press Ctrl+C (or send `SIGTERM`). The proxy stops accepting connections and
 waits up to 60 seconds for in-flight requests, including streamed
 generations, to finish and be recorded. Press Ctrl+C again to stop at once.
-Requests cut off this way are logged as `incomplete`.
+Requests cut off this way are logged as `incomplete`. Open WebSocket
+connections (with `forward_management: true`) are not waited for; they end
+when the proxy exits.
 
 ## Configuration
 
@@ -249,6 +251,11 @@ includes the removed `metrics.mode` and `metrics.refresh_interval_ms`
 settings, so delete them from older config files. Older files also need
 `lm_studio:` renamed to `server:`.
 
+Values that can't work are rejected too: ports outside 1–65535, a
+`server.host` with a scheme or port (`http://localhost`, `localhost:1234`:
+give the bare name and put the port in `server.port`), and `api_endpoints`
+entries that don't start with `/` (use `"/*"` to meter every path).
+
 Duplicate keys are an error too. A config file holds a single YAML
 document: settings after a `---` separator, which earlier versions silently
 ignored, now fail with `line 2: a second YAML document starts here`. Wrong
@@ -323,7 +330,10 @@ apart. Request and response bodies are never logged.
   completion tokens and generation time and marked `(est.)`. For non-streamed
   responses this includes prompt processing and request overhead, so the
   value is understated, badly so for short replies; for streams the time
-  between the first and last chunk is used, which is closer. LM Studio's
+  between the first and last chunk is used, which is closer, unless the
+  stream arrived all at once (short, or buffered on the way) or faster than
+  about 1000 tokens/s: then the request duration is used as for a
+  non-streamed response. LM Studio's
   OpenAI-compatible API (`/v1/...`) never reports TPS, streamed or not.
 - Time to first token is only reported by LM Studio's native API
   (`/api/v1/...`). Ollama (native and OpenAI-compatible) and LM Studio's
