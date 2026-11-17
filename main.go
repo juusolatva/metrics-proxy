@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/csv"
@@ -176,7 +177,14 @@ func main() {
 	defer forceNow()
 	setupSignalHandling(stopNow, forceNow)
 
-	// Start proxy server
+	// Bind the port before announcing it or probing the upstream, so a port
+	// in use fails at once. Connections arriving during the probe wait in the
+	// listen backlog until serve() accepts them.
+	ln, err := listen()
+	if err != nil {
+		fmt.Printf("Error starting proxy: %v\n", err)
+		os.Exit(1)
+	}
 	fmt.Printf("Proxy listening on port %d\n", cfg.ProxyPort)
 	if backend := detectBackend(target); backend != "" {
 		fmt.Printf("Forwarding to %s at %s\n", backend, target.Host)
@@ -184,7 +192,7 @@ func main() {
 		fmt.Printf("Forwarding to upstream at %s (server type not detected)\n", target.Host)
 	}
 
-	if err := runProxy(stop, force); err != nil {
+	if err := runProxy(stop, force, ln); err != nil {
 		fmt.Printf("Error running proxy: %v\n", err)
 		os.Exit(1)
 	}
@@ -279,7 +287,50 @@ func parseConfig(data []byte) (Config, error) {
 	if c.Metrics.HistoryPoints <= 0 {
 		c.Metrics.HistoryPoints = 10
 	}
-	return c, nil
+	return c, c.validate()
+}
+
+// validate rejects settings the defaults don't replace and that can't work.
+func (c Config) validate() error {
+	for _, p := range []struct {
+		key  string
+		port int
+	}{{"proxy_port", c.ProxyPort}, {"server.port", c.Server.Port}} {
+		if p.port < 1 || p.port > 65535 {
+			return fmt.Errorf("%s: %d is not a port number (1-65535)", p.key, p.port)
+		}
+	}
+	if err := checkServerHost(c.Server.Host); err != nil {
+		return err
+	}
+	for _, e := range c.APIEndpoints {
+		if !strings.HasPrefix(e, "/") {
+			return fmt.Errorf(`api_endpoints: %q is not a path; patterns start with "/" ("/*" meters every path)`, e)
+		}
+	}
+	return nil
+}
+
+// checkServerHost checks that h is a bare host name or IP address, as
+// upstreamURL expects: net.JoinHostPort would turn "http://localhost" into
+// "[http://localhost]:1234".
+func checkServerHost(h string) error {
+	if strings.Contains(h, "://") {
+		return fmt.Errorf("server.host: %q: give the host name or IP address without a scheme (the upstream is always http)", h)
+	}
+	if _, _, err := net.SplitHostPort(h); err == nil {
+		return fmt.Errorf("server.host: %q: give the port in server.port, not in the host", h)
+	}
+	if strings.ContainsAny(h, "[]") {
+		return fmt.Errorf("server.host: %q: write IPv6 addresses without brackets", h)
+	}
+	notInHost := func(r rune) bool {
+		return strings.ContainsRune("/?#@", r) || unicode.IsSpace(r) || unicode.IsControl(r)
+	}
+	if strings.ContainsFunc(h, notInHost) {
+		return fmt.Errorf("server.host: %q is not a host name or IP address", h)
+	}
+	return nil
 }
 
 // decodeConfig decodes the YAML document in data; an empty file gives the zero
@@ -319,7 +370,11 @@ func upstreamURL() *url.URL {
 // unknown endpoints with 200 and an error body. It returns "" if the upstream
 // is unreachable or not recognized.
 func detectBackend(target *url.URL) string {
-	client := &http.Client{Timeout: 2 * time.Second}
+	client := &http.Client{
+		Timeout: 2 * time.Second,
+		// Probe the configured server only; a redirect shows as its 3xx status.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 	get := func(path string) (map[string]json.RawMessage, error) {
 		resp, err := client.Get(target.JoinPath(path).String())
 		if err != nil {
@@ -332,7 +387,7 @@ func detectBackend(target *url.URL) string {
 			return nil, nil
 		}
 		if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&body); err != nil {
-			debugf("backend probe %s: body is not a JSON object: %v", path, err)
+			debugf("backend probe %s: body is not a JSON object: %s", path, escapeControls(err.Error()))
 			return nil, nil
 		}
 		return body, nil
@@ -346,7 +401,7 @@ func detectBackend(target *url.URL) string {
 	for _, p := range probes {
 		body, err := get(p.path)
 		if err != nil {
-			debugf("backend probe %s: %v", p.path, err)
+			debugf("backend probe %s: %s", p.path, escapeControls(err.Error()))
 			return "" // unreachable; don't wait for the other probes
 		}
 		if _, ok := body[p.key]; ok {
@@ -360,9 +415,6 @@ func detectBackend(target *url.URL) string {
 	return ""
 }
 
-// setupSignalHandling returns a context that is done on the first SIGINT or
-// SIGTERM (start a graceful shutdown) and one that is done on the second
-// (abort it).
 // setupSignalHandling calls onFirst on the first SIGINT or SIGTERM (start a
 // graceful shutdown) and onSecond on the second (abort it).
 func setupSignalHandling(onFirst, onSecond func()) {
@@ -377,7 +429,14 @@ func setupSignalHandling(onFirst, onSecond func()) {
 	}()
 }
 
-func runProxy(stop, force context.Context) error {
+// listen opens the proxy's listening socket on cfg.ProxyPort, on all
+// interfaces.
+func listen() (net.Listener, error) {
+	return net.Listen("tcp", fmt.Sprintf(":%d", cfg.ProxyPort))
+}
+
+// runProxy serves the proxy on ln until stop is done (see serve).
+func runProxy(stop, force context.Context, ln net.Listener) error {
 	server := &http.Server{
 		Handler: http.HandlerFunc(handleRequest),
 		// No ReadTimeout/WriteTimeout: generations can take minutes, and an
@@ -385,11 +444,6 @@ func runProxy(stop, force context.Context) error {
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.ProxyPort))
-	if err != nil {
-		return err
-	}
-
 	fmt.Println("Press Ctrl+C to stop")
 	return serve(stop, force, server, ln, shutdownTimeout)
 }
@@ -404,8 +458,9 @@ func serve(stop, force context.Context, server *http.Server, ln net.Listener, ti
 	next := server.Handler
 	server.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		inFlight.Add(1)
-		defer inFlight.Add(-1)
-		next.ServeHTTP(w, r)
+		done := sync.OnceFunc(func() { inFlight.Add(-1) })
+		defer done()
+		next.ServeHTTP(&hijackNotifier{ResponseWriter: w, onHijack: done}, r)
 	})
 
 	errc := make(chan error, 1)
@@ -441,11 +496,44 @@ func serve(stop, force context.Context, server *http.Server, ln net.Listener, ti
 	return nil
 }
 
+// hijackNotifier calls onHijack once the connection has been taken over for
+// a protocol upgrade (forward_management: true). http.Server.Shutdown neither
+// waits for nor closes hijacked connections, so serve stops counting such a
+// request as in flight then. ReverseProxy hijacks and flushes through
+// http.ResponseController, which finds the other methods via Unwrap.
+type hijackNotifier struct {
+	http.ResponseWriter
+	onHijack func()
+}
+
+func (w *hijackNotifier) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func (w *hijackNotifier) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	conn, brw, err := http.NewResponseController(w.ResponseWriter).Hijack()
+	if err == nil {
+		w.onHijack()
+	}
+	return conn, brw, err
+}
+
+// cleanPath reads backslashes as slashes (as WHATWG URL parsers do) and
+// cleans the (decoded) request path p, so repeated slashes and "." segments,
+// which upstream routers may accept, don't change how it is classified.
+func cleanPath(p string) string {
+	return path.Clean("/" + strings.ReplaceAll(p, `\`, "/"))
+}
+
 // isAPIEndpoint checks if the request path matches an API endpoint pattern.
-// A trailing "*" in a pattern is ignored; patterns match as path prefixes.
-func isAPIEndpoint(path string) bool {
+// A trailing "*" in a pattern is ignored; patterns match as path prefixes of
+// the cleaned path (cleanPath), keeping a trailing slash, so "//v1/chat" and
+// "/./v1/chat" are metered like "/v1/chat".
+func isAPIEndpoint(raw string) bool {
+	p := cleanPath(raw)
+	if p != "/" && (strings.HasSuffix(raw, "/") || strings.HasSuffix(raw, `\`)) {
+		p += "/"
+	}
 	for _, pattern := range cfg.APIEndpoints {
-		if strings.HasPrefix(path, strings.TrimSuffix(pattern, "*")) {
+		if strings.HasPrefix(p, strings.TrimSuffix(pattern, "*")) {
 			return true
 		}
 	}
@@ -467,13 +555,13 @@ var managementEndpoints = []string{
 }
 
 // isManagementEndpoint reports whether the (decoded) request path is one of
-// managementEndpoints or below one. Backslashes are read as slashes (as
-// WHATWG URL parsers do), and the path is cleaned and lowercased first, so
-// repeated or trailing slashes and case variants that an upstream router may
-// accept match too. Paths with ".." segments are refused before this check
+// managementEndpoints or below one. The path is cleaned (cleanPath, which
+// also reads backslashes as slashes) and lowercased first, so repeated or
+// trailing slashes and case variants that an upstream router may accept
+// match too. Paths with ".." segments are refused before this check
 // (hasDotDotSegment), since cleaning them can remove the endpoint's prefix.
 func isManagementEndpoint(p string) bool {
-	p = path.Clean("/" + strings.ToLower(strings.ReplaceAll(p, `\`, "/")))
+	p = strings.ToLower(cleanPath(p))
 	for _, e := range managementEndpoints {
 		if p == e || strings.HasPrefix(p, e+"/") {
 			return true
@@ -772,8 +860,9 @@ type meteredBody struct {
 	io.ReadCloser
 	info      *requestInfo
 	status    int
-	capture   capture // nil when the body is not inspected
-	firstByte time.Time
+	capture   capture   // nil when the body is not inspected
+	firstByte time.Time // when the first body bytes were read
+	lastByte  time.Time // when the last body bytes were read
 	bytes     int64
 	eof       bool
 	once      sync.Once
@@ -783,8 +872,9 @@ func (b *meteredBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	if n > 0 {
 		b.bytes += int64(n)
+		b.lastByte = time.Now()
 		if b.firstByte.IsZero() {
-			b.firstByte = time.Now()
+			b.firstByte = b.lastByte
 		}
 		if b.capture != nil {
 			_, _ = b.capture.Write(p[:n]) // captures never fail; parse problems show in diag()
@@ -816,9 +906,10 @@ func (b *meteredBody) finish() {
 		}
 		switch b.capture.(type) {
 		case *sseCapture, *ndjsonCapture:
-			if !b.firstByte.IsZero() {
-				streamTime = end.Sub(b.firstByte)
-			}
+			// 0 if the whole body arrived in one read (a short or buffered
+			// stream): the time between reads would then measure only the
+			// proxy, so completeDerived falls back to the request duration.
+			streamTime = b.lastByte.Sub(b.firstByte)
 		}
 		data.Duration = end.Sub(b.info.start)
 		basis := data.completeDerived(streamTime)
@@ -853,9 +944,20 @@ func (b *meteredBody) debugSummary(data MetricsData, streamTime time.Duration, b
 	}
 	if !data.hasInference() {
 		debugf("req %d: no model, token or rate fields found; not counted as a query", id)
-	} else if d.name == "SSE" && data.TotalTokens == 0 {
-		debugf(`req %d: stream has no token usage; OpenAI-compatible clients must send "stream_options": {"include_usage": true}`, id)
+	} else if d.name == "SSE" && data.TotalTokens == 0 && b.eof {
+		// Not before EOF: usage comes in the last events, which may not have arrived.
+		debugf("req %d: stream has no token usage%s", id, usageHint(b.info.path))
 	}
+}
+
+// usageHint explains a missing token usage in a complete SSE stream from
+// path. OpenAI-style completions endpoints only send usage on request; other
+// APIs (LM Studio native, Responses) always do, so for them nothing is added.
+func usageHint(p string) string {
+	if strings.HasSuffix(cleanPath(p), "/completions") {
+		return `; OpenAI-compatible clients must send "stream_options": {"include_usage": true}`
+	}
+	return ""
 }
 
 // recordQuery updates the global metrics and prints a status line. Responses
@@ -1008,9 +1110,9 @@ type sseCapture struct {
 	lines   lineSplitter
 	data    []byte // data field of the event being assembled
 	skip    bool   // part of the event exceeded maxCaptureBytes; drop the rest of it
-	dropped int    // lines.oversized when the last line was processed
+	dropped int    // lines.oversized at the last noteDropped
 	metrics MetricsData
-	d       captureDiag
+	d       captureDiag // oversized counts skipped events, once per event
 }
 
 func (c *sseCapture) Write(p []byte) (int, error) {
@@ -1019,10 +1121,7 @@ func (c *sseCapture) Write(p []byte) (int, error) {
 }
 
 func (c *sseCapture) processLine(line []byte) {
-	if c.lines.oversized != c.dropped {
-		// The splitter dropped an oversized line of this event since the last call.
-		c.dropped, c.skip = c.lines.oversized, true
-	}
+	c.noteDropped()
 	switch {
 	case len(line) == 0:
 		c.dispatch()
@@ -1031,8 +1130,7 @@ func (c *sseCapture) processLine(line []byte) {
 	case bytes.HasPrefix(line, []byte("data:")):
 		value := bytes.TrimPrefix(line[len("data:"):], []byte(" "))
 		if len(c.data)+len(value) > maxCaptureBytes {
-			c.data, c.skip = c.data[:0], true
-			c.d.oversized++
+			c.skipEvent()
 			return
 		}
 		if len(c.data) > 0 {
@@ -1044,6 +1142,27 @@ func (c *sseCapture) processLine(line []byte) {
 	// payloads are recognized by their content.
 }
 
+// noteDropped skips the event being assembled if the splitter has dropped an
+// oversized line since the last call. The splitter doesn't emit dropped
+// lines, so this runs before each emitted line and before the final dispatch
+// in finish, where the dropped line may have been the last one.
+func (c *sseCapture) noteDropped() {
+	if c.lines.oversized != c.dropped {
+		c.dropped = c.lines.oversized
+		c.skipEvent()
+	}
+}
+
+// skipEvent drops the event being assembled up to its closing blank line, so
+// its remaining data lines aren't parsed as a fragment. An event counts as
+// oversized once, however many of its lines exceeded the limit.
+func (c *sseCapture) skipEvent() {
+	if !c.skip {
+		c.d.oversized++
+	}
+	c.data, c.skip = c.data[:0], true
+}
+
 func (c *sseCapture) dispatch() {
 	if !c.skip && len(c.data) > 0 && !bytes.Equal(c.data, []byte("[DONE]")) {
 		c.d.count(c.metrics.mergeJSON(c.data))
@@ -1053,6 +1172,7 @@ func (c *sseCapture) dispatch() {
 
 func (c *sseCapture) finish() MetricsData {
 	c.lines.flush(c.processLine)
+	c.noteDropped()
 	c.dispatch()
 	return c.metrics
 }
@@ -1060,7 +1180,6 @@ func (c *sseCapture) finish() MetricsData {
 func (c *sseCapture) diag() captureDiag {
 	d := c.d
 	d.name = "SSE"
-	d.oversized += c.lines.oversized
 	return d
 }
 
@@ -1402,7 +1521,7 @@ func formatMetricsLine(now time.Time, info *requestInfo, status int, data Metric
 		now.Format("15:04:05"), snap.QueryCount, info.method, escapeControls(info.path), status)
 
 	if data.ModelName != "" {
-		fmt.Fprintf(&b, " | Model: %s", escapeControls(truncateString(data.ModelName, 30)))
+		fmt.Fprintf(&b, " | Model: %s", escapeTruncated(data.ModelName, 30))
 	}
 	if data.PromptTokens > 0 || data.CompletionTokens > 0 {
 		fmt.Fprintf(&b, " | Tokens: %d in / %d out", data.PromptTokens, data.CompletionTokens)
@@ -1432,11 +1551,29 @@ func formatMetricsLine(now time.Time, info *requestInfo, status int, data Metric
 	return b.String()
 }
 
-// truncateString truncates a string to max length in runes
-func truncateString(s string, maxLen int) string {
-	r := []rune(s)
-	if len(r) <= maxLen {
-		return s
+// escapeTruncated escapes s as escapeControls does and shortens the result
+// to at most maxLen runes, ending in "..." if it was cut. It cuts between the
+// runes (or invalid bytes) of s, so escapes are kept whole and count with
+// their full length, and invalid bytes are escaped rather than replaced by
+// U+FFFD.
+func escapeTruncated(s string, maxLen int) string {
+	e := escapeControls(s)
+	if utf8.RuneCountInString(e) <= maxLen {
+		return e
 	}
-	return string(r[:maxLen-3]) + "..."
+	b := make([]byte, 0, maxLen)
+	width := 0
+	for i := 0; i < len(s); {
+		n, escape := escapeAt(s, i)
+		unit := []byte(s[i : i+n])
+		if escape {
+			unit = appendGoEscape(nil, s[i:i+n])
+		}
+		if width += utf8.RuneCount(unit); width > maxLen-3 {
+			break
+		}
+		b = append(b, unit...)
+		i += n
+	}
+	return string(append(b, "..."...))
 }

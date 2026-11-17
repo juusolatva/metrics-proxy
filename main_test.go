@@ -102,6 +102,14 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	}
 }
 
+// waitForLog waits until the proxy output contains want. Use it rather than
+// waitForQueries before checking status lines: the query count advances
+// before the status line is printed and the CSV row written.
+func waitForLog(t *testing.T, logs *syncBuffer, want string) {
+	t.Helper()
+	waitFor(t, fmt.Sprintf("output %q", want), func() bool { return strings.Contains(logs.String(), want) })
+}
+
 func waitForQueries(t *testing.T, n int) {
 	t.Helper()
 	waitFor(t, fmt.Sprintf("%d recorded queries", n), func() bool {
@@ -139,6 +147,13 @@ func TestIsAPIEndpoint(t *testing.T) {
 		{"/exact", true},
 		{"/exactly", true},
 		{"/other", false},
+		// Cleaned like management paths, so these aren't forwarded unmetered.
+		{"//v1/chat/completions", true},
+		{"/./v1/chat/completions", true},
+		{`\v1\chat\completions`, true},
+		{"/api//v1/chat", true},
+		{"/api/v1//", true}, // trailing slash kept
+		{"//api", false},
 	}
 	for _, tt := range tests {
 		if got := isAPIEndpoint(tt.path); got != tt.want {
@@ -174,6 +189,37 @@ func TestParseConfigDefaults(t *testing.T) {
 		}
 		if c.forwardsUnmatched() != want {
 			t.Errorf("%q: forwardsUnmatched() = %t, want %t", data, !want, want)
+		}
+	}
+}
+
+func TestParseConfigValidates(t *testing.T) {
+	for _, tt := range []struct{ data, want string }{
+		{"proxy_port: -1\n", "proxy_port: -1 is not a port number"},
+		{"proxy_port: 70000\n", "proxy_port: 70000 is not a port number"},
+		{"server:\n  port: 65536\n", "server.port: 65536 is not a port number"},
+		{"server:\n  host: \"http://localhost\"\n", "without a scheme"},
+		{"server:\n  host: \"localhost:1234\"\n", "give the port in server.port"},
+		{"server:\n  host: \"[::1]:1234\"\n", "give the port in server.port"},
+		{"server:\n  host: \"[::1]\"\n", "without brackets"},
+		{"server:\n  host: \"localhost/v1\"\n", "is not a host name or IP address"},
+		{"server:\n  host: \"user@host\"\n", "is not a host name or IP address"},
+		{"server:\n  host: \"local host\"\n", "is not a host name or IP address"},
+		{"api_endpoints: [\"\"]\n", `api_endpoints: "" is not a path`},
+		{"api_endpoints: [\"*\"]\n", `"/*" meters every path`},
+		{"api_endpoints: [\"v1/*\"]\n", `api_endpoints: "v1/*" is not a path`},
+	} {
+		if _, err := parseConfig([]byte(tt.data)); err == nil || !strings.Contains(err.Error(), tt.want) {
+			t.Errorf("%q: err = %v, want it to contain %q", tt.data, err, tt.want)
+		}
+	}
+	for _, data := range []string{
+		"proxy_port: 65535\nserver:\n  port: 1\n",
+		"server:\n  host: \"::1\"\n", "server:\n  host: \"192.168.1.20\"\n", "server:\n  host: \"gpu-box.lan\"\n",
+		"api_endpoints: [\"/\", \"/*\"]\n",
+	} {
+		if _, err := parseConfig([]byte(data)); err != nil {
+			t.Errorf("%q: %v, want it accepted", data, err)
 		}
 	}
 }
@@ -361,9 +407,7 @@ func TestProxyForwardsRequestAndResponse(t *testing.T) {
 	if len(metrics.History) != 1 {
 		t.Errorf("len(History) = %d, want 1", len(metrics.History))
 	}
-	if !strings.Contains(logs.String(), "Tokens: 10 in / 20 out") {
-		t.Errorf("status line missing token counts:\n%s", logs)
-	}
+	waitForLog(t, logs, "Tokens: 10 in / 20 out")
 }
 
 func TestProxyLMStudioNativeJSON(t *testing.T) {
@@ -396,9 +440,7 @@ func TestProxyLMStudioNativeJSON(t *testing.T) {
 	if metrics.TokensPerSecond != 29.753900615398926 {
 		t.Errorf("TokensPerSecond = %v", metrics.TokensPerSecond)
 	}
-	if line := logs.String(); !strings.Contains(line, "TPS: 29.75") || !strings.Contains(line, "TTFT: 1.09s") {
-		t.Errorf("status line missing reported stats:\n%s", line)
-	}
+	waitForLog(t, logs, "TPS: 29.75 | TTFT: 1.09s")
 }
 
 func TestProxyStreamsSSEWithoutBuffering(t *testing.T) {
@@ -692,6 +734,15 @@ func TestCaptureOversizedInChunks(t *testing.T) {
 			"data: " + half + "\ndata: " + half + "\n" + fragment + "\n" + next, MetricsData{ModelName: "m", TotalTokens: 4}, 1},
 		{"SSE oversized line within an event", "text/event-stream",
 			"event: x\ndata: " + half + half + "\n" + fragment + "\n" + next, MetricsData{ModelName: "m", TotalTokens: 4}, 1},
+		// The splitter drops the oversized line without emitting it, and
+		// nothing follows to emit: the fragment before it must still be dropped.
+		{"SSE oversized line at the end", "text/event-stream",
+			next + fragment + "data: " + half + half + "\n", MetricsData{ModelName: "m", TotalTokens: 4}, 1},
+		{"SSE oversized unterminated line at the end", "text/event-stream",
+			next + fragment + "data: " + half + half, MetricsData{ModelName: "m", TotalTokens: 4}, 1},
+		// Both limits exceeded by one event: it counts once.
+		{"SSE event with too much data and an oversized line", "text/event-stream",
+			"data: " + half + "\ndata: " + half + "\ndata: " + half + half + "\n\n" + next, MetricsData{ModelName: "m", TotalTokens: 4}, 1},
 	} {
 		got, d := parseInChunks(t, tt.contentType, []byte(tt.body), 1<<20)
 		if got != tt.want || d.oversized != 1 || d.documents != tt.documents || d.invalid != 0 {
@@ -960,7 +1011,9 @@ func TestGracefulShutdownWaitsForInFlightStream(t *testing.T) {
 
 	p.stop()
 	waitFor(t, "listener to close", func() bool {
-		conn, err := net.Dial("tcp", p.addr)
+		// Some network stacks (WSL2) drop connections to a closed port
+		// instead of refusing them; a timeout means closed too.
+		conn, err := net.DialTimeout("tcp", p.addr, 100*time.Millisecond)
 		if err == nil {
 			conn.Close()
 		}
@@ -1041,6 +1094,28 @@ func TestClientDisconnectMidStream(t *testing.T) {
 	}
 }
 
+// http.Server.Shutdown neither waits for nor closes upgraded (hijacked)
+// connections, so an open WebSocket doesn't count as an in-flight request.
+func TestShutdownIgnoresUpgradedConnections(t *testing.T) {
+	target, _ := startCountingUpstream(t)
+	p := startServe(t, target, time.Minute)
+	cfg.ForwardManagement = true
+	conn := openWebSocket(t, p.url+"/llm")
+	defer conn.Close()
+
+	start := time.Now()
+	p.stop()
+	if err := p.wait(t, 2*time.Second); err != nil {
+		t.Errorf("serve() = %v, want nil", err)
+	}
+	if logs := p.logs.String(); !strings.HasSuffix(logs, "\nShutting down\nProxy stopped\n") {
+		t.Errorf("logs = %q, want shutdown without in-flight requests", logs)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Errorf("shutdown took %v with an open WebSocket", d)
+	}
+}
+
 func TestShutdownWithoutInFlightRequests(t *testing.T) {
 	p := startServe(t, startUpstream(t, http.NotFoundHandler()), time.Minute)
 	p.stop()
@@ -1064,18 +1139,18 @@ func TestServeReturnsListenerError(t *testing.T) {
 	}
 }
 
-func TestRunProxyPortInUse(t *testing.T) {
+func TestListenPortInUse(t *testing.T) {
 	startProxy(t, startUpstream(t, http.NotFoundHandler()))
-	busy, err := net.Listen("tcp", ":0") // same wildcard address runProxy listens on
+	busy, err := net.Listen("tcp", ":0") // same wildcard address listen uses
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer busy.Close()
 	cfg.ProxyPort = busy.Addr().(*net.TCPAddr).Port
 
-	ctx := context.Background()
-	if err := runProxy(ctx, ctx); err == nil {
-		t.Errorf("runProxy() on port %d in use: want an error", cfg.ProxyPort)
+	if ln, err := listen(); err == nil {
+		ln.Close()
+		t.Errorf("listen() on port %d in use: want an error", cfg.ProxyPort)
 	}
 }
 
@@ -1088,11 +1163,15 @@ func TestRunProxyServesUntilStopped(t *testing.T) {
 	}
 	cfg.ProxyPort = free.Addr().(*net.TCPAddr).Port
 	free.Close()
+	ln, err := listen()
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	stopCtx, stop := context.WithCancel(context.Background())
 	defer stop()
 	errc := make(chan error, 1)
-	go func() { errc <- runProxy(stopCtx, context.Background()) }()
+	go func() { errc <- runProxy(stopCtx, context.Background(), ln) }()
 
 	url := fmt.Sprintf("http://127.0.0.1:%d/v1/models", cfg.ProxyPort)
 	waitFor(t, "proxy to answer", func() bool {
@@ -1447,6 +1526,19 @@ func TestUpgradeOnMeteredPathNotWrapped(t *testing.T) {
 // bytes sent over it come back from the upstream.
 func checkWebSocketTunnel(t *testing.T, url string) {
 	t.Helper()
+	conn := openWebSocket(t, url)
+	defer conn.Close()
+	conn.Write([]byte("ping"))
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(conn, buf); err != nil || string(buf) != "ping" {
+		t.Errorf("echo over the tunnel = %q, %v; want \"ping\"", buf, err)
+	}
+}
+
+// openWebSocket sends a WebSocket handshake to url and returns the upgraded
+// connection.
+func openWebSocket(t *testing.T, url string) io.ReadWriteCloser {
+	t.Helper()
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -1458,16 +1550,12 @@ func checkWebSocketTunnel(t *testing.T, url string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
 	conn, ok := resp.Body.(io.ReadWriteCloser)
 	if resp.StatusCode != http.StatusSwitchingProtocols || !ok {
+		resp.Body.Close()
 		t.Fatalf("status = %d, writable body %t; want 101 and an upgraded connection", resp.StatusCode, ok)
 	}
-	conn.Write([]byte("ping"))
-	buf := make([]byte, 4)
-	if _, err := io.ReadFull(conn, buf); err != nil || string(buf) != "ping" {
-		t.Errorf("echo over the tunnel = %q, %v; want \"ping\"", buf, err)
-	}
+	return conn
 }
 
 func TestNonInferenceResponseNotCounted(t *testing.T) {
@@ -1649,8 +1737,8 @@ func TestProxyWritesQueriesToCSV(t *testing.T) {
 		readAll(t, resp.Body)
 		resp.Body.Close()
 	}
-	waitForQueries(t, 1)
-
+	// QueryCount can advance before the CSV row is flushed.
+	waitFor(t, "CSV query row", func() bool { return len(readCSV(t, path)) >= 2 })
 	rows := readCSV(t, path)
 	if len(rows) != 2 {
 		t.Fatalf("want header + 1 query row (models request not written), got %q", rows)
@@ -1742,9 +1830,12 @@ func debugTestUpstream(w http.ResponseWriter, r *http.Request) {
 	case "/v1/chat/completions": // non-streamed, usage but no rate: TPS estimated
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, chatCompletionJSON)
-	case "/v1/stream": // streamed without include_usage
+	case "/v1/completions": // streamed without include_usage
 		w.Header().Set("Content-Type", "text/event-stream")
 		io.WriteString(w, "data: {\"model\":\"m\",\"choices\":[]}\n\ndata: oops\n\ndata: [DONE]\n\n")
+	case "/api/v1/chat": // LM Studio native stream cut short before chat.end
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "event: chat.start\ndata: {\"type\":\"chat.start\",\"model_instance_id\":\"m\"}\n\n")
 	case "/v1/models": // JSON without inference data
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, `{"object":"list","data":[]}`)
@@ -1769,7 +1860,7 @@ func postAndDrain(t *testing.T, url string) {
 func TestDebugLoggingOffByDefault(t *testing.T) {
 	srv, logs := startProxy(t, startUpstream(t, http.HandlerFunc(debugTestUpstream)))
 	postAndDrain(t, srv.URL+"/v1/chat/completions")
-	waitForQueries(t, 1)
+	waitForLog(t, logs, "| Total tokens: ") // printed after any debug lines
 	if strings.Contains(logs.String(), "[DEBUG]") {
 		t.Errorf("debug lines printed with logging.debug off:\n%s", logs)
 	}
@@ -1778,8 +1869,8 @@ func TestDebugLoggingOffByDefault(t *testing.T) {
 func TestDebugLogging(t *testing.T) {
 	target := startUpstream(t, http.HandlerFunc(debugTestUpstream))
 	tests := []struct {
-		path string
-		want []string
+		path          string
+		want, notWant []string
 	}{
 		{"/v1/chat/completions", []string{
 			"POST /v1/chat/completions from 127.0.0.1:",
@@ -1788,39 +1879,76 @@ func TestDebugLogging(t *testing.T) {
 			fmt.Sprintf("body ended at EOF after %d bytes", len(chatCompletionJSON)),
 			"parsed as JSON: 1 JSON document(s), 0 invalid, 0 skipped",
 			"estimated as completion tokens / request duration",
-		}},
-		{"/v1/stream", []string{
+		}, nil},
+		{"/v1/completions", []string{
 			"parsed as SSE: 1 JSON document(s), 1 invalid, 0 skipped",
-			`must send "stream_options": {"include_usage": true}`,
-		}},
+			`stream has no token usage; OpenAI-compatible clients must send "stream_options": {"include_usage": true}`,
+		}, nil},
+		// The native API always reports usage, at the end; include_usage doesn't apply.
+		{"/api/v1/chat", []string{"stream has no token usage\n"}, []string{"include_usage"}},
 		{"/v1/models", []string{
 			"parsed as JSON: 1 JSON document(s), 0 invalid, 0 skipped",
 			"no model, token or rate fields found; not counted as a query",
-		}},
+		}, nil},
 		{"/v1/text", []string{
 			`Content-Type "text/plain"`,
 			"Content-Type not inspected",
 			"body ended at EOF after 5 bytes",
-		}},
+		}, nil},
 	}
 	for _, tt := range tests {
-		t.Run(tt.path, func(t *testing.T) { checkDebugOutput(t, target, tt.path, tt.want) })
+		t.Run(tt.path, func(t *testing.T) { checkDebugOutput(t, target, tt.path, tt.want, tt.notWant) })
+	}
+}
+
+// A stream that ends before EOF may lack usage only because its last events
+// never arrived, so no hint is printed for it.
+func TestDebugNoUsageHintBeforeEOF(t *testing.T) {
+	target, _ := startStreamingUpstream(t, streamFirst, streamRest)
+	srv, logs := startProxy(t, target)
+	cfg.Logging.Debug = true
+
+	resp, _ := postStream(t, srv.URL)
+	resp.Body.Close()
+	waitForLog(t, logs, "| incomplete")
+	if got := logs.String(); strings.Contains(got, "no token usage") {
+		t.Errorf("usage hint printed for a stream cut off before EOF:\n%s", got)
+	}
+}
+
+func TestUsageHint(t *testing.T) {
+	for p, want := range map[string]bool{
+		"/v1/chat/completions": true, "/v1/completions": true, "//v1/chat/completions/": true,
+		"/api/v1/chat": false, "/v1/responses": false,
+	} {
+		if got := usageHint(p) != ""; got != want {
+			t.Errorf("usageHint(%q) given: %t, want %t", p, got, want)
+		}
 	}
 }
 
 // checkDebugOutput sends one request with logging.debug on and checks that
-// the debug lines contain want and share one request ID.
-func checkDebugOutput(t *testing.T, target *url.URL, path string, want []string) {
+// the debug lines contain want, not notWant, and share one request ID.
+func checkDebugOutput(t *testing.T, target *url.URL, path string, want, notWant []string) {
 	t.Helper()
 	srv, logs := startProxy(t, target)
 	cfg.Logging.Debug = true
 	postAndDrain(t, srv.URL+path)
-	waitFor(t, "the request to finish", func() bool { return strings.Contains(logs.String(), "body ended") })
+	// The status or [Proxy] line comes after all debug lines of the request.
+	waitFor(t, "the request to be recorded", func() bool {
+		got := logs.String()
+		return strings.Contains(got, "| Total tokens: ") || strings.Contains(got, "[Proxy] ")
+	})
 
 	got := logs.String()
 	for _, w := range want {
 		if !strings.Contains(got, w) {
 			t.Errorf("debug output missing %q:\n%s", w, got)
+		}
+	}
+	for _, w := range notWant {
+		if strings.Contains(got, w) {
+			t.Errorf("debug output contains %q:\n%s", w, got)
 		}
 	}
 	if ids := debugRequestIDs(got); len(ids) != 1 {
@@ -1895,6 +2023,31 @@ func TestUpdateGlobalMetrics(t *testing.T) {
 	}
 	if metrics.TokensPerSecond != 30 {
 		t.Errorf("TokensPerSecond = %v, want most recent 30", metrics.TokensPerSecond)
+	}
+}
+
+// A short stream that arrives in one read has no measurable stream time; the
+// time between reads would only measure the proxy and give an absurd rate.
+func TestStreamInOneReadUsesRequestDuration(t *testing.T) {
+	const delay = 50 * time.Millisecond
+	target := startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(delay) // prompt processing: part of the request duration
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, streamFirst+streamRest) // one write: one read on the proxy
+	}))
+	srv, logs := startProxy(t, target)
+	cfg.Logging.Debug = true
+	postAndDrain(t, srv.URL+"/v1/chat/completions")
+	waitForLog(t, logs, "| Total tokens: ")
+
+	metrics.mu.RLock()
+	defer metrics.mu.RUnlock()
+	// 2 completion tokens over at least delay: at most 40 tok/s.
+	if maxTPS := 2 / delay.Seconds(); metrics.TokensPerSecond <= 0 || metrics.TokensPerSecond > maxTPS {
+		t.Errorf("TokensPerSecond = %v, want an estimate over the request duration (at most %v)", metrics.TokensPerSecond, maxTPS)
+	}
+	if got := logs.String(); !strings.Contains(got, "estimated as completion tokens / request duration") || strings.Contains(got, "stream time") {
+		t.Errorf("want the request duration as basis and no stream time:\n%s", got)
 	}
 }
 
@@ -1994,6 +2147,22 @@ func TestDetectBackend(t *testing.T) {
 		}
 	}
 
+	// Redirects aren't followed: only the configured server is probed.
+	elsewhere := startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"version":"0.40.2"}`)
+	}))
+	redirecting := startUpstream(t, http.RedirectHandler(elsewhere.String()+"/api/version", http.StatusFound))
+	cfg.Logging.Debug = true
+	logs := &syncBuffer{}
+	out = logs
+	if got := detectBackend(redirecting); got != "" {
+		t.Errorf("redirecting upstream: detectBackend() = %q, want \"\"", got)
+	}
+	cfg.Logging.Debug = false
+	if !strings.Contains(logs.String(), "backend probe /api/version: status 302") {
+		t.Errorf("want the redirect logged as its status:\n%s", logs)
+	}
+
 	closed := httptest.NewServer(http.NotFoundHandler())
 	u, _ := url.Parse(closed.URL)
 	closed.Close()
@@ -2002,12 +2171,27 @@ func TestDetectBackend(t *testing.T) {
 	}
 }
 
-func TestTruncateString(t *testing.T) {
-	if got := truncateString("short", 30); got != "short" {
-		t.Errorf("got %q", got)
-	}
-	if got := truncateString("ääääää", 5); got != "ää..." {
-		t.Errorf("got %q, want rune-safe truncation", got)
+func TestEscapeTruncated(t *testing.T) {
+	long := strings.Repeat("m", 30)
+	for _, tt := range []struct {
+		in   string
+		max  int
+		want string
+	}{
+		{"short", 30, "short"},
+		{"ääääää", 5, "ää..."},                                            // cut between runes
+		{"a\x1bb", 6, `a\x1bb`},                                           // fits once escaped
+		{"ab\x1bcdef", 8, `ab...`},                                        // an escape is not split
+		{"\xff" + long, 10, `\xffmmm...`},                                 // invalid byte escaped, not U+FFFD
+		{"\u202e" + long, 30, `\u202e` + strings.Repeat("m", 21) + "..."}, // escapes count with their length
+	} {
+		got := escapeTruncated(tt.in, tt.max)
+		if got != tt.want {
+			t.Errorf("escapeTruncated(%q, %d) = %q, want %q", tt.in, tt.max, got, tt.want)
+		}
+		if n := utf8.RuneCountInString(got); n > tt.max {
+			t.Errorf("escapeTruncated(%q, %d) has %d runes, want at most %d", tt.in, tt.max, n, tt.max)
+		}
 	}
 }
 
@@ -2135,11 +2319,12 @@ func testEscapedNoInference(t *testing.T) {
 func testEscapedQuery(t *testing.T) {
 	srv, logs := startProxy(t, startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, `{"model":"m\u001b[2J\r\n[12:00:00] #9\u202e",`+
+		// 30 runes once escaped: the status line's limit, so shown whole.
+		io.WriteString(w, `{"model":"\u001b[2J\r\n[12:00:00] #9\u202e",`+
 			`"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`)
 	})))
 	postAndDrain(t, srv.URL+"/v1"+injectedPath)
-	checkEscapedLogs(t, logs, 1, " POST /v1"+injectedLog+` 200 | Model: m\x1b[2J\r\n[12:00:00] #9\u202e | Tokens: 1 in / 2 out`)
+	checkEscapedLogs(t, logs, 1, " POST /v1"+injectedLog+` 200 | Model: \x1b[2J\r\n[12:00:00] #9\u202e | Tokens: 1 in / 2 out`)
 }
 
 // checkEscapedLogs waits for wantLines log lines, then checks that they
