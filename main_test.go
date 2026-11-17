@@ -2026,28 +2026,51 @@ func TestUpdateGlobalMetrics(t *testing.T) {
 	}
 }
 
-// A short stream that arrives in one read has no measurable stream time; the
-// time between reads would only measure the proxy and give an absurd rate.
-func TestStreamInOneReadUsesRequestDuration(t *testing.T) {
+// A stream that arrives at once, in one read or in several back-to-back reads
+// from the transport's buffer, has no measurable stream time: the time
+// between its reads would only measure the proxy and give an absurd rate.
+// Only a body that arrived in bursts is timed from first to last byte.
+func TestStreamTimeNeedsPausesBetweenReads(t *testing.T) {
+	pad := ": " + strings.Repeat("x", 64<<10) + "\n\n" // SSE comment, larger than the read buffers
+	for _, tt := range []struct {
+		name   string
+		chunks []string // flushed with a pause between them
+		basis  string
+	}{
+		{"one read", []string{streamFirst + streamRest}, "completion tokens / request duration"},
+		{"several reads at once", []string{pad + streamFirst + pad + streamRest}, "completion tokens / request duration"},
+		{"paused stream", []string{streamFirst, streamFirst, streamRest}, "completion tokens / stream time"},
+	} {
+		t.Run(tt.name, func(t *testing.T) { checkStreamTimeBasis(t, tt.chunks, tt.basis) })
+	}
+}
+
+func checkStreamTimeBasis(t *testing.T, chunks []string, basis string) {
 	const delay = 50 * time.Millisecond
 	target := startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(delay) // prompt processing: part of the request duration
 		w.Header().Set("Content-Type", "text/event-stream")
-		io.WriteString(w, streamFirst+streamRest) // one write: one read on the proxy
+		for i, c := range chunks {
+			if i > 0 {
+				time.Sleep(20 * streamGap)
+			}
+			io.WriteString(w, c)
+			w.(http.Flusher).Flush()
+		}
 	}))
 	srv, logs := startProxy(t, target)
 	cfg.Logging.Debug = true
 	postAndDrain(t, srv.URL+"/v1/chat/completions")
 	waitForLog(t, logs, "| Total tokens: ")
 
+	if got := logs.String(); !strings.Contains(got, "estimated as "+basis) {
+		t.Errorf("want TPS estimated as %q:\n%s", basis, got)
+	}
 	metrics.mu.RLock()
 	defer metrics.mu.RUnlock()
-	// 2 completion tokens over at least delay: at most 40 tok/s.
-	if maxTPS := 2 / delay.Seconds(); metrics.TokensPerSecond <= 0 || metrics.TokensPerSecond > maxTPS {
-		t.Errorf("TokensPerSecond = %v, want an estimate over the request duration (at most %v)", metrics.TokensPerSecond, maxTPS)
-	}
-	if got := logs.String(); !strings.Contains(got, "estimated as completion tokens / request duration") || strings.Contains(got, "stream time") {
-		t.Errorf("want the request duration as basis and no stream time:\n%s", got)
+	// 2 completion tokens over at least 40 ms of pauses or delay: at most 50 tok/s.
+	if metrics.TokensPerSecond <= 0 || metrics.TokensPerSecond > 50 {
+		t.Errorf("TokensPerSecond = %v, want a plausible estimate (at most 50)", metrics.TokensPerSecond)
 	}
 }
 

@@ -331,8 +331,9 @@ apart. Request and response bodies are never logged.
   responses this includes prompt processing and request overhead, so the
   value is understated, badly so for short replies; for streams the time
   between the first and last chunk is used, which is closer, unless the
-  stream arrived in one piece (short, or buffered on the way): then the
-  request duration is used as for a non-streamed response. LM Studio's
+  stream arrived all at once (short, or buffered on the way) or faster than
+  about 1000 tokens/s: then the request duration is used as for a
+  non-streamed response. LM Studio's
   OpenAI-compatible API (`/v1/...`) never reports TPS, streamed or not.
 - Time to first token is only reported by LM Studio's native API
   (`/api/v1/...`). Ollama (native and OpenAI-compatible) and LM Studio's

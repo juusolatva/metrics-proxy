@@ -122,6 +122,17 @@ const (
 	maxPayloadParseBytes = 2 * maxCaptureBytes
 )
 
+// A streamed body's first-to-last-byte time is used as generation time only
+// if the body arrived in bursts: at least minStreamWaits pauses of streamGap
+// or more between reads. A buffered body (short, or held back on the way) is
+// read back to back from the transport's buffer, so the time between its
+// reads measures only the proxy. Generation at over 1000 tokens/s has
+// shorter pauses and falls back to the request duration too.
+const (
+	streamGap      = time.Millisecond
+	minStreamWaits = 2
+)
+
 // shutdownTimeout bounds how long a graceful shutdown waits for in-flight
 // requests; below systemd's default 90 s stop timeout.
 const shutdownTimeout = 60 * time.Second
@@ -863,6 +874,7 @@ type meteredBody struct {
 	capture   capture   // nil when the body is not inspected
 	firstByte time.Time // when the first body bytes were read
 	lastByte  time.Time // when the last body bytes were read
+	waits     int       // pauses of streamGap or more between reads with data
 	bytes     int64
 	eof       bool
 	once      sync.Once
@@ -872,10 +884,13 @@ func (b *meteredBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	if n > 0 {
 		b.bytes += int64(n)
-		b.lastByte = time.Now()
+		now := time.Now()
 		if b.firstByte.IsZero() {
-			b.firstByte = b.lastByte
+			b.firstByte = now
+		} else if now.Sub(b.lastByte) >= streamGap {
+			b.waits++
 		}
+		b.lastByte = now
 		if b.capture != nil {
 			_, _ = b.capture.Write(p[:n]) // captures never fail; parse problems show in diag()
 		}
@@ -906,10 +921,11 @@ func (b *meteredBody) finish() {
 		}
 		switch b.capture.(type) {
 		case *sseCapture, *ndjsonCapture:
-			// 0 if the whole body arrived in one read (a short or buffered
-			// stream): the time between reads would then measure only the
-			// proxy, so completeDerived falls back to the request duration.
-			streamTime = b.lastByte.Sub(b.firstByte)
+			// Left 0 for a body that arrived at once (see streamGap), so
+			// completeDerived falls back to the request duration.
+			if b.waits >= minStreamWaits {
+				streamTime = b.lastByte.Sub(b.firstByte)
+			}
 		}
 		data.Duration = end.Sub(b.info.start)
 		basis := data.completeDerived(streamTime)
