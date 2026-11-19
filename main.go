@@ -104,8 +104,13 @@ type MetricsData struct {
 	CompletionTokens int
 	TotalTokens      int
 	TokensPerSecond  float64
-	TPSEstimated     bool          // TokensPerSecond derived by completeDerived, not reported
-	TimeToFirstToken time.Duration // as reported by the upstream; 0 if unknown
+	TPSEstimated     bool // TokensPerSecond derived by completeDerived, not reported
+	// TimeToFirstToken is measured by the proxy for streamed responses
+	// (TTFTMeasured; request start to the first generated output, so it
+	// includes model loading) and otherwise as reported by the upstream;
+	// 0 if unknown.
+	TimeToFirstToken time.Duration
+	TTFTMeasured     bool
 	Duration         time.Duration
 }
 
@@ -181,11 +186,12 @@ func main() {
 	proxy = newReverseProxy(target)
 
 	// Setup signal handling for graceful shutdown: stop is done on the first
-	// signal, force on the second.
-	stop, stopNow := context.WithCancel(context.Background())
-	defer stopNow()
+	// signal, force on the second. stop is derived from force, since forcing
+	// implies stopping (not the other way round).
 	force, forceNow := context.WithCancel(context.Background())
 	defer forceNow()
+	stop, stopNow := context.WithCancel(force)
+	defer stopNow()
 	setupSignalHandling(stopNow, forceNow)
 
 	// Bind the port before announcing it or probing the upstream, so a port
@@ -928,7 +934,15 @@ func (b *meteredBody) finish() {
 			}
 		}
 		data.Duration = end.Sub(b.info.start)
+		// TPS is estimated with the upstream's TTFT, before it is replaced:
+		// the measured one includes model loading and, for a body held back
+		// on the way, the whole generation.
 		basis := data.completeDerived(streamTime)
+		if b.capture != nil {
+			if at := b.capture.firstOutput(); !at.IsZero() {
+				data.TimeToFirstToken, data.TTFTMeasured = at.Sub(b.info.start), true
+			}
+		}
 
 		if cfg.Logging.Debug {
 			b.debugSummary(data, streamTime, basis)
@@ -955,6 +969,10 @@ func (b *meteredBody) debugSummary(data MetricsData, streamTime time.Duration, b
 	d := b.capture.diag()
 	debugf("req %d: parsed as %s: %d JSON document(s), %d invalid, %d skipped as larger than %d MiB",
 		id, d.name, d.documents, d.invalid, d.oversized, maxCaptureBytes>>20)
+	if data.TTFTMeasured {
+		debugf("req %d: first output in document %d, %.2fs after the request (measured TTFT, includes model loading)",
+			id, d.outputDoc, data.TimeToFirstToken.Seconds())
+	}
 	if basis != "" {
 		debugf("req %d: no tokens/s reported; estimated as %s", id, basis)
 	}
@@ -1002,6 +1020,9 @@ type capture interface {
 	finish() MetricsData
 	// diag reports what was parsed, for debug output.
 	diag() captureDiag
+	// firstOutput returns when the first document carrying generated output
+	// was written, or the zero time if none was (or for unstreamed bodies).
+	firstOutput() time.Time
 }
 
 // captureDiag counts the JSON documents (whole body, SSE events or NDJSON
@@ -1011,6 +1032,7 @@ type captureDiag struct {
 	documents int    // parsed as JSON objects
 	invalid   int    // not valid JSON objects
 	oversized int    // bodies, lines or events skipped for exceeding maxCaptureBytes
+	outputDoc int    // number (from 1) of the first document with generated output; 0 if none
 }
 
 // count records the outcome of parsing one document.
@@ -1069,6 +1091,27 @@ func (c *jsonCapture) finish() MetricsData {
 }
 
 func (c *jsonCapture) diag() captureDiag { return c.d }
+
+// firstOutput is zero: a JSON body arrives whole, after generation ends.
+func (c *jsonCapture) firstOutput() time.Time { return time.Time{} }
+
+// outputTimer notes when a streamed body's first document carrying generated
+// output (text, reasoning or tool calls) was written to its capture. Captures
+// are written as the proxy reads the body from the upstream, just before it
+// forwards each chunk, so this times the upstream (model loading included),
+// not a slow client's receipt of the token.
+type outputTimer struct {
+	at  time.Time
+	doc int // number of that document among those parsed, from 1
+}
+
+// note records the parse result of one document; parsed counts the
+// documents parsed so far, this one included.
+func (o *outputTimer) note(output bool, parsed int) {
+	if output && o.at.IsZero() {
+		o.at, o.doc = time.Now(), parsed
+	}
+}
 
 // lineSplitter splits a body written in arbitrary chunks into lines and
 // passes each line, without its "\n" or "\r\n" terminator, to emit. Lines
@@ -1129,6 +1172,7 @@ type sseCapture struct {
 	dropped int    // lines.oversized at the last noteDropped
 	metrics MetricsData
 	d       captureDiag // oversized counts skipped events, once per event
+	output  outputTimer
 }
 
 func (c *sseCapture) Write(p []byte) (int, error) {
@@ -1181,7 +1225,9 @@ func (c *sseCapture) skipEvent() {
 
 func (c *sseCapture) dispatch() {
 	if !c.skip && len(c.data) > 0 && !bytes.Equal(c.data, []byte("[DONE]")) {
-		c.d.count(c.metrics.mergeJSON(c.data))
+		ok, output := c.metrics.mergeDocument(c.data)
+		c.d.count(ok)
+		c.output.note(output, c.d.documents)
 	}
 	c.data, c.skip = c.data[:0], false
 }
@@ -1196,8 +1242,11 @@ func (c *sseCapture) finish() MetricsData {
 func (c *sseCapture) diag() captureDiag {
 	d := c.d
 	d.name = "SSE"
+	d.outputDoc = c.output.doc
 	return d
 }
+
+func (c *sseCapture) firstOutput() time.Time { return c.output.at }
 
 // ndjsonCapture parses a newline-delimited JSON body (Ollama's native
 // streaming format) line by line. Metrics from later lines override earlier
@@ -1206,6 +1255,7 @@ type ndjsonCapture struct {
 	lines   lineSplitter
 	metrics MetricsData
 	d       captureDiag
+	output  outputTimer
 }
 
 func (c *ndjsonCapture) Write(p []byte) (int, error) {
@@ -1215,7 +1265,9 @@ func (c *ndjsonCapture) Write(p []byte) (int, error) {
 
 func (c *ndjsonCapture) processLine(line []byte) {
 	if len(bytes.TrimSpace(line)) > 0 {
-		c.d.count(c.metrics.mergeJSON(line))
+		ok, output := c.metrics.mergeDocument(line)
+		c.d.count(ok)
+		c.output.note(output, c.d.documents)
 	}
 }
 
@@ -1228,8 +1280,11 @@ func (c *ndjsonCapture) diag() captureDiag {
 	d := c.d
 	d.name = "NDJSON"
 	d.oversized += c.lines.oversized
+	d.outputDoc = c.output.doc
 	return d
 }
+
+func (c *ndjsonCapture) firstOutput() time.Time { return c.output.at }
 
 // llmPayload is the subset of upstream response fields used for metrics. It
 // covers OpenAI-compatible responses (/v1/*), LM Studio's native REST API
@@ -1258,6 +1313,13 @@ type llmPayload struct {
 	PromptEvalCount int   `json:"prompt_eval_count"` // Ollama native
 	EvalCount       int   `json:"eval_count"`        // Ollama native
 	EvalDuration    int64 `json:"eval_duration"`     // Ollama native, nanoseconds
+	// Generated output, used only to time the first token of a stream.
+	Choices  outputChoices `json:"choices"`  // OpenAI chat and legacy completions chunks
+	Message  *outputFields `json:"message"`  // Ollama native /api/chat
+	Content  string        `json:"content"`  // LM Studio API v1 message.delta, reasoning.delta
+	Delta    string        `json:"delta"`    // OpenAI Responses API *.delta events
+	Thinking string        `json:"thinking"` // Ollama native /api/generate
+	// Ollama native /api/generate puts its text in "response" (a string).
 	// Wrapped payloads: the API v1 "chat.end" SSE event carries the response
 	// in "result", OpenAI Responses API events in "response". Kept raw so an
 	// unrelated field of the same name doesn't fail the whole parse.
@@ -1265,19 +1327,103 @@ type llmPayload struct {
 	Response json.RawMessage `json:"response"`
 }
 
+// outputFields are the fields of an OpenAI chunk's delta or an Ollama
+// message that carry generated output.
+type outputFields struct {
+	Content          string        `json:"content"`
+	ReasoningContent string        `json:"reasoning_content"` // LM Studio, DeepSeek, llama.cpp
+	Reasoning        string        `json:"reasoning"`         // Ollama OpenAI-compatible
+	Thinking         string        `json:"thinking"`          // Ollama native
+	ToolCalls        nonEmptyArray `json:"tool_calls"`
+}
+
+func (f *outputFields) hasOutput() bool {
+	return f != nil && (f.Content != "" || f.ReasoningContent != "" || f.Reasoning != "" ||
+		f.Thinking != "" || bool(f.ToolCalls))
+}
+
+// nonEmptyArray records whether a JSON value is an array with at least one
+// element, without decoding the elements: a document within maxCaptureBytes
+// can hold millions of them.
+type nonEmptyArray bool
+
+func (a *nonEmptyArray) UnmarshalJSON(b []byte) error {
+	// json.Unmarshal has checked the syntax, so "[" is followed by "]" or a value.
+	b = bytes.TrimSpace(b)
+	*a = len(b) > 1 && b[0] == '[' && bytes.TrimSpace(b[1:])[0] != ']'
+	return nil
+}
+
+// outputChoices records whether one of the first maxOutputChoices elements
+// of an OpenAI "choices" array carries generated output. Elements are decoded
+// one at a time, so neither memory nor work grows with the number of elements
+// a document within maxCaptureBytes can hold (millions). Responses have one
+// choice per requested completion ("n", usually 1). Anything but an array is
+// ignored.
+type outputChoices bool
+
+const maxOutputChoices = 16
+
+func (o *outputChoices) UnmarshalJSON(b []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	if t, err := dec.Token(); err != nil || t != json.Delim('[') {
+		return nil
+	}
+	for i := 0; i < maxOutputChoices && dec.More(); i++ {
+		var c struct {
+			Delta *outputFields `json:"delta"` // chat completions chunk
+			Text  string        `json:"text"`  // legacy completions chunk
+		}
+		// A type error skips only the mismatched field, as in json.Unmarshal.
+		// json.Unmarshal has ruled out syntax errors; one would end More().
+		_ = dec.Decode(&c)
+		if c.Text != "" || c.Delta.hasOutput() {
+			*o = true
+			return nil
+		}
+	}
+	return nil
+}
+
+// hasOutput reports whether p, as a streamed document, carries generated
+// output. Events sent before generation, such as LM Studio's chat.start and
+// prompt_processing.* or an OpenAI chunk with only the role, don't. Wrapped
+// payloads are not inspected: they summarize the response at its end.
+func (p *llmPayload) hasOutput() bool {
+	// "response" is a string in Ollama's /api/generate, an object (a
+	// wrapper) in Responses API events; `""` is the empty string.
+	return bool(p.Choices) || p.Message.hasOutput() || p.Content != "" || p.Delta != "" || p.Thinking != "" ||
+		(len(p.Response) > 2 && p.Response[0] == '"')
+}
+
 // mergeJSON applies the metrics found in a JSON document to d and reports
 // whether it was a JSON object. Other documents are ignored; a field of
 // unexpected type is skipped without discarding the others.
 func (d *MetricsData) mergeJSON(raw []byte) bool {
+	ok, _ := d.mergeDocument(raw)
+	return ok
+}
+
+// mergeDocument is mergeJSON that also reports whether the document carries
+// generated output (see llmPayload.hasOutput), for streamed bodies.
+func (d *MetricsData) mergeDocument(raw []byte) (ok, output bool) {
 	remaining := maxPayloadParseBytes
-	return d.mergeJSONBounded(raw, 0, &remaining)
+	p, ok := d.mergeJSONPayload(raw, 0, &remaining)
+	return ok, ok && p.hasOutput()
 }
 
 // mergeJSONBounded keeps already merged fields when deeper inspection reaches
 // a limit. This only limits metrics inspection; response bytes are forwarded.
 func (d *MetricsData) mergeJSONBounded(raw []byte, depth int, remaining *int) bool {
+	_, ok := d.mergeJSONPayload(raw, depth, remaining)
+	return ok
+}
+
+// mergeJSONPayload is mergeJSONBounded that also returns the decoded
+// payload, without its wrappers' contents.
+func (d *MetricsData) mergeJSONPayload(raw []byte, depth int, remaining *int) (*llmPayload, bool) {
 	if depth > maxWrapperDepth || len(raw) > *remaining {
-		return false
+		return nil, false
 	}
 	*remaining -= len(raw)
 	var p llmPayload
@@ -1285,7 +1431,7 @@ func (d *MetricsData) mergeJSONBounded(raw []byte, depth int, remaining *int) bo
 	err := json.Unmarshal(raw, &p)
 	// A type error without a field is the document itself (array, string, ...).
 	if err != nil && (!errors.As(err, &typeErr) || typeErr.Field == "") {
-		return false
+		return nil, false
 	}
 	d.merge(&p)
 	for _, wrapped := range []json.RawMessage{p.Result, p.Response} {
@@ -1293,7 +1439,7 @@ func (d *MetricsData) mergeJSONBounded(raw []byte, depth int, remaining *int) bo
 			d.mergeJSONBounded(wrapped, depth+1, remaining)
 		}
 	}
-	return true
+	return &p, true
 }
 
 // merge applies the metrics in p to d. Fields p reports override those already
@@ -1434,10 +1580,12 @@ func displayMetrics(now time.Time, info *requestInfo, status int, data MetricsDa
 
 // csvHeader names the columns written by csvRecorder.record. Unknown values
 // (no tokens, TPS or TTFT reported) are left empty rather than written as 0.
+// New columns go at the end: existing files are appended to as they are.
 var csvHeader = []string{
 	"timestamp", "method", "path", "status", "model",
 	"prompt_tokens", "completion_tokens", "total_tokens",
 	"tokens_per_second", "tps_estimated", "ttft_seconds", "duration_seconds", "complete",
+	"ttft_measured",
 }
 
 // csvRecorder appends one row per recorded query to a CSV file. Rows are
@@ -1507,6 +1655,7 @@ func (r *csvRecorder) record(now time.Time, info *requestInfo, status int, data 
 		optInt(data.PromptTokens), optInt(data.CompletionTokens), optInt(data.TotalTokens),
 		tps, strconv.FormatBool(data.TPSEstimated), ttft,
 		strconv.FormatFloat(data.Duration.Seconds(), 'f', 3, 64), strconv.FormatBool(complete),
+		strconv.FormatBool(data.TTFTMeasured),
 	}
 
 	r.mu.Lock()
