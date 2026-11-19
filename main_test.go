@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -1627,8 +1628,8 @@ func TestCSVLogAppendsWithSingleHeader(t *testing.T) {
 
 	want := [][]string{
 		csvHeader,
-		{"2026-10-17T14:02:31.500Z", "POST", "/api/v1/chat", "200", "qwen, \"8b\"", "42", "311", "353", "48.12", "false", "0.210", "6.680", "true"},
-		{"2026-10-17T14:02:31.500Z", "POST", "/api/v1/chat", "200", "m", "", "", "", "", "false", "", "1.000", "false"},
+		{"2026-10-17T14:02:31.500Z", "POST", "/api/v1/chat", "200", "qwen, \"8b\"", "42", "311", "353", "48.12", "false", "0.210", "6.680", "true", "false"},
+		{"2026-10-17T14:02:31.500Z", "POST", "/api/v1/chat", "200", "m", "", "", "", "", "false", "", "1.000", "false", "false"},
 	}
 	if got := readCSV(t, path); fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Errorf("CSV rows:\n got %q\nwant %q", got, want)
@@ -2470,4 +2471,143 @@ func TestParseConfigAllowedHosts(t *testing.T) {
 	if c, err := parseConfig(nil); err != nil || len(c.AllowedHosts) != 0 {
 		t.Errorf("default AllowedHosts = %q, %v; want none", c.AllowedHosts, err)
 	}
+}
+
+// TestCaptureFirstOutput checks which document of each capture counts as the
+// first generated output, whole and in 1-byte chunks. LM Studio's native
+// stream starts with chat.start, prompt_processing.* and message.start
+// events; the first message.delta is its 7th event.
+func TestCaptureFirstOutput(t *testing.T) {
+	tests := []struct {
+		file, contentType string
+		outputDoc         int
+	}{
+		{"lm_v1_chat.json", "application/json", 0}, // whole bodies are not timed
+		{"lm_v1_chat_stream.sse", "text/event-stream", 7},
+		{"lm_oai_stream.sse", "text/event-stream", 1},
+		{"lm_oai_stream_nousage.sse", "text/event-stream", 1},
+		{"ol_chat_stream.ndjson", "application/x-ndjson", 1},
+		{"ol_generate_stream.ndjson", "application/x-ndjson", 1},
+		{"ol_oai_stream.sse", "text/event-stream", 1},
+		{"ol_oai_stream_nousage.sse", "text/event-stream", 1},
+	}
+	for _, tt := range tests {
+		body := readFixture(t, tt.file)
+		for _, chunkSize := range []int{len(body), 1} {
+			c := newCapture(tt.contentType)
+			for b := body; len(b) > 0; b = b[min(chunkSize, len(b)):] {
+				c.Write(b[:min(chunkSize, len(b))])
+			}
+			c.finish()
+			if got := c.diag().outputDoc; got != tt.outputDoc || c.firstOutput().IsZero() != (tt.outputDoc == 0) {
+				t.Errorf("%s (chunk %d): first output in document %d (time set: %t), want %d",
+					tt.file, chunkSize, got, !c.firstOutput().IsZero(), tt.outputDoc)
+			}
+		}
+	}
+}
+
+func TestPayloadHasOutput(t *testing.T) {
+	tests := []struct {
+		doc  string
+		want bool
+	}{
+		{`{"choices":[{"delta":{"role":"assistant","content":""}}]}`, false},
+		{`{"choices":[{"delta":{"role":"assistant"}}]}`, false},
+		{`{"choices":[{"delta":{"content":null}}]}`, false},
+		{`{"choices":[{"delta":{"content":"Hi"}}]}`, true},
+		{`{"choices":[{"delta":{"reasoning_content":"Hmm"}}]}`, true},
+		{`{"choices":[{"delta":{"reasoning":"Hmm"}}]}`, true},
+		{`{"choices":[{"delta":{"tool_calls":[{"index":0}]}}]}`, true},
+		{`{"choices":[{"delta":{"tool_calls":[]}}]}`, false},
+		{`{"choices":[{"text":"Hi"}]}`, true},
+		{`{"choices":[],"usage":{"total_tokens":3}}`, false},
+		{`{"message":{"role":"assistant","content":""},"done":true}`, false},
+		{`{"message":{"role":"assistant","content":"1"}}`, true},
+		{`{"message":{"role":"assistant","thinking":"Hmm"}}`, true},
+		{`{"message":{"tool_calls":[{"function":{"name":"f"}}]}}`, true},
+		{`{"response":"","done":true}`, false},
+		{`{"response":"1"}`, true},
+		{`{"thinking":"Hmm"}`, true},
+		{`{"type":"chat.start","model_instance_id":"m"}`, false},
+		{`{"type":"prompt_processing.progress","progress":0.5}`, false},
+		{`{"type":"message.delta","content":"1"}`, true},
+		{`{"type":"response.created","response":{"model":"m"}}`, false},
+		{`{"type":"response.output_text.delta","delta":"Hi"}`, true},
+		{`{"content":["not","a","string"],"model":"m"}`, false},
+	}
+	for _, tt := range tests {
+		var d MetricsData
+		ok, got := d.mergeDocument([]byte(tt.doc))
+		if !ok || got != tt.want {
+			t.Errorf("%s: output %t (valid %t), want %t", tt.doc, got, ok, tt.want)
+		}
+	}
+	var d MetricsData
+	if ok, got := d.mergeDocument([]byte(`"just a string"`)); ok || got {
+		t.Errorf("non-object document: valid %t, output %t; want neither", ok, got)
+	}
+}
+
+// TestMeasuredTTFTIncludesModelLoad sends LM Studio's native stream with a
+// pause before its first message.delta, as when the model is loaded first.
+// The measured TTFT replaces the reported 0.03s (prompt processing only), and
+// the reported TPS is kept.
+func TestMeasuredTTFTIncludesModelLoad(t *testing.T) {
+	const load = 150 * time.Millisecond
+	stream := string(readFixture(t, "lm_v1_chat_stream.sse"))
+	i := strings.Index(stream, "event: message.delta")
+	target := startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, stream[:i]) // chat.start ... message.start
+		w.(http.Flusher).Flush()
+		time.Sleep(load)
+		io.WriteString(w, stream[i:])
+	}))
+	srv, logs := startProxy(t, target)
+	cfg.Logging.Debug = true
+	path := filepath.Join(t.TempDir(), "stats.csv")
+	rec, err := openCSVLog(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	csvLog = rec
+	t.Cleanup(func() { rec.Close() })
+
+	postAndDrain(t, srv.URL+"/api/v1/chat")
+	waitForLog(t, logs, "| Total tokens: ")
+	checkMeasuredTTFT(t, logs.String(), readCSV(t, path), load)
+}
+
+func checkMeasuredTTFT(t *testing.T, logs string, rows [][]string, load time.Duration) {
+	t.Helper()
+	m := regexp.MustCompile(`TPS: 84\.25 \| TTFT: (\d+\.\d+)s`).FindStringSubmatch(logs)
+	if m == nil {
+		t.Fatalf("no reported TPS and TTFT in status line:\n%s", logs)
+	}
+	if ttft, _ := strconv.ParseFloat(m[1], 64); ttft < load.Seconds() || ttft > 2 {
+		t.Errorf("TTFT %ss, want the measured time (at least %v)", m[1], load)
+	}
+	if !strings.Contains(logs, "first output in document 7") {
+		t.Errorf("debug output lacks the first output document:\n%s", logs)
+	}
+	if len(rows) != 2 || len(rows[1]) != len(csvHeader) {
+		t.Fatalf("CSV rows %q, want header and one row", rows)
+	}
+	row := rows[1]
+	if ttft, _ := strconv.ParseFloat(row[10], 64); ttft < load.Seconds() || row[13] != "true" {
+		t.Errorf("CSV ttft_seconds %q, ttft_measured %q; want at least %v and true", row[10], row[13], load)
+	}
+}
+
+// A JSON response arrives whole, so its TTFT stays as the upstream reports it.
+func TestReportedTTFTKeptForJSON(t *testing.T) {
+	body := readFixture(t, "lm_v1_chat.json")
+	target := startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(body)
+	}))
+	srv, logs := startProxy(t, target)
+	postAndDrain(t, srv.URL+"/api/v1/chat")
+	waitForLog(t, logs, "| TTFT: 0.11s |")
 }

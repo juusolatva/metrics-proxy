@@ -111,7 +111,11 @@ controls (e.g. `\u202e`). Other text, including non-ASCII, is printed as is.
 
 `TPS` is the rate reported by the server. When the server doesn't report one,
 the proxy estimates it and marks it `(est.)`, e.g. `TPS: 40.98 (est.)`. `TTFT`
-(time to first token) only appears when the server reports it (see
+(time to first token) is measured by the proxy for streamed responses: the
+time from receiving the request to forwarding the first generated text,
+reasoning or tool call, so it includes loading the model. Non-streamed
+responses show it only when the server reports it (LM Studio's native API,
+whose value covers prompt processing, not loading; see
 [Limitations](#limitations)).
 
 ### Saving statistics to CSV
@@ -127,15 +131,18 @@ existing file is not checked; start a new file if the column format changes.
 Requests without inference data (such as `/v1/models`) are not written.
 
 ```csv
-timestamp,method,path,status,model,prompt_tokens,completion_tokens,total_tokens,tokens_per_second,tps_estimated,ttft_seconds,duration_seconds,complete
-2026-10-17T03:28:30.366+03:00,POST,/api/v1/chat,200,qwen2.5-coder-0.5b-instruct,32,10,42,271.22,false,0.005,0.054,true
-2026-10-17T03:28:30.447+03:00,POST,/v1/chat/completions,200,qwen2.5-coder-0.5b-instruct,32,10,42,234.45,true,,0.043,true
+timestamp,method,path,status,model,prompt_tokens,completion_tokens,total_tokens,tokens_per_second,tps_estimated,ttft_seconds,duration_seconds,complete,ttft_measured
+2026-10-17T03:28:30.366+03:00,POST,/api/v1/chat,200,qwen2.5-coder-0.5b-instruct,32,10,42,271.22,false,0.005,0.054,true,false
+2026-10-17T03:28:30.447+03:00,POST,/v1/chat/completions,200,qwen2.5-coder-0.5b-instruct,32,10,42,234.45,true,0.021,0.043,true,true
 ```
 
 Values that are neither reported nor derived (tokens, TPS, TTFT) are left empty.
 `tps_estimated` is `true` when the TPS was estimated by the proxy (shown as
-`(est.)` in the terminal), and `complete` is `false` for responses that were
-cut off. Only per-query values are saved; the running averages are not.
+`(est.)` in the terminal), `complete` is `false` for responses that were
+cut off, and `ttft_measured` is `true` when the TTFT was measured by the proxy
+(streams, including model loading) rather than reported by the server. The
+`ttft_measured` column was added on 2026-11-19; files started before that
+have one column less in their header, so start a new file. Only per-query values are saved; the running averages are not.
 Method, path and model cells receive a leading apostrophe when they could be
 interpreted as spreadsheet formulas: `=`, `+`, `-`, `@` (including fullwidth
 variants), also behind leading whitespace, controls or Unicode format characters.
@@ -335,9 +342,14 @@ apart. Request and response bodies are never logged.
   about 1000 tokens/s: then the request duration is used as for a
   non-streamed response. LM Studio's
   OpenAI-compatible API (`/v1/...`) never reports TPS, streamed or not.
-- Time to first token is only reported by LM Studio's native API
-  (`/api/v1/...`). Ollama (native and OpenAI-compatible) and LM Studio's
-  OpenAI-compatible API don't report it, so their lines have no `TTFT`.
+- Time to first token for non-streamed responses is only shown when the
+  server reports it, which only LM Studio's native API (`/api/v1/...`) does.
+  For streams the proxy measures it instead, so the value includes model
+  loading and the network to the server, and with LM Studio's native API it
+  differs from the server's own figure. A stream whose generated output is in
+  fields the proxy doesn't know (e.g. LM Studio's native tool call events
+  without text) gets no measured TTFT. A stream held back by something
+  between the server and the proxy is measured as it arrives at the proxy.
 - One upstream over plain HTTP; no HTTPS upstream or API key injection.
 - No client authentication: anyone who can reach the proxy can run queries on
   the server (see [Management requests](#management-requests)). Queries can
