@@ -593,7 +593,7 @@ func TestSSECaptureMultiLineDataAndUnterminatedEvent(t *testing.T) {
 }
 
 // readFixture returns a response captured from a real server in testdata/.
-func readFixture(t *testing.T, name string) []byte {
+func readFixture(t testing.TB, name string) []byte {
 	t.Helper()
 	body, err := os.ReadFile(filepath.Join("testdata", name))
 	if err != nil {

@@ -62,6 +62,39 @@ jobs:
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 
+  # The Test job runs the fuzz seed corpora on every push; actual fuzzing
+  # only runs weekly and on manual runs, briefly per target.
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [FuzzCaptureSplit, FuzzEscapeControls, FuzzCSVText, FuzzHostName, FuzzPathChecks]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+
+      - name: Fuzz
+        run: go test -run '^$' -fuzz='^${{ matrix.target }}$' -fuzztime=30s .
+
+      # A failing input is written to testdata/fuzz/<target>/; commit it so the
+      # Test job keeps checking it.
+      - name: Upload failing input
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: testdata/fuzz/
+          if-no-files-found: ignore
+
   golangci-lint:
     runs-on: ubuntu-latest
     timeout-minutes: 10

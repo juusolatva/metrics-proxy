@@ -368,6 +368,7 @@ gofmt -s -l .
 go mod verify
 go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 run
 go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+go test -run '^$' -fuzz='^FuzzCaptureSplit$' -fuzztime=30s .  # fuzz one target (see fuzz_test.go)
 ```
 
 The parser tests use real responses captured from LM Studio and Ollama in
