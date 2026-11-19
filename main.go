@@ -186,11 +186,12 @@ func main() {
 	proxy = newReverseProxy(target)
 
 	// Setup signal handling for graceful shutdown: stop is done on the first
-	// signal, force on the second.
-	stop, stopNow := context.WithCancel(context.Background())
-	defer stopNow()
+	// signal, force on the second. stop is derived from force, since forcing
+	// implies stopping (not the other way round).
 	force, forceNow := context.WithCancel(context.Background())
 	defer forceNow()
+	stop, stopNow := context.WithCancel(force)
+	defer stopNow()
 	setupSignalHandling(stopNow, forceNow)
 
 	// Bind the port before announcing it or probing the upstream, so a port
@@ -1096,8 +1097,9 @@ func (c *jsonCapture) firstOutput() time.Time { return time.Time{} }
 
 // outputTimer notes when a streamed body's first document carrying generated
 // output (text, reasoning or tool calls) was written to its capture. Captures
-// are written as the proxy forwards the body, so that is when the client
-// received the first token.
+// are written as the proxy reads the body from the upstream, just before it
+// forwards each chunk, so this times the upstream (model loading included),
+// not a slow client's receipt of the token.
 type outputTimer struct {
 	at  time.Time
 	doc int // number of that document among those parsed, from 1
@@ -1312,10 +1314,7 @@ type llmPayload struct {
 	EvalCount       int   `json:"eval_count"`        // Ollama native
 	EvalDuration    int64 `json:"eval_duration"`     // Ollama native, nanoseconds
 	// Generated output, used only to time the first token of a stream.
-	Choices []struct {
-		Delta *outputFields `json:"delta"` // OpenAI chat completions chunk
-		Text  string        `json:"text"`  // OpenAI legacy completions chunk
-	} `json:"choices"`
+	Choices  outputChoices `json:"choices"`  // OpenAI chat and legacy completions chunks
 	Message  *outputFields `json:"message"`  // Ollama native /api/chat
 	Content  string        `json:"content"`  // LM Studio API v1 message.delta, reasoning.delta
 	Delta    string        `json:"delta"`    // OpenAI Responses API *.delta events
@@ -1331,16 +1330,59 @@ type llmPayload struct {
 // outputFields are the fields of an OpenAI chunk's delta or an Ollama
 // message that carry generated output.
 type outputFields struct {
-	Content          string            `json:"content"`
-	ReasoningContent string            `json:"reasoning_content"` // LM Studio, DeepSeek, llama.cpp
-	Reasoning        string            `json:"reasoning"`         // Ollama OpenAI-compatible
-	Thinking         string            `json:"thinking"`          // Ollama native
-	ToolCalls        []json.RawMessage `json:"tool_calls"`
+	Content          string        `json:"content"`
+	ReasoningContent string        `json:"reasoning_content"` // LM Studio, DeepSeek, llama.cpp
+	Reasoning        string        `json:"reasoning"`         // Ollama OpenAI-compatible
+	Thinking         string        `json:"thinking"`          // Ollama native
+	ToolCalls        nonEmptyArray `json:"tool_calls"`
 }
 
 func (f *outputFields) hasOutput() bool {
 	return f != nil && (f.Content != "" || f.ReasoningContent != "" || f.Reasoning != "" ||
-		f.Thinking != "" || len(f.ToolCalls) > 0)
+		f.Thinking != "" || bool(f.ToolCalls))
+}
+
+// nonEmptyArray records whether a JSON value is an array with at least one
+// element, without decoding the elements: a document within maxCaptureBytes
+// can hold millions of them.
+type nonEmptyArray bool
+
+func (a *nonEmptyArray) UnmarshalJSON(b []byte) error {
+	// json.Unmarshal has checked the syntax, so "[" is followed by "]" or a value.
+	b = bytes.TrimSpace(b)
+	*a = len(b) > 1 && b[0] == '[' && bytes.TrimSpace(b[1:])[0] != ']'
+	return nil
+}
+
+// outputChoices records whether one of the first maxOutputChoices elements
+// of an OpenAI "choices" array carries generated output. Elements are decoded
+// one at a time, so neither memory nor work grows with the number of elements
+// a document within maxCaptureBytes can hold (millions). Responses have one
+// choice per requested completion ("n", usually 1). Anything but an array is
+// ignored.
+type outputChoices bool
+
+const maxOutputChoices = 16
+
+func (o *outputChoices) UnmarshalJSON(b []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	if t, err := dec.Token(); err != nil || t != json.Delim('[') {
+		return nil
+	}
+	for i := 0; i < maxOutputChoices && dec.More(); i++ {
+		var c struct {
+			Delta *outputFields `json:"delta"` // chat completions chunk
+			Text  string        `json:"text"`  // legacy completions chunk
+		}
+		// A type error skips only the mismatched field, as in json.Unmarshal.
+		// json.Unmarshal has ruled out syntax errors; one would end More().
+		_ = dec.Decode(&c)
+		if c.Text != "" || c.Delta.hasOutput() {
+			*o = true
+			return nil
+		}
+	}
+	return nil
 }
 
 // hasOutput reports whether p, as a streamed document, carries generated
@@ -1348,14 +1390,9 @@ func (f *outputFields) hasOutput() bool {
 // prompt_processing.* or an OpenAI chunk with only the role, don't. Wrapped
 // payloads are not inspected: they summarize the response at its end.
 func (p *llmPayload) hasOutput() bool {
-	for _, c := range p.Choices {
-		if c.Text != "" || c.Delta.hasOutput() {
-			return true
-		}
-	}
 	// "response" is a string in Ollama's /api/generate, an object (a
 	// wrapper) in Responses API events; `""` is the empty string.
-	return p.Message.hasOutput() || p.Content != "" || p.Delta != "" || p.Thinking != "" ||
+	return bool(p.Choices) || p.Message.hasOutput() || p.Content != "" || p.Delta != "" || p.Thinking != "" ||
 		(len(p.Response) > 2 && p.Response[0] == '"')
 }
 

@@ -2520,6 +2520,16 @@ func TestPayloadHasOutput(t *testing.T) {
 		{`{"choices":[{"delta":{"reasoning":"Hmm"}}]}`, true},
 		{`{"choices":[{"delta":{"tool_calls":[{"index":0}]}}]}`, true},
 		{`{"choices":[{"delta":{"tool_calls":[]}}]}`, false},
+		{`{"choices":[{"delta":{"tool_calls": [ ] }}]}`, false},
+		{`{"choices":[{"delta":{"tool_calls":null}}]}`, false},
+		{`{"choices":[{"delta":{"tool_calls":{"index":0}}}]}`, false},
+		{`{"choices":[{"delta":{}},{"delta":{"content":"Hi"}}]}`, true},
+		{`{"choices":[{"delta":{"content":7}},{"text":"Hi"}]}`, true},
+		{`{"choices":[{"delta":{"content":7,"reasoning":"Hmm"}}]}`, true},
+		{`{"choices":{"delta":{"content":"Hi"}},"model":"m"}`, false},
+		{`{"choices":null}`, false},
+		{`{"choices":[` + strings.Repeat(`{},`, maxOutputChoices-1) + `{"text":"Hi"}]}`, true},
+		{`{"choices":[` + strings.Repeat(`{},`, maxOutputChoices) + `{"text":"Hi"}]}`, false},
 		{`{"choices":[{"text":"Hi"}]}`, true},
 		{`{"choices":[],"usage":{"total_tokens":3}}`, false},
 		{`{"message":{"role":"assistant","content":""},"done":true}`, false},
@@ -2576,7 +2586,10 @@ func TestMeasuredTTFTIncludesModelLoad(t *testing.T) {
 
 	postAndDrain(t, srv.URL+"/api/v1/chat")
 	waitForLog(t, logs, "| Total tokens: ")
-	checkMeasuredTTFT(t, logs.String(), readCSV(t, path), load)
+	// The status line is printed before the CSV row is written.
+	var rows [][]string
+	waitFor(t, "CSV row", func() bool { rows = readCSV(t, path); return len(rows) >= 2 })
+	checkMeasuredTTFT(t, logs.String(), rows, load)
 }
 
 func checkMeasuredTTFT(t *testing.T, logs string, rows [][]string, load time.Duration) {
@@ -2610,4 +2623,28 @@ func TestReportedTTFTKeptForJSON(t *testing.T) {
 	srv, logs := startProxy(t, target)
 	postAndDrain(t, srv.URL+"/api/v1/chat")
 	waitForLog(t, logs, "| TTFT: 0.11s |")
+}
+
+// A choices array of millions of empty elements, within maxCaptureBytes, is
+// not decoded into a slice of that length; only the first maxOutputChoices
+// elements are inspected.
+func TestOutputChoicesBounded(t *testing.T) {
+	const n = 4 << 20
+	doc := []byte(`{"model":"m","choices":[` + strings.Repeat(`{},`, n) + `{"text":"Hi"}]}`)
+	if len(doc) > maxCaptureBytes {
+		t.Fatalf("document of %d bytes exceeds maxCaptureBytes", len(doc))
+	}
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	var d MetricsData
+	ok, output := d.mergeDocument(doc)
+	runtime.ReadMemStats(&after)
+	if !ok || output || d.ModelName != "m" {
+		t.Fatalf("valid %t, output %t, model %q; want the model and no output past maxOutputChoices", ok, output, d.ModelName)
+	}
+	// A []struct{*outputFields; string} of n elements alone would be 96 MiB.
+	if alloc := after.TotalAlloc - before.TotalAlloc; alloc > uint64(len(doc)) {
+		t.Errorf("allocated %d MiB for a %d MiB document", alloc>>20, len(doc)>>20)
+	}
 }

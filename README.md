@@ -112,8 +112,8 @@ controls (e.g. `\u202e`). Other text, including non-ASCII, is printed as is.
 `TPS` is the rate reported by the server. When the server doesn't report one,
 the proxy estimates it and marks it `(est.)`, e.g. `TPS: 40.98 (est.)`. `TTFT`
 (time to first token) is measured by the proxy for streamed responses: the
-time from receiving the request to forwarding the first generated text,
-reasoning or tool call, so it includes loading the model. Non-streamed
+time from receiving the request to receiving the first generated text,
+reasoning or tool call from the server, so it includes loading the model. Non-streamed
 responses show it only when the server reports it (LM Studio's native API,
 whose value covers prompt processing, not loading; see
 [Limitations](#limitations)).
