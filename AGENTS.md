@@ -31,6 +31,7 @@ metrics_proxy/
 ├── LICENSE            # MIT License
 ├── main.go            # Complete application source (proxy, metrics, config)
 ├── main_test.go       # httptest-based tests (proxying, streaming, parsing, concurrency)
+├── fuzz_test.go       # Fuzz targets for the captures, escaping, CSV and Host/path checks
 ├── README.md          # Usage, configuration, limitations and development commands
 ├── CLAUDE.md          # Includes this file (`@AGENTS.md`)
 ├── .gitattributes     # Keeps testdata/ byte-exact (no CRLF conversion)
@@ -49,7 +50,8 @@ metrics_proxy/
     ├── ol_chat.json, ol_chat_stream.ndjson             # Ollama native /api/chat
     ├── ol_generate.json, ol_generate_stream.ndjson     # Ollama native /api/generate
     ├── ol_oai.json, ol_oai_stream.sse                  # Ollama /v1/chat/completions (stream with include_usage)
-    └── ol_oai_stream_nousage.sse                       #   … streamed without include_usage
+    ├── ol_oai_stream_nousage.sse                       #   … streamed without include_usage
+    └── fuzz/                                           # Inputs fuzzing found, replayed as seeds by go test
 ```
 
 The current captures were taken on 2026-10-17. All of them used the prompt `Count from 1 to 5, separated by spaces.`, sent directly to the server (not through the proxy). Only response bodies were saved.
@@ -86,6 +88,8 @@ Parser tests should use the captured payloads in `testdata/` (read with `readFix
 
 Under WSL2 a connection to a closed loopback port can hang instead of being refused. `TestUpstreamUnavailable` and `TestLogEscapesControlCharacters` then take ~30 s each (the transport's connect timeout), and the full suite ~70 s. Tests that wait for a listener to close dial it with a short timeout (`net.DialTimeout`) and count a timeout as closed.
 
+Fuzz targets live in `fuzz_test.go` (added 2026-11-19): `FuzzCaptureSplit` (a body written in arbitrary chunks gives the same `MetricsData` and `captureDiag` as the whole body; seeded from every capture in `testdata/`, also as the wrong kind), `FuzzEscapeControls` (nothing left to escape, clean text unchanged, lossless for input without `\` and `"`, which are kept as is), `FuzzCSVText` (at most a leading apostrophe added, no formula prefix, survives a CSV write and read), `FuzzHostName` (a second pass leaves a well-formed result alone; malformed Host values such as `[:` may change again, which is harmless since `hostName` runs once and browsers only send DNS names and IP literals) and `FuzzPathChecks` (no path that a lenient router, modelled independently by `routerPath`, resolves to a management endpoint passes both `hasDotDotSegment` and `isManagementEndpoint`; ASCII case changes, doubled slashes, `\` separators and `cleanPath` don't change the result). A plain `go test` runs only their seeds and any failing inputs under `testdata/fuzz/<FuzzName>/`; commit such inputs when fixing what they found. To fuzz one target: `go test -run '^$' -fuzz='^FuzzCaptureSplit$' -fuzztime=30s .` (one target per run). CI fuzzes each target for 30 s in the weekly scheduled and manual runs only (the `fuzz` job) and uploads a failing input as an artifact. Huge inputs are out of the fuzzer's reach, so `maxCaptureBytes` limits stay covered by `TestCaptureOversizedInChunks`.
+
 Testing on Windows: see `docs/windows-testing.md`.
 - **Run tests**:
   ```bash
@@ -101,15 +105,9 @@ Coverage (2026-11-19): 92.5% of statements. Security checks (`allowedHost`, `hos
 ### Backlog
 Planned on 2026-10-26, not yet done. Remove an item from this list once it is done.
 1. **`testing/synctest` for timing tests** (Go 1.25): run the shutdown and streaming tests on a fake clock instead of `waitFor` polling and real timeouts. `t.Context()` (1.24) can replace hand-made test contexts where a test needs no cancel of its own.
-2. **Fuzz tests** (`testing.F`, available since Go 1.18). Seed them from `testdata/` and commit failing inputs under `testdata/fuzz/`. Targets and invariants:
-   - Captures: a body split at random points gives the same `MetricsData` and `captureDiag` as the whole body, never panics, and stays within `maxCaptureBytes`. This generalizes `TestCaptureFixtures`' 1-byte chunks.
-   - `escapeControls`: the output contains no control, bidi or U+2028/U+2029 characters, and unescaping it gives back the input (see `TestEscapeControlsLossless`).
-   - `csvText`: writing and reading the cell with `encoding/csv` gives back the value after the protective apostrophe, and the cell never starts with a formula prefix.
-   - `hostName`, `isManagementEndpoint`, `hasDotDotSegment`: applying them twice changes nothing; a management path stays one under case changes, repeated slashes and `\` separators; no path that cleans to a management endpoint passes both checks.
-   - CI: run each target briefly (`go test -run '^$' -fuzz=FuzzX -fuzztime=30s`) in the weekly scheduled run only, not on every push.
-3. **Windows in CI**: a `windows-latest` job running `go test ./...` (without `-race` or the coverage upload). This automates the path, CSV file and refused-connection items of `docs/windows-testing.md`; Ctrl+C handling and Excel stay manual. Possibly `macos-latest` too.
-4. **More captures** in `testdata/`, each added to `TestCaptureFixtures`: OpenAI Responses API (`/v1/responses`, so far only hand-written `response` wrapper tests), error bodies (Ollama `{"error": …}` as JSON and mid-stream), embeddings (`/api/embed`, `/v1/embeddings`: they carry a model and prompt tokens, so they count as queries, as intended; pin that in the test), tool-call and reasoning-model streams, and legacy `/v1/completions`. Record the server versions (LM Studio, Ollama) alongside the capture date in §2. Capturing sends requests to a real server, so ask the user before sending any.
-5. Optional: `BenchmarkSSECapture` (with `b.Loop()`) over `lm_v1_chat_stream.sse` (parsing runs on every streamed chunk, so a slowdown delays tokens), and a one-off mutation-testing run to find assertions that check nothing.
+2. **Windows in CI**: a `windows-latest` job running `go test ./...` (without `-race` or the coverage upload). This automates the path, CSV file and refused-connection items of `docs/windows-testing.md`; Ctrl+C handling and Excel stay manual. Possibly `macos-latest` too.
+3. **More captures** in `testdata/`, each added to `TestCaptureFixtures`: OpenAI Responses API (`/v1/responses`, so far only hand-written `response` wrapper tests), error bodies (Ollama `{"error": …}` as JSON and mid-stream), embeddings (`/api/embed`, `/v1/embeddings`: they carry a model and prompt tokens, so they count as queries, as intended; pin that in the test), tool-call and reasoning-model streams, and legacy `/v1/completions`. Record the server versions (LM Studio, Ollama) alongside the capture date in §2. Capturing sends requests to a real server, so ask the user before sending any.
+4. Optional: `BenchmarkSSECapture` (with `b.Loop()`) over `lm_v1_chat_stream.sse` (parsing runs on every streamed chunk, so a slowdown delays tokens), and a one-off mutation-testing run to find assertions that check nothing.
 
 ### Linting & Formatting
 - **Format code**:
