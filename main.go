@@ -697,6 +697,14 @@ func hasPathTarget(u *url.URL) bool {
 	return u.Opaque == "" && strings.HasPrefix(u.Path, "/")
 }
 
+// redactedTarget returns a request target for logging without user info,
+// query string or fragment, which may carry passwords or keys.
+func redactedTarget(u *url.URL) string {
+	c := *u
+	c.User, c.RawQuery, c.ForceQuery, c.Fragment, c.RawFragment = nil, "", false, "", ""
+	return c.String()
+}
+
 // allowsHost reports whether host (lowercase, without port) matches an
 // allowed_hosts entry.
 func (c Config) allowsHost(host string) bool {
@@ -789,7 +797,7 @@ type requestInfoKey struct{}
 // handleRequest processes incoming requests
 func handleRequest(w http.ResponseWriter, r *http.Request) {
 	if !hasPathTarget(r.URL) {
-		fmt.Fprintf(out, "[Proxy] Rejected %s %s: request target is not a path\n", r.Method, escapeControls(r.RequestURI))
+		fmt.Fprintf(out, "[Proxy] Rejected %s %s: request target is not a path\n", r.Method, escapeControls(redactedTarget(r.URL)))
 		http.Error(w, "Bad Request: request target is not a path", http.StatusBadRequest)
 		return
 	}

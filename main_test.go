@@ -1413,6 +1413,25 @@ func checkNonPathTargetRefused(t *testing.T, forwardManagement, forwardUnmatched
 		t.Errorf("logs missing %q:\n%s", want, logs)
 	}
 
+	// The rejection line is printed without debug, so it leaves out user
+	// info and query strings, which may carry passwords or keys.
+	for _, u := range []*url.URL{
+		{Scheme: "http", User: url.UserPassword("user", "secret-password"), Host: "localhost", RawQuery: "api_key=secret-key"},
+		{Scheme: "a", Opaque: "x:/api/delete", RawQuery: "api_key=secret-key"},
+	} {
+		if status := rawRequest(t, addr, "GET", u.String()); status != http.StatusBadRequest {
+			t.Errorf("GET %s: status = %d, want 400", redactedTarget(u), status)
+		}
+	}
+	for _, want := range []string{"Rejected GET http://localhost: request", "Rejected GET a:x:/api/delete: request"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("logs missing %q:\n%s", want, logs)
+		}
+	}
+	if got := logs.String(); strings.Contains(got, "secret") || strings.Contains(got, "user") {
+		t.Errorf("rejection lines contain user info or a query string:\n%s", got)
+	}
+
 	// An absolute-form target with a path is checked and forwarded as usual.
 	if status := rawRequest(t, addr, "GET", "http://localhost/v1/models"); status != http.StatusOK {
 		t.Errorf("GET http://localhost/v1/models: status = %d, want the upstream's 200", status)
