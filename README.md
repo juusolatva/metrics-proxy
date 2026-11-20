@@ -352,6 +352,9 @@ strings or user names and passwords in request URLs.
   document. Fields already read are kept; deeper or over-budget wrappers are
   ignored. Response forwarding is unaffected. The separate 16 MiB capture
   limit still applies to bodies, lines and assembled events.
+- Numbers the server reports beyond plausible values are ignored, as if not
+  reported: token counts above 2^30 (about a billion), rates above a million
+  tokens per second and times to first token above 24 hours.
 - Streamed OpenAI-compatible responses only include token counts when the
   client sends `"stream_options": {"include_usage": true}`. Without it, the
   query is recorded with model and duration only.

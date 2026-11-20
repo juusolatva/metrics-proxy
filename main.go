@@ -1205,23 +1205,41 @@ func (s *lineSplitter) flush(emit func(line []byte)) {
 }
 
 // endLine emits the current line (which may be empty) and starts a new one.
+// The line is held with one byte to spare for a "\r" before the "\n", so a
+// CRLF line of maxCaptureBytes is not dropped; without the "\r" it must fit.
 func (s *lineSplitter) endLine(emit func(line []byte)) {
-	if !s.skipLine {
-		emit(bytes.TrimSuffix(s.line, []byte("\r")))
+	if line := bytes.TrimSuffix(s.line, []byte("\r")); !s.skipLine && len(line) > maxCaptureBytes {
+		s.oversized++
+	} else if !s.skipLine {
+		emit(line)
 	}
-	s.line, s.skipLine = s.line[:0], false
+	s.line, s.skipLine = reuse(s.line), false
 }
 
 func (s *lineSplitter) appendLine(p []byte) {
 	if s.skipLine {
 		return
 	}
-	if len(s.line)+len(p) > maxCaptureBytes {
-		s.line, s.skipLine = s.line[:0], true
+	if len(s.line)+len(p) > maxCaptureBytes+1 { // +1: room for a "\r"
+		s.line, s.skipLine = nil, true
 		s.oversized++
 		return
 	}
 	s.line = append(s.line, p...)
+}
+
+// reuseLimit is the largest buffer a capture keeps for the next line or
+// event. Larger ones are dropped, so one large event doesn't keep up to
+// maxCaptureBytes allocated for the rest of a long stream.
+const reuseLimit = 64 << 10
+
+// reuse returns b emptied for reuse, or nil if its backing array is larger
+// than reuseLimit.
+func reuse(b []byte) []byte {
+	if cap(b) > reuseLimit {
+		return nil
+	}
+	return b[:0]
 }
 
 // sseCapture parses a text/event-stream body event by event, so memory use
@@ -1251,7 +1269,11 @@ func (c *sseCapture) processLine(line []byte) {
 		// Data lines after the oversized part would be parsed as a fragment.
 	case bytes.HasPrefix(line, []byte("data:")):
 		value := bytes.TrimPrefix(line[len("data:"):], []byte(" "))
-		if len(c.data)+len(value) > maxCaptureBytes {
+		sep := 0 // the "\n" joining this data line to earlier ones
+		if len(c.data) > 0 {
+			sep = 1
+		}
+		if len(c.data)+sep+len(value) > maxCaptureBytes {
 			c.skipEvent()
 			return
 		}
@@ -1282,7 +1304,7 @@ func (c *sseCapture) skipEvent() {
 	if !c.skip {
 		c.d.oversized++
 	}
-	c.data, c.skip = c.data[:0], true
+	c.data, c.skip = nil, true
 }
 
 func (c *sseCapture) dispatch() {
@@ -1291,7 +1313,7 @@ func (c *sseCapture) dispatch() {
 		c.d.count(ok)
 		c.output.note(output, c.d.documents)
 	}
-	c.data, c.skip = c.data[:0], false
+	c.data, c.skip = reuse(c.data), false
 }
 
 func (c *sseCapture) finish() MetricsData {
@@ -1422,11 +1444,23 @@ func (a *nonEmptyArray) UnmarshalJSON(b []byte) error {
 // a document within maxCaptureBytes can hold (millions). Responses have one
 // choice per requested completion ("n", usually 1). Anything but an array is
 // ignored.
-type outputChoices bool
+//
+// Only the first "choices" member of a document is inspected. json.Unmarshal
+// calls UnmarshalJSON for every repeat of a key, and each call started a new
+// decoder with its own allowance, so a document of a million tiny repeated
+// "choices" members within maxCaptureBytes allocated hundreds of MiB. Plain
+// JSON fields keep the last repeat instead; servers don't repeat keys.
+type outputChoices struct {
+	seen, output bool
+}
 
 const maxOutputChoices = 16
 
 func (o *outputChoices) UnmarshalJSON(b []byte) error {
+	if o.seen {
+		return nil
+	}
+	o.seen = true
 	dec := json.NewDecoder(bytes.NewReader(b))
 	if t, err := dec.Token(); err != nil || t != json.Delim('[') {
 		return nil
@@ -1440,7 +1474,7 @@ func (o *outputChoices) UnmarshalJSON(b []byte) error {
 		// json.Unmarshal has ruled out syntax errors; one would end More().
 		_ = dec.Decode(&c)
 		if c.Text != "" || c.Delta.hasOutput() {
-			*o = true
+			o.output = true
 			return nil
 		}
 	}
@@ -1454,7 +1488,7 @@ func (o *outputChoices) UnmarshalJSON(b []byte) error {
 func (p *llmPayload) hasOutput() bool {
 	// "response" is a string in Ollama's /api/generate, an object (a
 	// wrapper) in Responses API events; `""` is the empty string.
-	return bool(p.Choices) || p.Message.hasOutput() || p.Content != "" || p.Delta != "" || p.Thinking != "" ||
+	return p.Choices.output || p.Message.hasOutput() || p.Content != "" || p.Delta != "" || p.Thinking != "" ||
 		(len(p.Response) > 2 && p.Response[0] == '"')
 }
 
@@ -1506,6 +1540,21 @@ func (d *MetricsData) mergeJSONPayload(raw []byte, depth int, remaining *int) (*
 
 // merge applies the metrics in p to d. Fields p reports override those already
 // in d; fields it lacks are left as is. mergeJSONBounded handles wrappers.
+// Limits on numbers from the upstream. Values beyond them are ignored as if
+// they weren't reported: JSON allows integers up to math.MaxInt and floats up
+// to 1.8e308, which overflowed token sums and the TTFT's time.Duration, made
+// the average rate +Inf and printed 300-digit numbers. Real values are far
+// below: context windows hold about a million tokens, and rates are at most
+// thousands of tokens per second.
+const (
+	maxTokenCount      = 1 << 30
+	maxTokensPerSecond = 1e6
+	maxTTFTSeconds     = 24 * 60 * 60
+)
+
+// plausibleTPS reports whether v is a usable tokens-per-second value.
+func plausibleTPS(v float64) bool { return v > 0 && v <= maxTokensPerSecond }
+
 func (d *MetricsData) merge(p *llmPayload) {
 	if p.Model != "" {
 		d.ModelName = p.Model
@@ -1519,30 +1568,32 @@ func (d *MetricsData) merge(p *llmPayload) {
 		setFirstPositive(&d.TotalTokens, u.TotalTokens)
 	}
 	if s := p.Stats; s != nil {
-		if s.TokensPerSecond > 0 {
+		if plausibleTPS(s.TokensPerSecond) {
 			d.TokensPerSecond = s.TokensPerSecond
 		}
-		if ttft := max(s.TimeToFirstToken, s.TimeToFirstTokenSeconds); ttft > 0 {
+		if ttft := max(s.TimeToFirstToken, s.TimeToFirstTokenSeconds); ttft > 0 && ttft <= maxTTFTSeconds {
 			d.TimeToFirstToken = time.Duration(ttft * float64(time.Second))
 		}
 		setFirstPositive(&d.PromptTokens, s.InputTokens)
 		setFirstPositive(&d.CompletionTokens, s.TotalOutputTokens)
 	}
-	if t := p.Timings; t != nil && t.PredictedPerSecond > 0 {
+	if t := p.Timings; t != nil && plausibleTPS(t.PredictedPerSecond) {
 		d.TokensPerSecond = t.PredictedPerSecond
 	}
 	setFirstPositive(&d.PromptTokens, p.PromptEvalCount)
 	setFirstPositive(&d.CompletionTokens, p.EvalCount)
-	if p.EvalCount > 0 && p.EvalDuration > 0 {
-		d.TokensPerSecond = float64(p.EvalCount) / time.Duration(p.EvalDuration).Seconds()
+	if p.EvalCount > 0 && p.EvalCount <= maxTokenCount && p.EvalDuration > 0 {
+		if tps := float64(p.EvalCount) / time.Duration(p.EvalDuration).Seconds(); plausibleTPS(tps) {
+			d.TokensPerSecond = tps
+		}
 	}
 }
 
-// setFirstPositive sets *dst to the first positive value in vals, leaving it
-// unchanged if there is none.
+// setFirstPositive sets *dst to the first value in vals between 1 and
+// maxTokenCount, leaving it unchanged if there is none.
 func setFirstPositive(dst *int, vals ...int) {
 	for _, v := range vals {
-		if v > 0 {
+		if v > 0 && v <= maxTokenCount {
 			*dst = v
 			return
 		}
@@ -1572,10 +1623,11 @@ func (d *MetricsData) completeDerived(streamTime time.Duration) (basis string) {
 		genTime = streamTime
 		basis = "completion tokens / stream time (first to last body byte)"
 	}
-	if genTime <= 0 {
+	tps := float64(d.CompletionTokens) / genTime.Seconds()
+	if genTime <= 0 || !plausibleTPS(tps) {
 		return ""
 	}
-	d.TokensPerSecond = float64(d.CompletionTokens) / genTime.Seconds()
+	d.TokensPerSecond = tps
 	d.TPSEstimated = true
 	return basis
 }
@@ -1791,7 +1843,7 @@ func startsFormula(s string) bool {
 
 func (r *csvRecorder) record(now time.Time, info *requestInfo, status int, data MetricsData, complete bool) error {
 	optInt := func(n int) string {
-		if n == 0 {
+		if n <= 0 {
 			return ""
 		}
 		return strconv.Itoa(n)
@@ -1870,25 +1922,28 @@ func formatMetricsLine(now time.Time, info *requestInfo, status int, data Metric
 // to at most maxLen runes, ending in "..." if it was cut. It cuts between the
 // runes (or invalid bytes) of s, so escapes are kept whole and count with
 // their full length, and invalid bytes are escaped rather than replaced by
-// U+FFFD.
+// U+FFFD. maxLen must be at least 3.
+//
+// It reads s only until it knows the result needs cutting, so the work is
+// bounded by maxLen, not by len(s): every status line shows the model name,
+// which comes from the upstream and may be up to maxCaptureBytes long.
 func escapeTruncated(s string, maxLen int) string {
-	e := escapeControls(s)
-	if utf8.RuneCountInString(e) <= maxLen {
-		return e
-	}
-	b := make([]byte, 0, maxLen)
-	width := 0
+	width := 0 // runes of the escaped s[:i]
+	cut := -1  // bytes of s whose escape fits in maxLen-3 runes, once known
+	var esc [16]byte
 	for i := 0; i < len(s); {
 		n, escape := escapeAt(s, i)
-		unit := []byte(s[i : i+n])
+		w := 1
 		if escape {
-			unit = appendGoEscape(nil, s[i:i+n])
+			w = len(appendGoEscape(esc[:0], s[i:i+n])) // escapes are ASCII
 		}
-		if width += utf8.RuneCount(unit); width > maxLen-3 {
-			break
+		if cut < 0 && width+w > maxLen-3 {
+			cut = i
 		}
-		b = append(b, unit...)
+		if width += w; width > maxLen {
+			return escapeControls(s[:cut]) + "..."
+		}
 		i += n
 	}
-	return string(append(b, "..."...))
+	return escapeControls(s)
 }
