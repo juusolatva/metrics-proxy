@@ -66,6 +66,9 @@ integrity of terminal output and exported CSV data.
 - Host validation must occur before forwarding. With restrictive
   `allowed_hosts`, disallowed names must not reach the upstream. This is a
   DNS rebinding control, not client authentication.
+- Request targets that are not a path (opaque or asterisk form, or an
+  absolute URL without a path) must be rejected before forwarding in every
+  configuration, so the path that is checked is the path the upstream sees.
 - Paths containing decoded `..` segments, including backslash-separated
   segments, must be rejected before forwarding in every configuration.
 - With `forward_management: false`, protected management endpoints and
@@ -81,7 +84,8 @@ integrity of terminal output and exported CSV data.
   or oversized input must not cause a panic or bypass these bounds.
 - Untrusted text must not inject terminal controls or forged log lines.
   CSV text cells must retain formula-injection protection.
-- Metrics and debug logging must not expose request or response bodies.
+- Metrics and debug logging must not expose request or response bodies,
+  query strings, or user information from request URLs.
 
 ## Reportable Findings and Severity Context
 

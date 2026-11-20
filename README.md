@@ -246,6 +246,16 @@ ordinary requests aren't affected:
 [Proxy] Rejected POST /api/blobs/..: ".." segment in path
 ```
 
+Request targets that aren't a path, such as `a:x:/api/delete` or `*`, are
+refused with `400 Bad Request` in every configuration too: the proxy's checks
+look at the path, while the server could read such a target as a management
+endpoint. Clients send a path (or a full URL with a path), so they aren't
+affected:
+
+```
+[Proxy] Rejected DELETE a:x:/api/delete: request target is not a path
+```
+
 Model lists (`/api/tags`, `/api/ps`, `/api/v1/models`, `/v1/models`) and
 model details (`/api/show`) are forwarded as before. Set
 `forward_management: true` to forward management requests too.
@@ -320,7 +330,8 @@ numbers. That is useful when a value is missing or looks wrong:
 
 At startup it also prints the effective configuration and what the backend
 probe found. Lines are tagged `req N` so concurrent requests can be told
-apart. Request and response bodies are never logged.
+apart. Request and response bodies are never logged, and neither are query
+strings or user names and passwords in request URLs.
 
 ## Limitations
 

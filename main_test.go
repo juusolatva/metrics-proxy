@@ -1344,6 +1344,119 @@ func checkDotDotRefused(t *testing.T, forwardManagement, forwardUnmatched bool) 
 	}
 }
 
+func TestHasPathTarget(t *testing.T) {
+	for raw, want := range map[string]bool{
+		"/v1/chat/completions":              true,
+		"/":                                 true,
+		"//api/pull":                        true, // a path; the management check cleans it
+		"http://localhost/v1/models":        true, // absolute form with a path
+		"a:x:/api/delete":                   false,
+		"http:%2F%2Fhost/api/delete":        false,
+		"mailto:someone@example.com":        false,
+		"*":                                 false,
+		"http://localhost":                  false,
+		"http://localhost?q=1":              false,
+		"localhost:11436":                   false, // authority form, as for CONNECT
+		"x:/api/delete":                     true,  // Path "/api/delete", which is what gets checked
+		"http://u:p@localhost/v1/models?q=": true,
+	} {
+		u, err := url.ParseRequestURI(raw)
+		if err != nil {
+			u = &url.URL{Host: raw} // net/http's server reads a CONNECT target this way
+		}
+		if got := hasPathTarget(u); got != want {
+			t.Errorf("hasPathTarget(%q) = %t, want %t", raw, got, want)
+		}
+	}
+}
+
+// Request targets that aren't a path leave URL.Path empty or relative, so
+// the path checks pass while the upstream may route the target to a
+// management endpoint ("a:x:/api/delete" was forwarded as "x:/api/delete",
+// which a Go upstream routes to /api/delete). They are refused in every
+// configuration.
+func TestNonPathTargetNotForwarded(t *testing.T) {
+	for _, tc := range []struct {
+		name                       string
+		forwardManagement, forward bool
+	}{
+		{"default", false, true},
+		{"forward_management", true, true},
+		{"forward_unmatched false", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			checkNonPathTargetRefused(t, tc.forwardManagement, tc.forward)
+		})
+	}
+}
+
+func checkNonPathTargetRefused(t *testing.T, forwardManagement, forwardUnmatched bool) {
+	target, hits := startCountingUpstream(t)
+	srv, logs := startProxy(t, target)
+	cfg.APIEndpoints = []string{"/api/*", "/v1/*"}
+	cfg.ForwardManagement = forwardManagement
+	cfg.ForwardUnmatched = &forwardUnmatched
+	addr := srv.Listener.Addr().String()
+
+	for _, rt := range []string{
+		"a:x:/api/delete", "a:x:/v1/chat/completions", "http:%2F%2Flocalhost/api/delete",
+		"mailto:someone@example.com", "*", "http://localhost",
+	} {
+		if status := rawRequest(t, addr, "DELETE", rt); status != http.StatusBadRequest {
+			t.Errorf("DELETE %s: status = %d, want 400", rt, status)
+		}
+	}
+	if n := hits.Load(); n != 0 {
+		t.Errorf("%d request(s) with a non-path target reached the upstream", n)
+	}
+	if want := "[Proxy] Rejected DELETE a:x:/api/delete: request target is not a path\n"; !strings.Contains(logs.String(), want) {
+		t.Errorf("logs missing %q:\n%s", want, logs)
+	}
+
+	// The rejection line is printed without debug, so it leaves out user
+	// info and query strings, which may carry passwords or keys.
+	for _, u := range []*url.URL{
+		{Scheme: "http", User: url.UserPassword("user", "secret-password"), Host: "localhost", RawQuery: "api_key=secret-key"},
+		{Scheme: "a", Opaque: "x:/api/delete", RawQuery: "api_key=secret-key"},
+	} {
+		if status := rawRequest(t, addr, "GET", u.String()); status != http.StatusBadRequest {
+			t.Errorf("GET %s: status = %d, want 400", redactedTarget(u), status)
+		}
+	}
+	for _, want := range []string{"Rejected GET http://localhost: request", "Rejected GET a:x:/api/delete: request"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("logs missing %q:\n%s", want, logs)
+		}
+	}
+	if got := logs.String(); strings.Contains(got, "secret") || strings.Contains(got, "user") {
+		t.Errorf("rejection lines contain user info or a query string:\n%s", got)
+	}
+
+	// An absolute-form target with a path is checked and forwarded as usual.
+	if status := rawRequest(t, addr, "GET", "http://localhost/v1/models"); status != http.StatusOK {
+		t.Errorf("GET http://localhost/v1/models: status = %d, want the upstream's 200", status)
+	}
+}
+
+// rawRequest sends a request with target written as is, which http.Client
+// can't do for targets that aren't URLs with a path, and returns the status.
+func rawRequest(t *testing.T, addr, method, target string) int {
+	t.Helper()
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	fmt.Fprintf(conn, "%s %s HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", method, target)
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode
+}
+
 // startCountingUpstream starts a fake upstream that counts the requests
 // reaching it. It accepts WebSocket handshakes, as LM Studio's SDK API does,
 // and echoes the first 4 bytes sent over the upgraded connection. Other
@@ -1902,6 +2015,48 @@ func TestDebugLogging(t *testing.T) {
 	}
 }
 
+// Query strings and user info may carry keys or passwords, so debug lines
+// leave them out. The query is still forwarded; user info never was.
+func TestDebugLoggingOmitsQueryAndUserInfo(t *testing.T) {
+	seen := make(chan string, 2)
+	target := startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- r.URL.RawQuery + " auth=" + r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"object":"list","data":[]}`)
+	}))
+	srv, logs := startProxy(t, target)
+	cfg.Logging.Debug = true
+
+	sendRequest(t, "GET", srv.URL+"/v1/models?api_key=secret-in-query")
+	if got, want := <-seen, "api_key=secret-in-query auth="; got != want {
+		t.Errorf("upstream got %q, want %q", got, want)
+	}
+	withUserInfo := &url.URL{Scheme: "http", User: url.UserPassword("user", "secret-password"),
+		Host: "localhost", Path: "/v1/models", RawQuery: "k=secret-2"}
+	status := rawRequest(t, srv.Listener.Addr().String(), "GET", withUserInfo.String())
+	if status != http.StatusOK {
+		t.Fatalf("absolute-form request with user info: status = %d, want 200", status)
+	}
+	if got, want := <-seen, "k=secret-2 auth="; got != want {
+		t.Errorf("upstream got %q, want %q", got, want)
+	}
+	waitFor(t, "both requests logged", func() bool {
+		return strings.Count(logs.String(), "[Proxy] GET /v1/models 200") == 2
+	})
+	got := logs.String()
+	if strings.Contains(got, "secret") || strings.Contains(got, "user") {
+		t.Errorf("debug lines contain a query string or user info:\n%s", got)
+	}
+	for _, want := range []string{
+		"GET /v1/models from 127.0.0.1:",
+		"upstream http://" + target.Host + "/v1/models -> 200 after",
+	} {
+		if strings.Count(got, want) != 2 {
+			t.Errorf("want %q twice in logs:\n%s", want, got)
+		}
+	}
+}
+
 // A stream that ends before EOF may lack usage only because its last events
 // never arrived, so no hint is printed for it.
 func TestDebugNoUsageHintBeforeEOF(t *testing.T) {
@@ -2310,8 +2465,8 @@ func TestLogEscapesControlCharacters(t *testing.T) {
 func testEscapedNotMetered(t *testing.T) {
 	srv, logs := startProxy(t, startUpstream(t, http.NotFoundHandler()))
 	cfg.Logging.Debug = true
-	postAndDrain(t, srv.URL+injectedPath+"?q=\u009b") // raw C1 CSI in the query
-	checkEscapedLogs(t, logs, 3, "[Proxy] POST "+injectedLog+" 404 (", `?q=\u009b from `, " -> 404 after ")
+	postAndDrain(t, srv.URL+injectedPath+"?q=\u009b") // raw C1 CSI in the query, which isn't logged
+	checkEscapedLogs(t, logs, 3, "[Proxy] POST "+injectedLog+" 404 (", "POST "+injectedLog+" from ", injectedLog+" -> 404 after ")
 }
 
 func testEscapedNotForwarded(t *testing.T) {

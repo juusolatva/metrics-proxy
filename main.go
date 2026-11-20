@@ -687,6 +687,24 @@ func refuseManagement(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
+// hasPathTarget reports whether a request's target is a path: the usual
+// origin form ("/v1/chat"), or an absolute URL with a path. Other targets
+// leave URL.Path empty or not starting with "/", so the path checks would
+// pass while the upstream sees something else: an opaque target such as
+// "a:x:/api/delete" is forwarded as "x:/api/delete", which a Go upstream
+// (Ollama) routes to /api/delete. Clients send only paths to a reverse proxy.
+func hasPathTarget(u *url.URL) bool {
+	return u.Opaque == "" && strings.HasPrefix(u.Path, "/")
+}
+
+// redactedTarget returns a request target for logging without user info,
+// query string or fragment, which may carry passwords or keys.
+func redactedTarget(u *url.URL) string {
+	c := *u
+	c.User, c.RawQuery, c.ForceQuery, c.Fragment, c.RawFragment = nil, "", false, "", ""
+	return c.String()
+}
+
 // allowsHost reports whether host (lowercase, without port) matches an
 // allowed_hosts entry.
 func (c Config) allowsHost(host string) bool {
@@ -778,6 +796,11 @@ type requestInfoKey struct{}
 
 // handleRequest processes incoming requests
 func handleRequest(w http.ResponseWriter, r *http.Request) {
+	if !hasPathTarget(r.URL) {
+		fmt.Fprintf(out, "[Proxy] Rejected %s %s: request target is not a path\n", r.Method, escapeControls(redactedTarget(r.URL)))
+		http.Error(w, "Bad Request: request target is not a path", http.StatusBadRequest)
+		return
+	}
 	if host := hostName(r.Host); !allowedHost(host) {
 		fmt.Fprintf(out, "[Proxy] Rejected %s %s: Host %q not allowed (add %q to allowed_hosts if clients use this name)\n",
 			r.Method, escapeControls(r.URL.Path), r.Host, host)
@@ -801,10 +824,11 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 
 	info := &requestInfo{id: requestSeq.Add(1), start: time.Now(), method: r.Method, path: r.URL.Path, metered: metered}
 	// debugf's arguments are evaluated even when it prints nothing; don't
-	// escape a client's (possibly long) request URI unless it is printed.
+	// escape a client's (possibly long) path unless it is printed. The query
+	// string is left out: it may carry keys or other private values.
 	if cfg.Logging.Debug {
 		debugf("req %d: %s %s from %s (metered: %t)",
-			info.id, r.Method, escapeControls(r.URL.RequestURI()), r.RemoteAddr, metered)
+			info.id, r.Method, escapeControls(r.URL.Path), r.RemoteAddr, metered)
 	}
 	ctx := context.WithValue(r.Context(), requestInfoKey{}, info)
 	proxy.ServeHTTP(w, r.WithContext(ctx))
@@ -816,6 +840,10 @@ func newReverseProxy(target *url.URL) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(target)
+			// SetURL keeps user info from an absolute-form request target
+			// ("http://user:pass@host/…"). It isn't sent, but drop it so it
+			// can't reach logs.
+			pr.Out.URL.User = nil
 			pr.SetXForwarded()
 			// Let the transport negotiate compression and decompress
 			// transparently, so the body can be inspected for metrics.
@@ -836,9 +864,10 @@ func meterResponse(resp *http.Response) error {
 		return nil
 	}
 	contentType := resp.Header.Get("Content-Type")
-	if cfg.Logging.Debug { // only escape the URL when it is printed (see handleRequest)
-		debugf("req %d: upstream %s -> %d after %.2fs, Content-Type %q",
-			info.id, escapeControls(resp.Request.URL.String()), resp.StatusCode, time.Since(info.start).Seconds(), contentType)
+	if cfg.Logging.Debug { // only escape the path when it is printed (see handleRequest)
+		u := resp.Request.URL // without the query string, as in handleRequest
+		debugf("req %d: upstream %s://%s%s -> %d after %.2fs, Content-Type %q",
+			info.id, u.Scheme, u.Host, escapeControls(u.Path), resp.StatusCode, time.Since(info.start).Seconds(), contentType)
 	}
 	if !info.metered {
 		// Logged when the headers arrive; the body is passed through as is.
