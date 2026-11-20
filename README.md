@@ -129,6 +129,12 @@ finishes. A header is written when the file is new or empty; existing files
 are appended to, so restarts keep adding to the same file. The header of an
 existing file is not checked; start a new file if the column format changes.
 Requests without inference data (such as `/v1/models`) are not written.
+On Linux and macOS a new file is readable by its owner only (mode `0600`,
+before the umask); on Windows it gets the access rules of its folder. An
+existing file keeps its permissions. If a row can't be written (for example
+while Excel has the file open on Windows), an `[ERROR] writing CSV` line is
+printed and later rows are written again once the file accepts writes. Part
+of a row written before a failure is removed first, so rows aren't merged.
 
 ```csv
 timestamp,method,path,status,model,prompt_tokens,completion_tokens,total_tokens,tokens_per_second,tps_estimated,ttft_seconds,duration_seconds,complete,ttft_measured
@@ -145,8 +151,11 @@ cut off, and `ttft_measured` is `true` when the TTFT was measured by the proxy
 have one column less in their header, so start a new file. Only per-query values are saved; the running averages are not.
 Method, path and model cells receive a leading apostrophe when they could be
 interpreted as spreadsheet formulas: `=`, `+`, `-`, `@` (including fullwidth
-variants), also behind leading whitespace, controls or Unicode format characters.
-Text starting with a control character, or containing invalid UTF-8, is protected
+variants), also behind leading whitespace, controls, Unicode format characters
+or double quotes. The same goes for the text after each `;`, which gets the
+apostrophe right after the `;`: Excel in locales that use `;` as list
+separator (such as Finnish or German) splits cells at semicolons even inside
+quoted CSV fields. Text starting with a control character, or containing invalid UTF-8, is protected
 too. Other values are unchanged. The apostrophe may be visible in some readers;
 CSV quoting still handles commas, quotes and line breaks separately.
 Existing rows are not rewritten: after upgrading, use a new CSV file or import
