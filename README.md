@@ -100,8 +100,10 @@ Each completed query prints a line like this:
 per second over the last `history_points` queries, excluding queries without
 a rate from the TPS average. Requests without inference data (such as
 `/v1/models` or errors) are logged as `[Proxy]` lines and not
-counted. If the upstream can't be reached, the client gets
-`502 Bad Gateway` and the proxy logs an `[ERROR]` line.
+counted. If the upstream can't be reached, or answers with response headers
+larger than 64 KiB or a `Content-Type` longer than 1 KiB, the client gets
+`502 Bad Gateway` and the proxy logs an `[ERROR]` line. Requests to the
+upstream ignore `HTTP_PROXY` and similar environment variables.
 
 Paths, model names and error messages come from clients and the server, so
 characters in them that could control the terminal or start a fake line are

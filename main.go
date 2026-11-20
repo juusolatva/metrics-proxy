@@ -10,7 +10,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"mime"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -387,7 +386,8 @@ func upstreamURL() *url.URL {
 // is unreachable or not recognized.
 func detectBackend(target *url.URL) string {
 	client := &http.Client{
-		Timeout: 2 * time.Second,
+		Transport: upstreamTransport,
+		Timeout:   2 * time.Second,
 		// Probe the configured server only; a redirect shows as its 3xx status.
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
@@ -833,10 +833,36 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	proxy.ServeHTTP(w, r.WithContext(ctx))
 }
 
+// Limits on upstream response headers. Real LLM servers send a few hundred
+// bytes; Go's default allows 10 MiB of headers, and parsing a Content-Type
+// with thousands of MIME parameters allocates a map for each, before the
+// body capture limits apply.
+const (
+	maxResponseHeaderBytes = 64 << 10
+	maxContentTypeBytes    = 1 << 10
+)
+
+// upstreamTransport carries all requests to the upstream: proxied requests
+// and the startup probes. It is http.DefaultTransport except that it
+// ignores HTTP_PROXY and friends (the upstream is a local or LAN server,
+// which an ambient proxy setting would otherwise route elsewhere; Go only
+// exempts localhost), keeps more idle connections to the single upstream
+// (the default keeps 2), and limits response headers.
+var upstreamTransport = newUpstreamTransport()
+
+func newUpstreamTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.Proxy = nil
+	t.MaxIdleConnsPerHost = 16
+	t.MaxResponseHeaderBytes = maxResponseHeaderBytes
+	return t
+}
+
 // newReverseProxy returns a reverse proxy to target that records metrics
 // from response bodies while streaming them to the client.
 func newReverseProxy(target *url.URL) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
+		Transport: upstreamTransport,
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(target)
 			// SetURL keeps user info from an absolute-form request target
@@ -858,11 +884,16 @@ func newReverseProxy(target *url.URL) *httputil.ReverseProxy {
 // meterResponse wraps the upstream response body so metrics are recorded
 // once the body has been streamed to the client.
 func meterResponse(resp *http.Response) error {
+	// Checked first, for unmetered responses too: ReverseProxy parses the
+	// Content-Type with mime.ParseMediaType after this hook returns.
+	contentType := resp.Header.Get("Content-Type")
+	if len(contentType) > maxContentTypeBytes {
+		return fmt.Errorf("upstream Content-Type header too long (%d bytes, limit %d)", len(contentType), maxContentTypeBytes)
+	}
 	info, ok := resp.Request.Context().Value(requestInfoKey{}).(*requestInfo)
 	if !ok {
 		return nil
 	}
-	contentType := resp.Header.Get("Content-Type")
 	if cfg.Logging.Debug { // only escape the path when it is printed (see handleRequest)
 		u := resp.Request.URL // without the query string, as in handleRequest
 		debugf("req %d: upstream %s://%s%s -> %d after %.2fs, Content-Type %q",
@@ -1075,7 +1106,10 @@ func (d *captureDiag) count(ok bool) {
 // newCapture returns a capture for bodies of the given Content-Type, or nil
 // if bodies of that type carry no metrics.
 func newCapture(contentType string) capture {
-	mediaType, _, _ := mime.ParseMediaType(contentType)
+	// Only the media type matters; parameters such as charset are ignored,
+	// so they aren't parsed.
+	mediaType, _, _ := strings.Cut(contentType, ";")
+	mediaType = strings.ToLower(strings.TrimSpace(mediaType))
 	switch {
 	case mediaType == "text/event-stream":
 		return &sseCapture{}

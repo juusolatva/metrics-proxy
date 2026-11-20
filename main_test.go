@@ -2089,6 +2089,103 @@ func TestCSVWriteErrorLogged(t *testing.T) {
 	waitFor(t, "CSV error line", func() bool { return strings.Contains(logs.String(), "[ERROR] writing CSV: ") })
 }
 
+// Only the media type selects a capture, case-insensitively; parameters are
+// ignored without being parsed.
+func TestNewCaptureMediaType(t *testing.T) {
+	for contentType, want := range map[string]string{
+		"application/json":                   "JSON",
+		"Application/JSON; charset=utf-8":    "JSON",
+		"application/problem+json":           "JSON",
+		" text/event-stream ; charset=utf-8": "SSE",
+		"TEXT/EVENT-STREAM":                  "SSE",
+		"application/x-ndjson;x=1":           "NDJSON",
+		"text/plain":                         "",
+		"":                                   "",
+		"application/jsonx":                  "",
+		"application/json garbage":           "",
+	} {
+		got := ""
+		if c := newCapture(contentType); c != nil {
+			c.finish() // the JSON capture names itself when it parses
+			got = c.diag().name
+		}
+		if got != want {
+			t.Errorf("newCapture(%q) = %q, want %q", contentType, got, want)
+		}
+	}
+}
+
+// Upstream requests use their own transport: no HTTP_PROXY (Go only exempts
+// localhost, not LAN upstreams), more idle connections, and a header limit.
+func TestUpstreamTransport(t *testing.T) {
+	startProxy(t, &url.URL{Scheme: "http", Host: "localhost:1"})
+	if proxy.Transport != upstreamTransport {
+		t.Error("reverse proxy doesn't use upstreamTransport")
+	}
+	tr := upstreamTransport
+	if tr.Proxy != nil || tr.MaxIdleConnsPerHost != 16 || tr.MaxResponseHeaderBytes != maxResponseHeaderBytes {
+		t.Errorf("upstreamTransport: Proxy set %t, MaxIdleConnsPerHost %d, MaxResponseHeaderBytes %d",
+			tr.Proxy != nil, tr.MaxIdleConnsPerHost, tr.MaxResponseHeaderBytes)
+	}
+	if tr == http.DefaultTransport {
+		t.Error("upstreamTransport is http.DefaultTransport")
+	}
+}
+
+// bigHeaderUpstream answers like Ollama, with a response header larger than
+// maxResponseHeaderBytes.
+func bigHeaderUpstream(t *testing.T) *url.URL {
+	return startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Big", strings.Repeat("x", maxResponseHeaderBytes+1))
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"version":"0.40.2"}`)
+	}))
+}
+
+// Response headers beyond maxResponseHeaderBytes are refused, for proxied
+// requests and for the startup probe (so detectBackend uses the same
+// transport: http.DefaultTransport allows 10 MiB).
+func TestUpstreamResponseHeaderLimit(t *testing.T) {
+	target := bigHeaderUpstream(t)
+	srv, logs := startProxy(t, target)
+	if resp := sendRequest(t, "GET", srv.URL+"/v1/models"); resp.StatusCode != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502", resp.StatusCode)
+	}
+	waitForLog(t, logs, "[ERROR] GET /v1/models: ")
+	if !strings.Contains(logs.String(), "exceeded") {
+		t.Errorf("want the header limit in the error:\n%s", logs)
+	}
+	if got := detectBackend(target); got != "" {
+		t.Errorf("detectBackend() = %q, want \"\" for headers beyond the limit", got)
+	}
+}
+
+// A Content-Type longer than maxContentTypeBytes is refused before any MIME
+// parsing, also for unmetered paths (ReverseProxy parses it for those too).
+func TestLongContentTypeRefused(t *testing.T) {
+	var contentType atomic.Value
+	target := startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", contentType.Load().(string))
+		io.WriteString(w, chatCompletionJSON)
+	}))
+	srv, logs := startProxy(t, target)
+	atLimit := "application/json; x=" + strings.Repeat("a", maxContentTypeBytes-len("application/json; x="))
+
+	for _, p := range []string{"/v1/chat/completions", "/other"} {
+		contentType.Store(atLimit)
+		if resp := sendRequest(t, "GET", srv.URL+p); resp.StatusCode != http.StatusOK {
+			t.Errorf("GET %s with a %d-byte Content-Type: status = %d, want 200", p, len(atLimit), resp.StatusCode)
+		}
+		contentType.Store(atLimit + "a")
+		if resp := sendRequest(t, "GET", srv.URL+p); resp.StatusCode != http.StatusBadGateway {
+			t.Errorf("GET %s with a longer Content-Type: status = %d, want 502", p, resp.StatusCode)
+		}
+		want := fmt.Sprintf("[ERROR] GET %s: upstream Content-Type header too long (%d bytes, limit %d)\n", p, maxContentTypeBytes+1, maxContentTypeBytes)
+		waitForLog(t, logs, want)
+	}
+	waitForQueries(t, 1) // the metered request within the limit
+}
+
 func TestCaptureDiag(t *testing.T) {
 	tests := []struct {
 		contentType, body string
