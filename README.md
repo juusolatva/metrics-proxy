@@ -129,10 +129,12 @@ finishes. A header is written when the file is new or empty; existing files
 are appended to, so restarts keep adding to the same file. The header of an
 existing file is not checked; start a new file if the column format changes.
 Requests without inference data (such as `/v1/models`) are not written.
-A new file is readable by its owner only; an existing file keeps its
-permissions. If a row can't be written (for example while Excel has the file
-open on Windows), an `[ERROR] writing CSV` line is printed and later rows are
-written again once the file accepts writes.
+On Linux and macOS a new file is readable by its owner only (mode `0600`,
+before the umask); on Windows it gets the access rules of its folder. An
+existing file keeps its permissions. If a row can't be written (for example
+while Excel has the file open on Windows), an `[ERROR] writing CSV` line is
+printed and later rows are written again once the file accepts writes. Part
+of a row written before a failure is removed first, so rows aren't merged.
 
 ```csv
 timestamp,method,path,status,model,prompt_tokens,completion_tokens,total_tokens,tokens_per_second,tps_estimated,ttft_seconds,duration_seconds,complete,ttft_measured

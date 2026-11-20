@@ -111,7 +111,7 @@ func FuzzEscapeControls(f *testing.F) {
 func FuzzCSVText(f *testing.F) {
 	for _, s := range []string{
 		"", "qwen3:4b", "=1+1", "+cmd", "-2", "@SUM(A1)", " \t=x", "\u200b=x", "\x00=x", "＝x", "\xff", "a,b\"c\nd",
-		"/v1;=1", "=a;-b;c", ";", "a;'=1", `a;"=1`, "a;\x00", "a;;b", "'0\xff",
+		"/v1;=1", "=a;-b;c", ";", "a;'=1", `a;"=1`, "a;\x00", "a;;b", "'0\xff", `a; "\t"=1`, `"" =1`,
 	} {
 		f.Add(s)
 	}
@@ -123,7 +123,7 @@ func FuzzCSVText(f *testing.F) {
 		// Excel splits cells at ";" in some locales, so each part counts.
 		for part := range strings.SplitSeq(cell, ";") {
 			trimmed := strings.TrimLeftFunc(part, func(r rune) bool {
-				return unicode.IsSpace(r) || unicode.IsControl(r) || unicode.In(r, unicode.Cf)
+				return r == '"' || unicode.IsSpace(r) || unicode.IsControl(r) || unicode.In(r, unicode.Cf)
 			})
 			if strings.ContainsRune("=+-@＝＋－＠", firstRune(trimmed)) {
 				t.Fatalf("csvText(%q) = %q, part %q starts with a formula prefix", s, cell, part)

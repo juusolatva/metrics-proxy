@@ -1876,42 +1876,137 @@ func TestCSVTextCleanTextNotCopied(t *testing.T) {
 	}
 }
 
-// failingWriter fails its first fails writes, like a file Excel has locked
-// or a full disk, and then works again.
-type failingWriter struct {
+// fakeCSVFile is a csvFile whose next writes fail, like a file Excel has
+// locked or a full disk, and then work again. A failing write stores partial
+// bytes of the row first; truncations fail while truncFails > 0.
+type fakeCSVFile struct {
 	bytes.Buffer
-	fails int
+	fails, partial, truncFails int
 }
 
-func (w *failingWriter) Write(p []byte) (int, error) {
-	if w.fails > 0 {
-		w.fails--
-		return 0, errors.New("disk full")
+func (f *fakeCSVFile) Write(p []byte) (int, error) {
+	if f.fails > 0 {
+		f.fails--
+		n := min(f.partial, len(p))
+		f.Buffer.Write(p[:n])
+		return n, errors.New("disk full")
 	}
-	return w.Buffer.Write(p)
+	return f.Buffer.Write(p)
 }
 
-func (w *failingWriter) Close() error { return nil }
+func (f *fakeCSVFile) Truncate(size int64) error {
+	if f.truncFails > 0 {
+		f.truncFails--
+		return errors.New("file locked")
+	}
+	f.Buffer.Truncate(int(size))
+	return nil
+}
+
+func (f *fakeCSVFile) Stat() (os.FileInfo, error) { return fakeFileInfo(f.Len()), nil }
+func (f *fakeCSVFile) Close() error               { return nil }
+
+// fakeFileInfo is an os.FileInfo that only knows its size.
+type fakeFileInfo int64
+
+func (fi fakeFileInfo) Size() int64     { return int64(fi) }
+func (fakeFileInfo) Name() string       { return "stats.csv" }
+func (fakeFileInfo) Mode() os.FileMode  { return 0o600 }
+func (fakeFileInfo) ModTime() time.Time { return time.Time{} }
+func (fakeFileInfo) IsDir() bool        { return false }
+func (fakeFileInfo) Sys() any           { return nil }
+
+// recordModels records one query per model name and returns each record's
+// error.
+func recordModels(rec *csvRecorder, models ...string) []error {
+	info := &requestInfo{method: "POST", path: "/v1/chat/completions"}
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	var errs []error
+	for _, m := range models {
+		errs = append(errs, rec.record(now, info, 200, MetricsData{ModelName: m}, true))
+	}
+	return errs
+}
+
+// csvModels returns the model column of the rows in f.
+func csvModels(t *testing.T, f *fakeCSVFile) []string {
+	t.Helper()
+	rows, err := csv.NewReader(bytes.NewReader(f.Bytes())).ReadAll()
+	if err != nil {
+		t.Fatalf("reading %q: %v", f.String(), err)
+	}
+	var models []string
+	for _, row := range rows {
+		models = append(models, row[4])
+	}
+	return models
+}
 
 // One failed write must not stop CSV recording: a shared csv.Writer kept the
 // first error, so every later row failed too.
 func TestCSVRecordsAgainAfterWriteError(t *testing.T) {
-	w := &failingWriter{fails: 1}
-	rec := &csvRecorder{f: w}
-	info := &requestInfo{method: "POST", path: "/v1/chat/completions"}
-	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
-	if err := rec.record(now, info, 200, MetricsData{ModelName: "lost"}, true); err == nil {
-		t.Fatal("first record: want the write error")
+	f := &fakeCSVFile{fails: 1}
+	errs := recordModels(&csvRecorder{f: f}, "lost", "kept")
+	if errs[0] == nil || errs[1] != nil {
+		t.Errorf("record errors = %v, want only the first write to fail", errs)
 	}
-	if err := rec.record(now, info, 200, MetricsData{ModelName: "kept"}, true); err != nil {
-		t.Fatalf("record after a failed write = %v, want nil", err)
+	if got := csvModels(t, f); fmt.Sprint(got) != "[kept]" {
+		t.Errorf("models = %q, want only the row written after the error", got)
 	}
-	rows, err := csv.NewReader(&w.Buffer).ReadAll()
+}
+
+// A write that fails after writing part of a row (here inside the quoted
+// model field) must not leave it to swallow the next rows.
+func TestCSVDropsPartlyWrittenRow(t *testing.T) {
+	f := &fakeCSVFile{}
+	rec := &csvRecorder{f: f}
+	recordModels(rec, "first")
+	f.fails, f.partial = 1, 75 // past the opening quote of "lost, partly written"
+	errs := recordModels(rec, "lost, partly written", "kept")
+	if errs[0] == nil || errs[1] != nil {
+		t.Errorf("record errors = %v, want only the partial write to fail", errs)
+	}
+	if got := csvModels(t, f); fmt.Sprint(got) != "[first kept]" {
+		t.Errorf("models = %q, want the partial row removed", got)
+	}
+}
+
+// While the partial row can't be cut off, rows are refused, not merged.
+func TestCSVRefusesRowsUntilPartialRowDropped(t *testing.T) {
+	f := &fakeCSVFile{fails: 1, partial: 10, truncFails: 2}
+	errs := recordModels(&csvRecorder{f: f}, "lost", "refused", "kept")
+	for i, want := range []string{"disk full", "removing a partly written row: file locked"} {
+		if errs[i] == nil || !strings.Contains(errs[i].Error(), want) {
+			t.Errorf("record %d error = %v, want %q", i, errs[i], want)
+		}
+	}
+	if errs[2] != nil {
+		t.Errorf("record 2 error = %v, want nil once truncation works", errs[2])
+	}
+	if got := csvModels(t, f); fmt.Sprint(got) != "[kept]" {
+		t.Errorf("models = %q, want only the row written after truncation worked", got)
+	}
+}
+
+// --csv opens the file as csvLog, announces it and returns its closer.
+func TestSetupCSVLog(t *testing.T) {
+	logs := &syncBuffer{}
+	out, csvLog = logs, nil
+	t.Cleanup(func() { csvLog = nil })
+	path := filepath.Join(t.TempDir(), "stats.csv")
+	closeCSV, err := setupCSVLog(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 1 || rows[0][4] != "kept" {
-		t.Errorf("rows = %q, want only the row written after the error", rows)
+	if csvLog == nil || logs.String() != "Writing statistics to "+path+"\n" {
+		t.Errorf("csvLog = %v, output %q", csvLog, logs)
+	}
+	closeCSV()
+	if !csvLog.closed {
+		t.Error("closer didn't close the CSV file")
+	}
+	if _, err := setupCSVLog(t.TempDir()); err == nil {
+		t.Error("setupCSVLog(directory): want an error")
 	}
 }
 

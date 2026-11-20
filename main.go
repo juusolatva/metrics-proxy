@@ -194,14 +194,12 @@ func main() {
 	// Open the CSV file only once the port is bound, so a port in use
 	// doesn't leave a new file with only a header behind.
 	if opts.csvPath != "" {
-		rec, err := openCSVLog(opts.csvPath)
+		closeCSV, err := setupCSVLog(opts.csvPath)
 		if err != nil {
 			fmt.Printf("Error opening CSV file: %v\n", err)
 			os.Exit(1)
 		}
-		csvLog = rec
-		defer rec.Close()
-		fmt.Printf("Writing statistics to %s\n", opts.csvPath)
+		defer closeCSV()
 	}
 	fmt.Printf("Proxy listening on port %d\n", cfg.ProxyPort)
 	if backend := detectBackend(target); backend != "" {
@@ -1621,9 +1619,29 @@ var csvHeader = []string{
 // csvRecorder appends one row per recorded query to a CSV file. Each row is
 // written with a single Write, so the file is usable while the proxy runs.
 type csvRecorder struct {
-	mu     sync.Mutex
-	f      io.WriteCloser
-	closed bool
+	mu      sync.Mutex
+	f       csvFile
+	closed  bool
+	partial int64 // bytes of a partly written row still at the end of f
+}
+
+// csvFile is the part of *os.File that csvRecorder uses (replaced in tests).
+type csvFile interface {
+	io.WriteCloser
+	Stat() (os.FileInfo, error)
+	Truncate(size int64) error
+}
+
+// setupCSVLog opens path as csvLog, as given by --csv, and announces it.
+// The returned function closes it.
+func setupCSVLog(path string) (func(), error) {
+	rec, err := openCSVLog(path)
+	if err != nil {
+		return nil, err
+	}
+	csvLog = rec
+	fmt.Fprintf(out, "Writing statistics to %s\n", path)
+	return func() { _ = rec.Close() }, nil // close errors at exit have no one to report to
 }
 
 // openCSVLog opens path for appending, creating it if needed. The header is
@@ -1650,13 +1668,42 @@ func openCSVLog(path string) (*csvRecorder, error) {
 // csv.Writer would keep the first write error forever (its bufio.Writer does),
 // so one failed write, e.g. while Excel locks the file on Windows or the disk
 // is briefly full, would stop CSV recording until a restart.
+//
+// A write that fails after writing part of the row (a full disk) leaves an
+// unfinished record, possibly inside a quoted field, that would swallow the
+// next rows. Those bytes are cut off the file before anything else is
+// written; until that succeeds, rows are refused rather than merged.
 func (r *csvRecorder) writeRow(row []string) error {
+	if err := r.dropPartial(); err != nil {
+		return err
+	}
 	var buf bytes.Buffer
 	w := csv.NewWriter(&buf)
 	_ = w.Write(row) // writes to a bytes.Buffer can't fail
 	w.Flush()
-	_, err := r.f.Write(buf.Bytes())
+	n, err := r.f.Write(buf.Bytes())
+	if err != nil && n > 0 {
+		r.partial = int64(n)
+		err = errors.Join(err, r.dropPartial())
+	}
 	return err
+}
+
+// dropPartial truncates the bytes of a partly written row off the end of the
+// file. The file is opened for appending, so they are its last bytes.
+func (r *csvRecorder) dropPartial() error {
+	if r.partial == 0 {
+		return nil
+	}
+	st, err := r.f.Stat()
+	if err == nil {
+		err = r.f.Truncate(st.Size() - r.partial)
+	}
+	if err != nil {
+		return fmt.Errorf("removing a partly written row: %w", err)
+	}
+	r.partial = 0
+	return nil
 }
 
 // csvText keeps upstream/client text from becoming a spreadsheet formula.
