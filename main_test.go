@@ -1763,6 +1763,10 @@ func TestCSVNeutralizesUntrustedText(t *testing.T) {
 		{"\xff=1", "'\xff=1"}, {" \x00@SUM(A1)", "' \x00@SUM(A1)"},
 		{"", ""}, {"plain", "plain"}, {"qwen, \"8b\"", "qwen, \"8b\""}, {"/v1/=model", "/v1/=model"}, {"'literal", "'literal"},
 		{"  qwen-ä-日本-👩‍💻", "  qwen-ä-日本-👩‍💻"},
+		// Excel with ";" as list separator starts a new cell after each ";".
+		{"/v1/x;=1+1", "/v1/x;'=1+1"}, {"=a;-b;c", "'=a;'-b;c"}, {"m; @SUM(A1)", "m;' @SUM(A1)"},
+		{`m;"=1+1`, `m;'"=1+1`}, {"m;\x01x", "m;'\x01x"}, {"m;＝1", "m;'＝1"}, {";=1", ";'=1"},
+		{"a;b;", "a;b;"}, {"m;'=1", "m;'=1"}, {`"=1`, `'"=1`},
 	}
 	for _, tt := range values {
 		info := &requestInfo{method: tt.raw, path: tt.raw}
@@ -1861,6 +1865,86 @@ func TestProxyWritesQueriesToCSV(t *testing.T) {
 	row := rows[1]
 	if row[2] != "/v1/chat/completions" || row[4] != "qwen2.5-7b-instruct" || row[7] != "30" || row[9] != "true" || row[12] != "true" {
 		t.Errorf("unexpected row %q", row)
+	}
+}
+
+// csvText runs on three cells of every recorded query; text without ";"
+// that needs no protection must not be copied.
+func TestCSVTextCleanTextNotCopied(t *testing.T) {
+	if allocs := testing.AllocsPerRun(100, func() { _ = csvText("/v1/chat/completions") }); allocs != 0 {
+		t.Errorf("csvText allocated %v times for text with nothing to protect", allocs)
+	}
+}
+
+// failingWriter fails its first fails writes, like a file Excel has locked
+// or a full disk, and then works again.
+type failingWriter struct {
+	bytes.Buffer
+	fails int
+}
+
+func (w *failingWriter) Write(p []byte) (int, error) {
+	if w.fails > 0 {
+		w.fails--
+		return 0, errors.New("disk full")
+	}
+	return w.Buffer.Write(p)
+}
+
+func (w *failingWriter) Close() error { return nil }
+
+// One failed write must not stop CSV recording: a shared csv.Writer kept the
+// first error, so every later row failed too.
+func TestCSVRecordsAgainAfterWriteError(t *testing.T) {
+	w := &failingWriter{fails: 1}
+	rec := &csvRecorder{f: w}
+	info := &requestInfo{method: "POST", path: "/v1/chat/completions"}
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	if err := rec.record(now, info, 200, MetricsData{ModelName: "lost"}, true); err == nil {
+		t.Fatal("first record: want the write error")
+	}
+	if err := rec.record(now, info, 200, MetricsData{ModelName: "kept"}, true); err != nil {
+		t.Fatalf("record after a failed write = %v, want nil", err)
+	}
+	rows, err := csv.NewReader(&w.Buffer).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0][4] != "kept" {
+		t.Errorf("rows = %q, want only the row written after the error", rows)
+	}
+}
+
+// New CSV files are readable by their owner only; an existing file keeps
+// its mode.
+func TestCSVLogFileMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows has no POSIX file modes")
+	}
+	dir := t.TempDir()
+	newPath := filepath.Join(dir, "new.csv")
+	rec, err := openCSVLog(newPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec.Close()
+	if st, err := os.Stat(newPath); err != nil || st.Mode().Perm()&0o077 != 0 {
+		t.Errorf("new CSV file: mode %v, err %v; want no group or other access", st.Mode().Perm(), err)
+	}
+
+	oldPath := filepath.Join(dir, "old.csv")
+	if err := os.WriteFile(oldPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(oldPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if rec, err = openCSVLog(oldPath); err != nil {
+		t.Fatal(err)
+	}
+	rec.Close()
+	if st, err := os.Stat(oldPath); err != nil || st.Mode().Perm() != 0o644 {
+		t.Errorf("existing CSV file: mode %v, err %v; want 0644 kept", st.Mode().Perm(), err)
 	}
 }
 

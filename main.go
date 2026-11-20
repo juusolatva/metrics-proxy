@@ -171,17 +171,6 @@ func main() {
 	debugf("config: proxy_port=%d upstream=%s:%d api_endpoints=%q forward_unmatched=%t forward_management=%t allowed_hosts=%q history_points=%d",
 		cfg.ProxyPort, cfg.Server.Host, cfg.Server.Port, cfg.APIEndpoints, cfg.forwardsUnmatched(), cfg.ForwardManagement, cfg.AllowedHosts, cfg.Metrics.HistoryPoints)
 
-	if opts.csvPath != "" {
-		rec, err := openCSVLog(opts.csvPath)
-		if err != nil {
-			fmt.Printf("Error opening CSV file: %v\n", err)
-			os.Exit(1)
-		}
-		csvLog = rec
-		defer rec.Close()
-		fmt.Printf("Writing statistics to %s\n", opts.csvPath)
-	}
-
 	target := upstreamURL()
 	proxy = newReverseProxy(target)
 
@@ -201,6 +190,18 @@ func main() {
 	if err != nil {
 		fmt.Printf("Error starting proxy: %v\n", err)
 		os.Exit(1)
+	}
+	// Open the CSV file only once the port is bound, so a port in use
+	// doesn't leave a new file with only a header behind.
+	if opts.csvPath != "" {
+		rec, err := openCSVLog(opts.csvPath)
+		if err != nil {
+			fmt.Printf("Error opening CSV file: %v\n", err)
+			os.Exit(1)
+		}
+		csvLog = rec
+		defer rec.Close()
+		fmt.Printf("Writing statistics to %s\n", opts.csvPath)
 	}
 	fmt.Printf("Proxy listening on port %d\n", cfg.ProxyPort)
 	if backend := detectBackend(target); backend != "" {
@@ -1617,27 +1618,27 @@ var csvHeader = []string{
 	"ttft_measured",
 }
 
-// csvRecorder appends one row per recorded query to a CSV file. Rows are
-// flushed as they are written, so the file is usable while the proxy runs.
+// csvRecorder appends one row per recorded query to a CSV file. Each row is
+// written with a single Write, so the file is usable while the proxy runs.
 type csvRecorder struct {
 	mu     sync.Mutex
-	f      *os.File
-	w      *csv.Writer
+	f      io.WriteCloser
 	closed bool
 }
 
 // openCSVLog opens path for appending, creating it if needed. The header is
 // written only when the file is empty, so restarts keep adding to one file.
+//
+// A new file is readable by its owner only (0600 before the umask): rows show
+// what was queried and when. The mode of an existing file is left alone.
 func openCSVLog(path string) (*csvRecorder, error) {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, err
 	}
-	r := &csvRecorder{f: f, w: csv.NewWriter(f)}
+	r := &csvRecorder{f: f}
 	if st, err := f.Stat(); err != nil || st.Size() == 0 {
-		_ = r.w.Write(csvHeader) // write errors are sticky; checked via r.w.Error()
-		r.w.Flush()
-		if err := r.w.Error(); err != nil {
+		if err := r.writeRow(csvHeader); err != nil {
 			f.Close()
 			return nil, err
 		}
@@ -1645,24 +1646,66 @@ func openCSVLog(path string) (*csvRecorder, error) {
 	return r, nil
 }
 
+// writeRow encodes row as CSV and writes it with a single Write. A shared
+// csv.Writer would keep the first write error forever (its bufio.Writer does),
+// so one failed write, e.g. while Excel locks the file on Windows or the disk
+// is briefly full, would stop CSV recording until a restart.
+func (r *csvRecorder) writeRow(row []string) error {
+	var buf bytes.Buffer
+	w := csv.NewWriter(&buf)
+	_ = w.Write(row) // writes to a bytes.Buffer can't fail
+	w.Flush()
+	_, err := r.f.Write(buf.Bytes())
+	return err
+}
+
 // csvText keeps upstream/client text from becoming a spreadsheet formula.
 // Inspect past leading whitespace, controls and format characters, but retain
 // the original value after the protective apostrophe. CSV quoting alone only
 // protects field boundaries, not spreadsheet interpretation.
+//
+// The same check runs after every ";" in s: Excel in locales whose list
+// separator is ";" (Finnish, German, …) splits the comma-separated file at
+// semicolons and ignores the quoting, so the text after one starts a new
+// cell. Such a part gets an apostrophe after the ";" when it would start a
+// formula. Text without ";" is returned without copying when it needs none.
 func csvText(s string) string {
-	first, _ := utf8.DecodeRuneInString(s)
-	if unicode.IsControl(first) || !utf8.ValidString(s) {
-		return "'" + s
+	if !utf8.ValidString(s) || startsFormula(s) {
+		s = "'" + s
+	}
+	if !strings.Contains(s, ";") {
+		return s
+	}
+	var b strings.Builder
+	for i, part := range strings.Split(s, ";") {
+		if i > 0 {
+			b.WriteByte(';')
+			if startsFormula(part) {
+				b.WriteByte('\'')
+			}
+		}
+		b.WriteString(part)
+	}
+	return b.String()
+}
+
+// startsFormula reports whether a spreadsheet could read s as a formula: s
+// starts with a control character, or with a formula prefix after leading
+// whitespace, controls, format characters and double quotes (Excel reads a
+// quoted cell "=…" as a formula too).
+func startsFormula(s string) bool {
+	if first, _ := utf8.DecodeRuneInString(s); unicode.IsControl(first) {
+		return true
 	}
 	trimmed := strings.TrimLeftFunc(s, func(r rune) bool {
-		return unicode.IsSpace(r) || unicode.IsControl(r) || unicode.In(r, unicode.Cf)
+		return r == '"' || unicode.IsSpace(r) || unicode.IsControl(r) || unicode.In(r, unicode.Cf)
 	})
-	first, _ = utf8.DecodeRuneInString(trimmed)
+	first, _ := utf8.DecodeRuneInString(trimmed)
 	switch first {
 	case '=', '+', '-', '@', '＝', '＋', '－', '＠':
-		return "'" + s
+		return true
 	}
-	return s
+	return false
 }
 
 func (r *csvRecorder) record(now time.Time, info *requestInfo, status int, data MetricsData, complete bool) error {
@@ -1692,9 +1735,7 @@ func (r *csvRecorder) record(now time.Time, info *requestInfo, status int, data 
 	if r.closed {
 		return nil // a request cut off by shutdown finished after Close
 	}
-	_ = r.w.Write(row) // write errors are sticky; returned by r.w.Error()
-	r.w.Flush()
-	return r.w.Error()
+	return r.writeRow(row)
 }
 
 func (r *csvRecorder) Close() error {
@@ -1704,8 +1745,7 @@ func (r *csvRecorder) Close() error {
 		return nil
 	}
 	r.closed = true
-	r.w.Flush()
-	return errors.Join(r.w.Error(), r.f.Close())
+	return r.f.Close()
 }
 
 func formatMetricsLine(now time.Time, info *requestInfo, status int, data MetricsData, snap metricsSnapshot, complete bool) string {

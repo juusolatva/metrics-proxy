@@ -111,19 +111,23 @@ func FuzzEscapeControls(f *testing.F) {
 func FuzzCSVText(f *testing.F) {
 	for _, s := range []string{
 		"", "qwen3:4b", "=1+1", "+cmd", "-2", "@SUM(A1)", " \t=x", "\u200b=x", "\x00=x", "＝x", "\xff", "a,b\"c\nd",
+		"/v1;=1", "=a;-b;c", ";", "a;'=1", `a;"=1`, "a;\x00", "a;;b", "'0\xff",
 	} {
 		f.Add(s)
 	}
 	f.Fuzz(func(t *testing.T, s string) {
 		cell := csvText(s)
-		if cell != s && cell != "'"+s {
-			t.Fatalf("csvText(%q) = %q, want the value with at most a leading apostrophe", s, cell)
+		if !onlyGuardsAdded(s, cell) {
+			t.Fatalf("csvText(%q) = %q, want the value with apostrophes added only at the start and after \";\"", s, cell)
 		}
-		trimmed := strings.TrimLeftFunc(cell, func(r rune) bool {
-			return unicode.IsSpace(r) || unicode.IsControl(r) || unicode.In(r, unicode.Cf)
-		})
-		if strings.ContainsRune("=+-@＝＋－＠", firstRune(trimmed)) {
-			t.Fatalf("csvText(%q) = %q, starts with a formula prefix", s, cell)
+		// Excel splits cells at ";" in some locales, so each part counts.
+		for part := range strings.SplitSeq(cell, ";") {
+			trimmed := strings.TrimLeftFunc(part, func(r rune) bool {
+				return unicode.IsSpace(r) || unicode.IsControl(r) || unicode.In(r, unicode.Cf)
+			})
+			if strings.ContainsRune("=+-@＝＋－＠", firstRune(trimmed)) {
+				t.Fatalf("csvText(%q) = %q, part %q starts with a formula prefix", s, cell, part)
+			}
 		}
 
 		var buf bytes.Buffer
@@ -140,6 +144,27 @@ func FuzzCSVText(f *testing.F) {
 			t.Fatalf("csvText(%q) = %q, reads back from CSV as %q", s, cell, rec)
 		}
 	})
+}
+
+// onlyGuardsAdded reports whether cell is s with apostrophes inserted at
+// the start or right after a ";", and nothing else changed. An apostrophe at
+// such a place may be inserted or s's own, so both readings are tried; a
+// wrong one fails within a character or two.
+func onlyGuardsAdded(s, cell string) bool {
+	return guardsMatch(s, cell, true)
+}
+
+// guardsMatch is onlyGuardsAdded for the rest of s and cell; partStart says
+// whether cell is at the start of a part (the start of the value or just
+// after a ";").
+func guardsMatch(s, cell string, partStart bool) bool {
+	if cell == "" {
+		return s == ""
+	}
+	if partStart && cell[0] == '\'' && guardsMatch(s, cell[1:], false) {
+		return true
+	}
+	return s != "" && cell[0] == s[0] && guardsMatch(s[1:], cell[1:], cell[0] == ';')
 }
 
 // firstRune returns the first rune of s, or -1 if s is empty.

@@ -44,15 +44,19 @@ If there is only time for one pass, these steps cover the likely problems
   remains text. Existing CSV rows are not rewritten; use a new file after
   upgrading or import old text columns explicitly as text.
 - [ ] **Open `stats.csv` in Excel while the proxy is running:** Excel locks
-  the file, so new rows may fail with `[ERROR] writing CSV`. Check whether
-  rows are written again after Excel is closed.
+  the file, so new rows may fail with `[ERROR] writing CSV`. Check that
+  rows are written again after Excel is closed (rows from while it was open
+  are lost).
 - [ ] **Start the proxy while Excel has the file open:** startup will
   probably fail with "file in use".
 - [ ] **Separators:** in locales that use a comma as the decimal separator
   (e.g. Finnish), Excel expects `;` between columns. The file may then open
   as a single column, and values like `48.12` may not be read as numbers.
   Data → From Text/CSV lets you choose the separator. If this is a problem,
-  the fix would be a `--csv-separator` option or a semicolon mode.
+  the fix would be a `--csv-separator` option or a semicolon mode. Opened
+  directly, Excel splits cells at `;` even inside quoted fields: check that a
+  path or model with `;=1+1` shows `'=1+1` as text in its own cell, not a
+  formula.
 
 ## 3. Paths for `--config` and `--csv`
 
