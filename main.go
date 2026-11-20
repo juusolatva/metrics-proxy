@@ -126,9 +126,14 @@ const (
 	maxPayloadParseBytes = 2 * maxCaptureBytes
 )
 
-// A streamed body's first-to-last-byte time is used as generation time only
-// if the body arrived in bursts: at least minStreamWaits pauses of streamGap
-// or more between reads. A buffered body (short, or held back on the way) is
+// A streamed body's stream time is used as generation time only if the body
+// arrived in bursts: at least minStreamWaits pauses of streamGap or more
+// between reads. Stream time runs from the first generated output (see
+// capture.firstOutput) to the last byte, and only pauses after that output
+// count; for a stream whose output fields aren't recognized, it runs from
+// the first byte. Events before the output, such as a role-only chunk,
+// response.created or keep-alive comments during model loading, would
+// otherwise add loading and prompt processing to the generation time. A buffered body (short, or held back on the way) is
 // read back to back from the transport's buffer, so the time between its
 // reads measures only the proxy. Generation at over 1000 tokens/s has
 // shorter pauses and falls back to the request duration too.
@@ -1005,6 +1010,8 @@ type meteredBody struct {
 	firstByte time.Time // when the first body bytes were read
 	lastByte  time.Time // when the last body bytes were read
 	waits     int       // pauses of streamGap or more between reads with data
+	output    time.Time // capture.firstOutput, noted in the read that found it
+	outWaits  int       // waits in reads after the one with the first output
 	bytes     int64
 	eof       bool
 	once      sync.Once
@@ -1015,14 +1022,21 @@ func (b *meteredBody) Read(p []byte) (int, error) {
 	if n > 0 {
 		b.bytes += int64(n)
 		now := time.Now()
+		paused := !b.firstByte.IsZero() && now.Sub(b.lastByte) >= streamGap
 		if b.firstByte.IsZero() {
 			b.firstByte = now
-		} else if now.Sub(b.lastByte) >= streamGap {
+		} else if paused {
 			b.waits++
 		}
 		b.lastByte = now
+		if paused && !b.output.IsZero() {
+			b.outWaits++
+		}
 		if b.capture != nil {
 			_, _ = b.capture.Write(p[:n]) // captures never fail; parse problems show in diag()
+			if b.output.IsZero() {
+				b.output = b.capture.firstOutput()
+			}
 		}
 	}
 	if err == io.EOF {
@@ -1040,6 +1054,23 @@ func (b *meteredBody) Close() error {
 	return err
 }
 
+// streamTime returns the generation time of a streamed body (see streamGap):
+// from the first output, or the first byte if no output was recognized, to
+// the last byte. It is 0 for a body that arrived at once, so completeDerived
+// falls back to the request duration.
+func (b *meteredBody) streamTime() time.Duration {
+	if !b.output.IsZero() {
+		if b.outWaits < minStreamWaits {
+			return 0
+		}
+		return b.lastByte.Sub(b.output)
+	}
+	if b.waits < minStreamWaits {
+		return 0
+	}
+	return b.lastByte.Sub(b.firstByte)
+}
+
 func (b *meteredBody) finish() {
 	b.once.Do(func() {
 		end := time.Now()
@@ -1051,11 +1082,7 @@ func (b *meteredBody) finish() {
 		}
 		switch b.capture.(type) {
 		case *sseCapture, *ndjsonCapture:
-			// Left 0 for a body that arrived at once (see streamGap), so
-			// completeDerived falls back to the request duration.
-			if b.waits >= minStreamWaits {
-				streamTime = b.lastByte.Sub(b.firstByte)
-			}
+			streamTime = b.streamTime()
 		}
 		data.Duration = end.Sub(b.info.start)
 		// TPS is estimated with the upstream's TTFT, before it is replaced:
@@ -1083,7 +1110,11 @@ func (b *meteredBody) debugSummary(data MetricsData, streamTime time.Duration, b
 		ended = "before EOF (client disconnected or shutdown)"
 	}
 	if streamTime > 0 {
-		ended += fmt.Sprintf(", stream time %.2fs", streamTime.Seconds())
+		from := "first byte"
+		if !b.output.IsZero() {
+			from = "first output"
+		}
+		ended += fmt.Sprintf(", stream time %.2fs from the %s", streamTime.Seconds(), from)
 	}
 	debugf("req %d: body ended %s after %d bytes", id, ended, b.bytes)
 	if b.capture == nil {
@@ -1687,7 +1718,7 @@ func (d *MetricsData) completeDerived(streamTime time.Duration) (basis string) {
 		basis = "completion tokens / (request duration - time to first token)"
 	} else if streamTime > 0 {
 		genTime = streamTime
-		basis = "completion tokens / stream time (first to last body byte)"
+		basis = "completion tokens / stream time (see body ended)"
 	}
 	if genTime <= 0 {
 		return ""

@@ -2589,10 +2589,16 @@ func TestStreamTimeNeedsPausesBetweenReads(t *testing.T) {
 		{"one read", []string{streamFirst + streamRest}, "completion tokens / request duration"},
 		{"several reads at once", []string{pad + streamFirst + pad + streamRest}, "completion tokens / request duration"},
 		{"paused stream", []string{streamFirst, streamFirst, streamRest}, "completion tokens / stream time"},
+		// Output in fields hasOutput doesn't know: timed from the first byte.
+		{"paused stream, output not recognized", []string{unknownOutput, unknownOutput, streamRest}, "completion tokens / stream time"},
 	} {
 		t.Run(tt.name, func(t *testing.T) { checkStreamTimeBasis(t, tt.chunks, tt.basis) })
 	}
 }
+
+// unknownOutput is a streamed document whose output field hasOutput doesn't
+// know, like LM Studio's tool_call.* events.
+const unknownOutput = "data: {\"model\":\"m\",\"type\":\"tool_call.arguments\",\"arguments\":\"{}\"}\n\n"
 
 func checkStreamTimeBasis(t *testing.T, chunks []string, basis string) {
 	const delay = 50 * time.Millisecond
@@ -2620,6 +2626,64 @@ func checkStreamTimeBasis(t *testing.T, chunks []string, basis string) {
 	// 2 completion tokens over at least 40 ms of pauses or delay: at most 50 tok/s.
 	if metrics.TokensPerSecond <= 0 || metrics.TokensPerSecond > 50 {
 		t.Errorf("TokensPerSecond = %v, want a plausible estimate (at most 50)", metrics.TokensPerSecond)
+	}
+}
+
+// Events before the first output (a role-only chunk here, sent before model
+// loading) don't count towards stream time: it runs from the first output,
+// and only pauses after it count.
+func TestStreamTimeFromFirstOutput(t *testing.T) {
+	const preamble = "data: {\"model\":\"m\",\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n"
+	const load = 500 * time.Millisecond
+	const done = "data: {\"model\":\"m\",\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":10}}\n\ndata: [DONE]\n\n"
+	for _, tt := range []struct {
+		name   string
+		chunks []string // the first is followed by the load pause, the others by short pauses
+		basis  string
+		minTPS float64 // the rate over the load pause alone: 10 tokens / 0.5 s
+	}{
+		{"paused after the output", []string{preamble, streamFirst, streamFirst, done}, "stream time", 10 / load.Seconds()},
+		// The two pauses are both before the output. They used to count, so
+		// the stream was timed from its first byte, load included.
+		{"output arrives at once", []string{preamble, preamble, streamFirst + streamFirst + done}, "request duration", 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			checkStreamTimeFromOutput(t, tt.chunks, load, tt.basis, tt.minTPS)
+		})
+	}
+}
+
+func checkStreamTimeFromOutput(t *testing.T, chunks []string, load time.Duration, basis string, minTPS float64) {
+	target := startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		for i, c := range chunks {
+			switch i {
+			case 0:
+			case 1:
+				time.Sleep(load)
+			default:
+				time.Sleep(20 * streamGap)
+			}
+			io.WriteString(w, c)
+			w.(http.Flusher).Flush()
+		}
+	}))
+	srv, logs := startProxy(t, target)
+	cfg.Logging.Debug = true
+	postAndDrain(t, srv.URL+"/v1/chat/completions")
+	waitForLog(t, logs, "| Total tokens: ")
+
+	got := logs.String()
+	if !strings.Contains(got, "estimated as completion tokens / "+basis) {
+		t.Errorf("want TPS estimated from the %s:\n%s", basis, got)
+	}
+	if basis == "stream time" && !strings.Contains(got, "from the first output") {
+		t.Errorf("want the stream time measured from the first output:\n%s", got)
+	}
+	metrics.mu.RLock()
+	defer metrics.mu.RUnlock()
+	if tps := metrics.TokensPerSecond; tps <= minTPS || tps > 10/(40*time.Millisecond).Seconds() {
+		t.Errorf("TokensPerSecond = %v, want above %v (the load excluded) and at most 250 (2 pauses of 20 ms)", tps, minTPS)
 	}
 }
 
