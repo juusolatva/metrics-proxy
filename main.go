@@ -450,13 +450,11 @@ func detectBackend(ctx context.Context, target *url.URL) string {
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 	get := func(path string) (map[string]json.RawMessage, error) {
-		// NewRequestWithContext can't fail for a fixed method and a URL from
-		// JoinPath; its error is handled with the request's.
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.JoinPath(path).String(), nil)
-		var resp *http.Response
-		if err == nil {
-			resp, err = client.Do(req)
+		if err != nil {
+			return nil, err // can't happen: a fixed method and a URL from JoinPath
 		}
+		resp, err := client.Do(req)
 		if err != nil {
 			return nil, err
 		}

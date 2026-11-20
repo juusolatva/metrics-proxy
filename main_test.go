@@ -251,19 +251,22 @@ func TestParseConfigValidates(t *testing.T) {
 // Ctrl+C during the startup probes ends them at once instead of after their
 // 2 s timeouts, and no further probe is sent.
 func TestDetectBackendCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
 	var hits atomic.Int32
+	var canceledAt atomic.Int64 // UnixNano when the first probe arrived and ctx was canceled
 	target := startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits.Add(1)
+		if hits.Add(1) == 1 {
+			canceledAt.Store(time.Now().UnixNano())
+			cancel() // Ctrl+C while the first probe waits
+		}
 		<-r.Context().Done() // a server that never answers
 	}))
-	ctx, cancel := context.WithCancel(t.Context())
-	time.AfterFunc(50*time.Millisecond, cancel)
-	start := time.Now()
 	if got := detectBackend(ctx, target); got != "" {
 		t.Errorf("detectBackend() = %q, want \"\"", got)
 	}
-	if took := time.Since(start); took > time.Second {
-		t.Errorf("detectBackend took %v after cancel, want it to stop at once", took)
+	if took := time.Since(time.Unix(0, canceledAt.Load())); took > time.Second {
+		t.Errorf("detectBackend returned %v after cancel, want it to stop at once", took)
 	}
 	if n := hits.Load(); n != 1 {
 		t.Errorf("%d probes sent, want 1", n)

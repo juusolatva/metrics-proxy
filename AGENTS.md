@@ -100,7 +100,7 @@ Testing on Windows: see `docs/windows-testing.md`.
   go test -race -v ./...
   ```
 
-Coverage (2026-11-20): 93.9% of statements. Security checks (`hasPathTarget`, `allowedHost`, `hostName`, `hasDotDotSegment`, `cleanPath`, `isManagementEndpoint`, `offersUpgrade`, `refuseManagement`, `escapeControls`, `csvText`, `startsFormula`) and the payload captures and parsers (including `hasOutput`, `outputChoices`, `nonEmptyArray` and the `outputTimer`) are at 100%; keep them there. `TestCaptureFirstOutput` pins which capture document counts as the first output. Deliberately uncovered: `main()`, `setupSignalHandling` (real signals would interfere with other tests), and the defensive no-`requestInfo` branch in `meterResponse`; one branch of `decodeConfig` is uncovered too.
+Coverage (2026-11-20): 93.8% of statements. Security checks (`hasPathTarget`, `allowedHost`, `hostName`, `hasDotDotSegment`, `cleanPath`, `isManagementEndpoint`, `offersUpgrade`, `refuseManagement`, `escapeControls`, `csvText`, `startsFormula`) and the payload captures and parsers (including `hasOutput`, `outputChoices`, `nonEmptyArray` and the `outputTimer`) are at 100%; keep them there. `TestCaptureFirstOutput` pins which capture document counts as the first output. Deliberately uncovered: `main()`, `setupSignalHandling` (real signals would interfere with other tests), and the defensive no-`requestInfo` branch in `meterResponse`; one branch of `decodeConfig` is uncovered too.
 
 ### Backlog
 Planned on 2026-10-26, not yet done. Remove an item from this list once it is done.
