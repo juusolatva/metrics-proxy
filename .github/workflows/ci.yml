@@ -11,9 +11,13 @@ on:
 permissions:
   contents: read
 
+# Superseded pull request runs are canceled. Runs on main are not: a push
+# would otherwise cancel the weekly fuzz and govulncheck run, or the previous
+# push's SonarQube scan. The event name keeps scheduled and manual runs out
+# of the push group.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
@@ -92,7 +96,7 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fuzz-${{ matrix.target }}
-          path: testdata/fuzz/
+          path: testdata/fuzz/${{ matrix.target }}/
           if-no-files-found: ignore
 
   golangci-lint:

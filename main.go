@@ -127,16 +127,18 @@ const (
 )
 
 // A streamed body's stream time is used as generation time only if the body
-// arrived in bursts: at least minStreamWaits pauses of streamGap or more
-// between reads. Stream time runs from the first generated output (see
-// capture.firstOutput) to the last byte, and only pauses after that output
-// count; for a stream whose output fields aren't recognized, it runs from
-// the first byte. Events before the output, such as a role-only chunk,
-// response.created or keep-alive comments during model loading, would
-// otherwise add loading and prompt processing to the generation time. A buffered body (short, or held back on the way) is
-// read back to back from the transport's buffer, so the time between its
-// reads measures only the proxy. Generation at over 1000 tokens/s has
-// shorter pauses and falls back to the request duration too.
+// arrived in bursts: at least minStreamWaits reads that waited streamGap or
+// more for the upstream. A buffered body (short, or held back on the way) is
+// read from the transport's buffer without waiting. Only the wait inside the
+// read counts, not the time between reads, which also holds the proxy's own
+// work and a slow client's writes. Generation at over 1000 tokens/s has
+// shorter waits and falls back to the request duration too.
+//
+// Stream time runs from the first generated output (capture.firstOutput) to
+// the last byte, and only waits after that output count, so events before
+// it (a role-only chunk, response.created, keep-alive comments during model
+// loading) don't add loading and prompt processing. For a stream whose
+// output fields aren't recognized, it runs from the first byte.
 const (
 	streamGap      = time.Millisecond
 	minStreamWaits = 2
@@ -455,25 +457,7 @@ func detectBackend(ctx context.Context, target *url.URL) string {
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 	get := func(path string) (map[string]json.RawMessage, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.JoinPath(path).String(), nil)
-		if err != nil {
-			return nil, err // can't happen: a fixed method and a URL from JoinPath
-		}
-		resp, err := client.Do(req)
-		if err != nil {
-			return nil, err
-		}
-		defer resp.Body.Close()
-		var body map[string]json.RawMessage
-		if resp.StatusCode != http.StatusOK {
-			debugf("backend probe %s: status %d", path, resp.StatusCode)
-			return nil, nil
-		}
-		if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&body); err != nil {
-			debugf("backend probe %s: body is not a JSON object: %s", path, escapeControls(err.Error()))
-			return nil, nil
-		}
-		return body, nil
+		return probeJSON(ctx, client, target.JoinPath(path), path)
 	}
 
 	probes := []struct{ name, path, key string }{
@@ -496,6 +480,34 @@ func detectBackend(ctx context.Context, target *url.URL) string {
 		}
 	}
 	return ""
+}
+
+// probeJSON fetches u for detectBackend and returns its body if it is a JSON
+// object. A connection error is returned; any other answer gives a nil body
+// and a debug line saying why.
+func probeJSON(ctx context.Context, client *http.Client, u *url.URL, path string) (map[string]json.RawMessage, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, err // can't happen: a fixed method and a URL from JoinPath
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var body map[string]json.RawMessage
+	if resp.StatusCode != http.StatusOK {
+		debugf("backend probe %s: status %d", path, resp.StatusCode)
+		return nil, nil
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&body); err != nil {
+		debugf("backend probe %s: body is not a JSON object: %s", path, escapeControls(err.Error()))
+		return nil, nil
+	}
+	if body == nil {
+		debugf("backend probe %s: body is not a JSON object: null", path)
+	}
+	return body, nil
 }
 
 // setupSignalHandling calls onFirst on the first SIGINT or SIGTERM (start a
@@ -975,9 +987,12 @@ func meterResponse(resp *http.Response) error {
 			info.method, escapeControls(info.path), resp.StatusCode, time.Since(info.start).Seconds())
 		return nil
 	}
-	// A 101 response body is used for the upgraded connection and must not be wrapped.
+	// A 101 response body is used for the upgraded connection and must not be
+	// wrapped. Logged like an unmetered request, which it is.
 	if resp.StatusCode == http.StatusSwitchingProtocols {
 		debugf("req %d: protocol upgrade, connection not inspected", info.id)
+		fmt.Fprintf(out, "[Proxy] %s %s %d (%.2fs, protocol upgrade, not metered)\n",
+			info.method, escapeControls(info.path), resp.StatusCode, time.Since(info.start).Seconds())
 		return nil
 	}
 
@@ -1009,7 +1024,8 @@ type meteredBody struct {
 	capture   capture   // nil when the body is not inspected
 	firstByte time.Time // when the first body bytes were read
 	lastByte  time.Time // when the last body bytes were read
-	waits     int       // pauses of streamGap or more between reads with data
+	waits     int       // reads with data that waited streamGap or more for it
+	readErr   error     // the first read error other than io.EOF
 	output    time.Time // capture.firstOutput, noted in the read that found it
 	outWaits  int       // waits in reads after the one with the first output
 	bytes     int64
@@ -1018,20 +1034,11 @@ type meteredBody struct {
 }
 
 func (b *meteredBody) Read(p []byte) (int, error) {
+	start := time.Now()
 	n, err := b.ReadCloser.Read(p)
 	if n > 0 {
 		b.bytes += int64(n)
-		now := time.Now()
-		paused := !b.firstByte.IsZero() && now.Sub(b.lastByte) >= streamGap
-		if b.firstByte.IsZero() {
-			b.firstByte = now
-		} else if paused {
-			b.waits++
-		}
-		b.lastByte = now
-		if paused && !b.output.IsZero() {
-			b.outWaits++
-		}
+		b.noteRead(start, time.Now())
 		if b.capture != nil {
 			_, _ = b.capture.Write(p[:n]) // captures never fail; parse problems show in diag()
 			if b.output.IsZero() {
@@ -1042,8 +1049,30 @@ func (b *meteredBody) Read(p []byte) (int, error) {
 	if err == io.EOF {
 		b.eof = true
 		b.finish()
+	} else if err != nil && b.readErr == nil {
+		b.readErr = err
 	}
 	return n, err
+}
+
+// noteRead updates the stream timing for a read with data that started at
+// start and returned at now. A pause is a read that waited for the upstream.
+// The time between reads also holds the proxy's own work (parsing the last
+// chunk, writing it to the client), which a slow client or the race
+// detector stretches beyond streamGap for a buffered body.
+func (b *meteredBody) noteRead(start, now time.Time) {
+	if b.firstByte.IsZero() {
+		b.firstByte, b.lastByte = now, now
+		return
+	}
+	b.lastByte = now
+	if now.Sub(start) < streamGap {
+		return
+	}
+	b.waits++
+	if !b.output.IsZero() {
+		b.outWaits++
+	}
 }
 
 // Close records metrics even if the body was not read to the end, e.g.
@@ -1106,8 +1135,14 @@ func (b *meteredBody) finish() {
 func (b *meteredBody) debugSummary(data MetricsData, streamTime time.Duration, basis string) {
 	id := b.info.id
 	ended := "at EOF"
-	if !b.eof {
+	switch {
+	case b.eof:
+	case b.readErr == nil, errors.Is(b.readErr, context.Canceled):
+		// The proxy stopped reading: the client went away, or shutdown
+		// canceled the upstream request.
 		ended = "before EOF (client disconnected or shutdown)"
+	default:
+		ended = "before EOF (upstream read error: " + escapeControls(b.readErr.Error()) + ")"
 	}
 	if streamTime > 0 {
 		from := "first byte"

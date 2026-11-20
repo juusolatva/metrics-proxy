@@ -1212,6 +1212,31 @@ func TestClientDisconnectMidStream(t *testing.T) {
 	}
 }
 
+// An upstream that breaks off its body is reported as such in the debug
+// summary, not as a client disconnect.
+func TestDebugUpstreamReadError(t *testing.T) {
+	target := startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, _, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer conn.Close()
+		io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 1000\r\n\r\n"+streamFirst)
+	}))
+	srv, logs := startProxy(t, target)
+	cfg.Logging.Debug = true
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{}`))
+	if err == nil {
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+	waitForLog(t, logs, "| incomplete")
+	if want := "body ended before EOF (upstream read error: "; !strings.Contains(logs.String(), want) {
+		t.Errorf("logs missing %q:\n%s", want, logs)
+	}
+}
+
 // http.Server.Shutdown neither waits for nor closes upgraded (hijacked)
 // connections, so an open WebSocket doesn't count as an in-flight request.
 func TestShutdownIgnoresUpgradedConnections(t *testing.T) {
@@ -1743,8 +1768,11 @@ func TestUpgradeOnMeteredPathNotWrapped(t *testing.T) {
 	cfg.Logging.Debug = true
 
 	checkWebSocketTunnel(t, srv.URL+"/v1/realtime")
-	if want := "protocol upgrade, connection not inspected"; !strings.Contains(logs.String(), want) {
-		t.Errorf("logs missing %q:\n%s", want, logs)
+	// The [Proxy] line is printed without debug too, as for unmetered paths.
+	for _, want := range []string{"protocol upgrade, connection not inspected", "[Proxy] GET /v1/realtime 101 (", "s, protocol upgrade, not metered)\n"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("logs missing %q:\n%s", want, logs)
+		}
 	}
 	metrics.mu.RLock()
 	defer metrics.mu.RUnlock()
@@ -1815,15 +1843,33 @@ func TestNonInferenceResponseNotCounted(t *testing.T) {
 
 func readCSV(t *testing.T, path string) [][]string {
 	t.Helper()
+	rows, err := tryReadCSV(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rows
+}
+
+func tryReadCSV(path string) ([][]string, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
 	defer f.Close()
-	rows, err := csv.NewReader(f).ReadAll()
-	if err != nil {
-		t.Fatal(err)
-	}
+	return csv.NewReader(f).ReadAll()
+}
+
+// waitForCSVRows polls path until it holds at least n rows and returns them.
+// A row may be read while it is being written (more likely on Windows), so
+// parse errors mean "not yet" rather than failing the test.
+func waitForCSVRows(t *testing.T, path string, n int) [][]string {
+	t.Helper()
+	var rows [][]string
+	waitFor(t, fmt.Sprintf("%d CSV rows", n), func() bool {
+		var err error
+		rows, err = tryReadCSV(path)
+		return err == nil && len(rows) >= n
+	})
 	return rows
 }
 
@@ -1935,8 +1981,11 @@ func checkProxyCSVFormula(t *testing.T, field string) {
 		t.Fatal("CSV escaping changed the forwarded response")
 	}
 	// QueryCount can advance before the CSV row is flushed.
-	waitFor(t, "CSV formula row", func() bool { return len(readCSV(t, path)) == 2 })
-	if got := readCSV(t, path)[1][4]; got != "'"+model {
+	rows := waitForCSVRows(t, path, 2)
+	if len(rows) != 2 {
+		t.Fatalf("want header + 1 row, got %q", rows)
+	}
+	if got := rows[1][4]; got != "'"+model {
 		t.Errorf("model cell = %q, want %q", got, "'"+model)
 	}
 	metrics.mu.RLock()
@@ -1973,8 +2022,7 @@ func TestProxyWritesQueriesToCSV(t *testing.T) {
 		resp.Body.Close()
 	}
 	// QueryCount can advance before the CSV row is flushed.
-	waitFor(t, "CSV query row", func() bool { return len(readCSV(t, path)) >= 2 })
-	rows := readCSV(t, path)
+	rows := waitForCSVRows(t, path, 2)
 	if len(rows) != 2 {
 		t.Fatalf("want header + 1 query row (models request not written), got %q", rows)
 	}
@@ -2596,6 +2644,50 @@ func TestStreamTimeNeedsPausesBetweenReads(t *testing.T) {
 	}
 }
 
+// chunkReader returns one chunk per Read, after waiting delay (a server
+// that pauses between chunks when delay > 0).
+type chunkReader struct {
+	chunks []string
+	delay  time.Duration
+}
+
+func (r *chunkReader) Read(p []byte) (int, error) {
+	if len(r.chunks) == 0 {
+		return 0, io.EOF
+	}
+	time.Sleep(r.delay)
+	n := copy(p, r.chunks[0])
+	r.chunks = r.chunks[1:]
+	return n, nil
+}
+
+// Only reads that wait for the upstream count as pauses. A slow client (the
+// time between reads) used to count too, and so did the race detector's
+// slowdown of the proxy's own parsing, which made a buffered body look
+// streamed.
+func TestStreamWaitsCountUpstreamOnly(t *testing.T) {
+	for _, tt := range []struct {
+		name             string
+		upstream, client time.Duration
+		want             int
+	}{
+		{"slow client", 0, 5 * streamGap, 0},
+		{"pausing upstream", 5 * streamGap, 0, 2},
+	} {
+		b := &meteredBody{ReadCloser: io.NopCloser(&chunkReader{chunks: []string{"a", "b", "c"}, delay: tt.upstream})}
+		buf := make([]byte, 8)
+		for range 3 { // not to EOF, which would record the query
+			if _, err := b.Read(buf); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(tt.client)
+		}
+		if b.waits != tt.want {
+			t.Errorf("%s: waits = %d, want %d", tt.name, b.waits, tt.want)
+		}
+	}
+}
+
 // unknownOutput is a streamed document whose output field hasOutput doesn't
 // know, like LM Studio's tool_call.* events.
 const unknownOutput = "data: {\"model\":\"m\",\"type\":\"tool_call.arguments\",\"arguments\":\"{}\"}\n\n"
@@ -2623,9 +2715,11 @@ func checkStreamTimeBasis(t *testing.T, chunks []string, basis string) {
 	}
 	metrics.mu.RLock()
 	defer metrics.mu.RUnlock()
-	// 2 completion tokens over at least 40 ms of pauses or delay: at most 50 tok/s.
-	if metrics.TokensPerSecond <= 0 || metrics.TokensPerSecond > 50 {
-		t.Errorf("TokensPerSecond = %v, want a plausible estimate (at most 50)", metrics.TokensPerSecond)
+	// 2 completion tokens over the 40 ms of pauses or more: about 50 tok/s at
+	// most. The proxy notes the first output only after parsing its chunk,
+	// which the race detector can delay, so allow up to 100 (20 ms).
+	if metrics.TokensPerSecond <= 0 || metrics.TokensPerSecond > 100 {
+		t.Errorf("TokensPerSecond = %v, want a plausible estimate (at most 100)", metrics.TokensPerSecond)
 	}
 }
 
@@ -2682,8 +2776,10 @@ func checkStreamTimeFromOutput(t *testing.T, chunks []string, load time.Duration
 	}
 	metrics.mu.RLock()
 	defer metrics.mu.RUnlock()
-	if tps := metrics.TokensPerSecond; tps <= minTPS || tps > 10/(40*time.Millisecond).Seconds() {
-		t.Errorf("TokensPerSecond = %v, want above %v (the load excluded) and at most 250 (2 pauses of 20 ms)", tps, minTPS)
+	// At most about 250 (10 tokens over 2 pauses of 20 ms); up to 500 allows
+	// for the first output being noted late (see checkStreamTimeBasis).
+	if tps := metrics.TokensPerSecond; tps <= minTPS || tps > 10/(20*time.Millisecond).Seconds() {
+		t.Errorf("TokensPerSecond = %v, want above %v (the load excluded) and at most 500", tps, minTPS)
 	}
 }
 
@@ -2797,6 +2893,15 @@ func TestDetectBackend(t *testing.T) {
 	cfg.Logging.Debug = false
 	if !strings.Contains(logs.String(), "backend probe /api/version: status 302") {
 		t.Errorf("want the redirect logged as its status:\n%s", logs)
+	}
+
+	// A JSON null body is reported like other non-objects.
+	nullBody := startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "null") }))
+	cfg.Logging.Debug, out = true, logs
+	detectBackend(t.Context(), nullBody)
+	cfg.Logging.Debug = false
+	if want := "backend probe /api/version: body is not a JSON object: null"; !strings.Contains(logs.String(), want) {
+		t.Errorf("logs missing %q:\n%s", want, logs)
 	}
 
 	closed := httptest.NewServer(http.NotFoundHandler())
@@ -3201,8 +3306,7 @@ func TestMeasuredTTFTIncludesModelLoad(t *testing.T) {
 	postAndDrain(t, srv.URL+"/api/v1/chat")
 	waitForLog(t, logs, "| Total tokens: ")
 	// The status line is printed before the CSV row is written.
-	var rows [][]string
-	waitFor(t, "CSV row", func() bool { rows = readCSV(t, path); return len(rows) >= 2 })
+	rows := waitForCSVRows(t, path, 2)
 	checkMeasuredTTFT(t, logs.String(), rows, load)
 }
 
