@@ -2,8 +2,12 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/csv"
+	"net/http"
+	"net/http/httputil"
 	"net/netip"
+	"net/url"
 	"strconv"
 	"strings"
 	"testing"
@@ -271,4 +275,42 @@ func asciiLower(s string) string {
 		}
 		return r
 	}, s)
+}
+
+// FuzzRequestTarget checks that a request target hasPathTarget accepts
+// reaches the upstream with the path the proxy checked. The target is parsed
+// as net/http's server parses a request line, rewritten by the proxy's own
+// Rewrite, and the outgoing request target parsed again as a Go upstream
+// (Ollama) would. The path fuzzer starts from a decoded path, so it can't see
+// targets whose URL fields disagree, such as "a:x:/api/delete" (empty Path,
+// forwarded as "x:/api/delete").
+func FuzzRequestTarget(f *testing.F) {
+	for _, s := range []string{
+		"/v1/chat/completions", "/api/pull?x=1", "//api/pull", "/api/blobs%2F..", "/a%3Fb", "/a?",
+		"a:x:/api/delete", "x:/api/delete", "http:%2F%2Fh/api/delete", "*", "http://localhost",
+		"http://localhost/api/pull", "http://u:p@localhost/v1/models?q=1", "HTTP://H//api//pull",
+	} {
+		f.Add(s)
+	}
+	rp := newReverseProxy(&url.URL{Scheme: "http", Host: "localhost:1234"})
+	f.Fuzz(func(t *testing.T, raw string) {
+		in, err := url.ParseRequestURI(raw)
+		if err != nil || !hasPathTarget(in) {
+			return
+		}
+		req := &http.Request{Method: "GET", URL: in, Header: http.Header{}, Host: "localhost"}
+		pr := &httputil.ProxyRequest{In: req, Out: req.Clone(context.Background())}
+		rp.Rewrite(pr)
+		if pr.Out.URL.User != nil {
+			t.Fatalf("%q: user info kept on the outgoing URL", raw)
+		}
+		sent := pr.Out.URL.RequestURI()
+		up, err := url.ParseRequestURI(sent)
+		if err != nil {
+			t.Fatalf("%q is forwarded as %q, which an upstream can't parse: %v", raw, sent, err)
+		}
+		if up.Path != in.Path {
+			t.Fatalf("%q: proxy checked path %q, upstream sees %q (forwarded as %q)", raw, in.Path, up.Path, sent)
+		}
+	})
 }
