@@ -15,8 +15,8 @@ import (
 	"unicode/utf8"
 )
 
-// Fuzz targets for the parsers and security checks (AGENTS.md backlog item
-// 2). go test runs only the seed corpus: the f.Add seeds plus any failing
+// Fuzz targets for the parsers and security checks. go test runs only the
+// seed corpus: the f.Add seeds plus any failing
 // inputs committed under testdata/fuzz/<FuzzName>/. To fuzz one target:
 //
 //	go test -run '^$' -fuzz=FuzzCaptureSplit -fuzztime=30s
