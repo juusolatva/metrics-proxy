@@ -209,6 +209,26 @@ func TestParseConfigValidates(t *testing.T) {
 		{"api_endpoints: [\"\"]\n", `api_endpoints: "" is not a path`},
 		{"api_endpoints: [\"*\"]\n", `"/*" meters every path`},
 		{"api_endpoints: [\"v1/*\"]\n", `api_endpoints: "v1/*" is not a path`},
+		{"api_endpoints: [\"/v1/**\"]\n", `"*" works only at the end`},
+		{"api_endpoints: [\"/v1/*/chat\"]\n", `"*" works only at the end`},
+		{"api_endpoints: [\"/v1/./chat\"]\n", `never matches, since request paths are cleaned first; write "/v1/chat"`},
+		{"api_endpoints: [\"//v1/*\"]\n", `write "/v1/*"`},
+		{"api_endpoints: [\"/v1/../api/*\"]\n", `write "/api/*"`},
+		{"api_endpoints: [\"/v1//*\"]\n", `write "/v1/*"`},
+		{"api_endpoints: ['/v1\\chat']\n", `write "/v1/chat"`},
+		{"allowed_hosts: [\"llm.example.com:11436\"]\n", "without a port"},
+		{"allowed_hosts: [\"http://llm.example.com\"]\n", "without a scheme"},
+		{"allowed_hosts: [\"llm.example.com.\"]\n", "without a trailing dot"},
+		{"allowed_hosts: [\"*.lan.\"]\n", "without a trailing dot"},
+		{"allowed_hosts: [\"\"]\n", "empty entry"},
+		{"allowed_hosts: [\"*.\"]\n", `"*" works only alone or as "*.example"`},
+		{"allowed_hosts: [\"*lan\"]\n", `"*" works only alone or as "*.example"`},
+		{"allowed_hosts: [\"a.*.lan\"]\n", `"*" works only alone or as "*.example"`},
+		{"allowed_hosts: [\"*.*.lan\"]\n", `"*" works only alone or as "*.example"`},
+		{"allowed_hosts: [\"llm example\"]\n", "not a host name"},
+		{"allowed_hosts: [\"llm.example.com/v1\"]\n", "not a host name"},
+		{"allowed_hosts: [\"[::1]\"]\n", "not a host name"},
+		{"metrics:\n  history_points: -1\n", "metrics.history_points: -1 must be at least 1"},
 	} {
 		if _, err := parseConfig([]byte(tt.data)); err == nil || !strings.Contains(err.Error(), tt.want) {
 			t.Errorf("%q: err = %v, want it to contain %q", tt.data, err, tt.want)
@@ -218,10 +238,38 @@ func TestParseConfigValidates(t *testing.T) {
 		"proxy_port: 65535\nserver:\n  port: 1\n",
 		"server:\n  host: \"::1\"\n", "server:\n  host: \"192.168.1.20\"\n", "server:\n  host: \"gpu-box.lan\"\n",
 		"api_endpoints: [\"/\", \"/*\"]\n",
+		"api_endpoints: [\"/api/v1/*\", \"/v1\", \"/api/\", \"/V1/Chat\"]\n",
+		"allowed_hosts: [\"*\", \"*.lan\", \"LLM.Example.com\", \"gpu-box\", \"xn--bcher-kva.example\"]\n",
+		"metrics:\n  history_points: 1\n",
 	} {
 		if _, err := parseConfig([]byte(data)); err != nil {
 			t.Errorf("%q: %v, want it accepted", data, err)
 		}
+	}
+}
+
+// Ctrl+C during the startup probes ends them at once instead of after their
+// 2 s timeouts, and no further probe is sent.
+func TestDetectBackendCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	var hits atomic.Int32
+	var canceledAt atomic.Int64 // UnixNano when the first probe arrived and ctx was canceled
+	target := startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hits.Add(1) == 1 {
+			canceledAt.Store(time.Now().UnixNano())
+			cancel() // Ctrl+C while the first probe waits
+		}
+		<-r.Context().Done() // a server that never answers
+	}))
+	if got := detectBackend(ctx, target); got != "" {
+		t.Errorf("detectBackend() = %q, want \"\"", got)
+	}
+	if took := time.Since(time.Unix(0, canceledAt.Load())); took > time.Second {
+		t.Errorf("detectBackend returned %v after cancel, want it to stop at once", took)
+	}
+	if n := hits.Load(); n != 1 {
+		t.Errorf("%d probes sent, want 1", n)
 	}
 }
 
@@ -2224,7 +2272,7 @@ func TestUpstreamResponseHeaderLimit(t *testing.T) {
 	if !strings.Contains(logs.String(), "exceeded") {
 		t.Errorf("want the header limit in the error:\n%s", logs)
 	}
-	if got := detectBackend(target); got != "" {
+	if got := detectBackend(t.Context(), target); got != "" {
 		t.Errorf("detectBackend() = %q, want \"\" for headers beyond the limit", got)
 	}
 }
@@ -2666,7 +2714,7 @@ func TestDetectBackend(t *testing.T) {
 			}
 			io.WriteString(w, body)
 		}))
-		if got := detectBackend(target); got != want {
+		if got := detectBackend(t.Context(), target); got != want {
 			t.Errorf("detectBackend() = %q, want %q", got, want)
 		}
 	}
@@ -2679,7 +2727,7 @@ func TestDetectBackend(t *testing.T) {
 	cfg.Logging.Debug = true
 	logs := &syncBuffer{}
 	out = logs
-	if got := detectBackend(redirecting); got != "" {
+	if got := detectBackend(t.Context(), redirecting); got != "" {
 		t.Errorf("redirecting upstream: detectBackend() = %q, want \"\"", got)
 	}
 	cfg.Logging.Debug = false
@@ -2690,7 +2738,7 @@ func TestDetectBackend(t *testing.T) {
 	closed := httptest.NewServer(http.NotFoundHandler())
 	u, _ := url.Parse(closed.URL)
 	closed.Close()
-	if got := detectBackend(u); got != "" {
+	if got := detectBackend(t.Context(), u); got != "" {
 		t.Errorf("unreachable upstream: detectBackend() = %q, want \"\"", got)
 	}
 }

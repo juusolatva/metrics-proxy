@@ -281,8 +281,14 @@ settings, so delete them from older config files. Older files also need
 
 Values that can't work are rejected too: ports outside 1–65535, a
 `server.host` with a scheme or port (`http://localhost`, `localhost:1234`:
-give the bare name and put the port in `server.port`), and `api_endpoints`
-entries that don't start with `/` (use `"/*"` to meter every path).
+give the bare name and put the port in `server.port`), `api_endpoints`
+entries that don't start with `/` (use `"/*"` to meter every path), have `*`
+anywhere but at the end, or contain `//`, `.` or `..` segments or `\` (request
+paths are cleaned before matching, so such patterns never matched; the error
+names the pattern to use), `allowed_hosts` entries with a scheme, port,
+trailing dot or a `*` other than a leading `*.`, and a `history_points` below
+1. A config file with such values loaded before 2026-11-20 but now fails to
+load; fix the value the error names.
 
 Duplicate keys are an error too. A config file holds a single YAML
 document: settings after a `---` separator, which earlier versions silently
