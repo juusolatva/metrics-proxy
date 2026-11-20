@@ -167,8 +167,8 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Printf("Loaded config from %s\n", opts.configPath)
-	debugf("config: proxy_port=%d upstream=%s:%d api_endpoints=%q forward_unmatched=%t forward_management=%t allowed_hosts=%q history_points=%d",
-		cfg.ProxyPort, cfg.Server.Host, cfg.Server.Port, cfg.APIEndpoints, cfg.forwardsUnmatched(), cfg.ForwardManagement, cfg.AllowedHosts, cfg.Metrics.HistoryPoints)
+	debugf("config: proxy_port=%d upstream=%s api_endpoints=%q forward_unmatched=%t forward_management=%t allowed_hosts=%q history_points=%d",
+		cfg.ProxyPort, net.JoinHostPort(cfg.Server.Host, strconv.Itoa(cfg.Server.Port)), cfg.APIEndpoints, cfg.forwardsUnmatched(), cfg.ForwardManagement, cfg.AllowedHosts, cfg.Metrics.HistoryPoints)
 
 	target := upstreamURL()
 	proxy = newReverseProxy(target)
@@ -201,7 +201,7 @@ func main() {
 		defer closeCSV()
 	}
 	fmt.Printf("Proxy listening on port %d\n", cfg.ProxyPort)
-	if backend := detectBackend(target); backend != "" {
+	if backend := detectBackend(stop, target); backend != "" {
 		fmt.Printf("Forwarding to %s at %s\n", backend, target.Host)
 	} else {
 		fmt.Printf("Forwarding to upstream at %s (server type not detected)\n", target.Host)
@@ -299,7 +299,7 @@ func parseConfig(data []byte) (Config, error) {
 	if len(c.APIEndpoints) == 0 {
 		c.APIEndpoints = []string{"/api/v1/*", "/v1/*"} // LM Studio native + OpenAI-compatible
 	}
-	if c.Metrics.HistoryPoints <= 0 {
+	if c.Metrics.HistoryPoints == 0 {
 		c.Metrics.HistoryPoints = 10
 	}
 	return c, c.validate()
@@ -319,9 +319,66 @@ func (c Config) validate() error {
 		return err
 	}
 	for _, e := range c.APIEndpoints {
-		if !strings.HasPrefix(e, "/") {
-			return fmt.Errorf(`api_endpoints: %q is not a path; patterns start with "/" ("/*" meters every path)`, e)
+		if err := checkAPIEndpoint(e); err != nil {
+			return err
 		}
+	}
+	for _, h := range c.AllowedHosts {
+		if err := checkAllowedHost(h); err != nil {
+			return err
+		}
+	}
+	if c.Metrics.HistoryPoints < 1 {
+		return fmt.Errorf("metrics.history_points: %d must be at least 1", c.Metrics.HistoryPoints)
+	}
+	return nil
+}
+
+// checkAPIEndpoint rejects api_endpoints patterns that can't match:
+// isAPIEndpoint only strips one trailing "*" and matches cleaned paths.
+func checkAPIEndpoint(e string) error {
+	if !strings.HasPrefix(e, "/") {
+		return fmt.Errorf(`api_endpoints: %q is not a path; patterns start with "/" ("/*" meters every path)`, e)
+	}
+	prefix := strings.TrimSuffix(e, "*")
+	if strings.Contains(prefix, "*") {
+		return fmt.Errorf(`api_endpoints: %q: "*" works only at the end; patterns are path prefixes`, e)
+	}
+	clean := cleanPath(prefix)
+	if clean != "/" && strings.HasSuffix(prefix, "/") {
+		clean += "/"
+	}
+	if clean != prefix {
+		return fmt.Errorf(`api_endpoints: %q never matches, since request paths are cleaned first; write %q`, e, clean+e[len(prefix):])
+	}
+	return nil
+}
+
+// checkAllowedHost rejects allowed_hosts entries that can't match: hostName
+// strips the port, brackets and trailing dot from the Host header and
+// lowercases it, and allowsHost knows only "*" and a leading "*.".
+func checkAllowedHost(h string) error {
+	bad := func(why string) error { return fmt.Errorf("allowed_hosts: %q: %s", h, why) }
+	switch {
+	case h == "*":
+		return nil
+	case h == "":
+		return bad("empty entry")
+	case strings.Contains(h, "://"):
+		return bad("give the host name without a scheme")
+	case strings.Contains(strings.TrimPrefix(h, "*."), "*"), h == "*.":
+		return bad(`"*" works only alone or as "*.example"`)
+	case strings.HasSuffix(h, "."):
+		return bad("give the name without a trailing dot")
+	}
+	if _, _, err := net.SplitHostPort(h); err == nil {
+		return bad("give the name without a port; any port is accepted")
+	}
+	notInName := func(r rune) bool {
+		return strings.ContainsRune("/?#@[]", r) || unicode.IsSpace(r) || unicode.IsControl(r)
+	}
+	if strings.ContainsFunc(h, notInName) {
+		return bad("not a host name")
 	}
 	return nil
 }
@@ -383,8 +440,9 @@ func upstreamURL() *url.URL {
 // detectBackend identifies the upstream server type for the startup banner.
 // It checks response bodies rather than status codes, since LM Studio answers
 // unknown endpoints with 200 and an error body. It returns "" if the upstream
-// is unreachable or not recognized.
-func detectBackend(target *url.URL) string {
+// is unreachable or not recognized, or once ctx is done (Ctrl+C during the
+// probes doesn't wait for their timeouts).
+func detectBackend(ctx context.Context, target *url.URL) string {
 	client := &http.Client{
 		Transport: upstreamTransport,
 		Timeout:   2 * time.Second,
@@ -392,7 +450,13 @@ func detectBackend(target *url.URL) string {
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 	get := func(path string) (map[string]json.RawMessage, error) {
-		resp, err := client.Get(target.JoinPath(path).String())
+		// NewRequestWithContext can't fail for a fixed method and a URL from
+		// JoinPath; its error is handled with the request's.
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.JoinPath(path).String(), nil)
+		var resp *http.Response
+		if err == nil {
+			resp, err = client.Do(req)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -432,7 +496,9 @@ func detectBackend(target *url.URL) string {
 }
 
 // setupSignalHandling calls onFirst on the first SIGINT or SIGTERM (start a
-// graceful shutdown) and onSecond on the second (abort it).
+// graceful shutdown) and onSecond on the second (abort it). After that the
+// signals are handed back to Go's default handling, so a third one ends the
+// process at once, even during the abort's last wait.
 func setupSignalHandling(onFirst, onSecond func()) {
 	sigChan := make(chan os.Signal, 2)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -442,6 +508,7 @@ func setupSignalHandling(onFirst, onSecond func()) {
 		onFirst()
 		<-sigChan
 		onSecond()
+		signal.Stop(sigChan)
 	}()
 }
 

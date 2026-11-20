@@ -22,7 +22,8 @@ server:
   port: 1234
 
 # Request paths whose responses are metered. Patterns are path prefixes; a
-# trailing "*" is optional.
+# trailing "*" is ignored, so "/v1/*" and "/v1/" are the same, while "/v1"
+# also matches "/v10". "*" elsewhere in a pattern is an error.
 api_endpoints:
   - "/api/v1/*"  # LM Studio native REST API
   - "/v1/*"      # OpenAI-compatible API (LM Studio, Ollama, others)
