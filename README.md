@@ -353,7 +353,7 @@ strings or user names and passwords in request URLs.
   ignored. Response forwarding is unaffected. The separate 16 MiB capture
   limit still applies to bodies, lines and assembled events.
 - Numbers the server reports beyond plausible values are ignored, as if not
-  reported: token counts above 2^30 (about a billion), rates above a million
+  reported: token counts above 2^29 (about 537 million), rates above a million
   tokens per second and times to first token above 24 hours.
 - Streamed OpenAI-compatible responses only include token counts when the
   client sends `"stream_options": {"include_usage": true}`. Without it, the

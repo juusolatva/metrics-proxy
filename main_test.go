@@ -3170,7 +3170,7 @@ func TestEscapeTruncatedBoundedWork(t *testing.T) {
 // overflowed sums and durations, and made averages +Inf.
 func TestMergeIgnoresImplausibleNumbers(t *testing.T) {
 	for _, doc := range []string{
-		`{"model":"m","usage":{"prompt_tokens":9223372036854775807,"completion_tokens":1073741825,"total_tokens":1e18}}`,
+		`{"model":"m","usage":{"prompt_tokens":9223372036854775807,"completion_tokens":536870913,"total_tokens":1e18}}`,
 		`{"model":"m","stats":{"tokens_per_second":1e308,"time_to_first_token":1e12,"input_tokens":-5}}`,
 		`{"model":"m","stats":{"time_to_first_token_seconds":86401},"timings":{"predicted_per_second":1000001}}`,
 		`{"model":"m","eval_count":1073741825,"eval_duration":1000000000000}`,
@@ -3191,7 +3191,7 @@ func TestMergeIgnoresImplausibleNumbers(t *testing.T) {
 	}
 
 	d = MetricsData{}
-	d.mergeJSON([]byte(`{"usage":{"prompt_tokens":1073741824},"stats":{"tokens_per_second":1000000,"time_to_first_token":86400}}`))
+	d.mergeJSON([]byte(`{"usage":{"prompt_tokens":536870912},"stats":{"tokens_per_second":1000000,"time_to_first_token":86400}}`))
 	if d.PromptTokens != maxTokenCount || d.TokensPerSecond != maxTokensPerSecond || d.TimeToFirstToken != 24*time.Hour {
 		t.Errorf("values at the limits: got %+v, want them kept", d)
 	}
@@ -3203,6 +3203,27 @@ func TestMergeIgnoresImplausibleNumbers(t *testing.T) {
 	}
 	if d.TotalTokens != maxTokenCount {
 		t.Errorf("TotalTokens = %d, want the completion tokens", d.TotalTokens)
+	}
+
+	// Prompt plus completion tokens at the limit fit in a 32-bit int.
+	d = MetricsData{PromptTokens: maxTokenCount, CompletionTokens: maxTokenCount}
+	d.completeDerived(0)
+	if d.TotalTokens != 2*maxTokenCount || int64(d.TotalTokens) > math.MaxInt32 {
+		t.Errorf("TotalTokens = %d, want %d, within a 32-bit int", d.TotalTokens, 2*maxTokenCount)
+	}
+}
+
+// The running total is an int64, so queries at the limit can't make it
+// overflow on 32-bit builds.
+func TestRunningTotalTokens(t *testing.T) {
+	cfg = Config{Metrics: MetricsConfig{HistoryPoints: 10}}
+	resetMetrics()
+	var snap metricsSnapshot
+	for range 3 {
+		snap = updateGlobalMetrics(MetricsData{ModelName: "m", TotalTokens: 2 * maxTokenCount, Duration: time.Second})
+	}
+	if want := int64(3) * 2 * maxTokenCount; snap.TotalTokens != want || want <= math.MaxInt32 {
+		t.Errorf("running total = %d, want %d (beyond a 32-bit int)", snap.TotalTokens, want)
 	}
 }
 

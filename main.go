@@ -72,7 +72,7 @@ type LoggingConfig struct {
 // Metrics stores collected metrics
 type Metrics struct {
 	TokensPerSecond float64 // most recent query
-	TotalTokens     int     // cumulative over all queries
+	TotalTokens     int64   // cumulative over all queries; int64 so it can't overflow on 32-bit builds
 	QueryCount      int
 	ModelName       string // most recent query that reported a model
 	AvgTimePerQuery time.Duration
@@ -91,7 +91,7 @@ type MetricsHistoryPoint struct {
 // recording a query, so it can be displayed without holding metrics.mu.
 type metricsSnapshot struct {
 	QueryCount      int
-	TotalTokens     int // cumulative over all queries
+	TotalTokens     int64 // cumulative over all queries
 	AvgTimePerQuery time.Duration
 	AvgTokensPerSec float64 // over History, ignoring queries without a rate
 }
@@ -1545,9 +1545,10 @@ func (d *MetricsData) mergeJSONPayload(raw []byte, depth int, remaining *int) (*
 // to 1.8e308, which overflowed token sums and the TTFT's time.Duration, made
 // the average rate +Inf and printed 300-digit numbers. Real values are far
 // below: context windows hold about a million tokens, and rates are at most
-// thousands of tokens per second.
+// thousands of tokens per second. maxTokenCount is 2^29 so that prompt plus
+// completion tokens fit in a 32-bit int.
 const (
-	maxTokenCount      = 1 << 30
+	maxTokenCount      = 1 << 29
 	maxTokensPerSecond = 1e6
 	maxTTFTSeconds     = 24 * 60 * 60
 )
@@ -1623,8 +1624,11 @@ func (d *MetricsData) completeDerived(streamTime time.Duration) (basis string) {
 		genTime = streamTime
 		basis = "completion tokens / stream time (first to last body byte)"
 	}
+	if genTime <= 0 {
+		return ""
+	}
 	tps := float64(d.CompletionTokens) / genTime.Seconds()
-	if genTime <= 0 || !plausibleTPS(tps) {
+	if !plausibleTPS(tps) {
 		return ""
 	}
 	d.TokensPerSecond = tps
@@ -1645,7 +1649,7 @@ func updateGlobalMetrics(data MetricsData) metricsSnapshot {
 	defer metrics.mu.Unlock()
 
 	metrics.QueryCount++
-	metrics.TotalTokens += data.TotalTokens
+	metrics.TotalTokens += int64(data.TotalTokens)
 	metrics.TokensPerSecond = data.TokensPerSecond
 	if data.ModelName != "" {
 		metrics.ModelName = data.ModelName
