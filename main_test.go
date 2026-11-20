@@ -752,6 +752,75 @@ func TestCaptureOversizedInChunks(t *testing.T) {
 	}
 }
 
+// An SSE event's data lines are joined with "\n", which counts towards
+// maxCaptureBytes: an event of exactly the limit is parsed, one byte more is
+// skipped, and the next event still counts.
+func TestSSEEventSizeLimit(t *testing.T) {
+	const head, tail = `{"model":"big",`, `"pad":1}`
+	next := "data: {\"model\":\"after\"}\n\n"
+	for _, tt := range []struct {
+		extra, documents, oversized int
+	}{{0, 2, 0}, {1, 1, 1}} {
+		pad := strings.Repeat(" ", maxCaptureBytes-len(head)-1-len(tail)+tt.extra)
+		body := "data: " + head + pad + "\ndata: " + tail + "\n\n" + next
+		got, d := parseInChunks(t, "text/event-stream", []byte(body), 1<<20)
+		if got.ModelName != "after" || d.documents != tt.documents || d.oversized != tt.oversized || d.invalid != 0 {
+			t.Errorf("event of limit+%d bytes: model %q, diag %+v; want %d document(s), %d oversized",
+				tt.extra, got.ModelName, d, tt.documents, tt.oversized)
+		}
+	}
+}
+
+// A line may hold maxCaptureBytes bytes plus the "\r" of a CRLF ending.
+func TestLineSizeLimitCRLF(t *testing.T) {
+	const head = `{"model":"m"`
+	for _, tt := range []struct {
+		name, ending                string
+		extra, documents, oversized int
+	}{
+		{"CRLF line at the limit", "\r\n", 0, 1, 0},
+		{"CRLF line over the limit", "\r\n", 1, 0, 1},
+		{"LF line at the limit", "\n", 0, 1, 0},
+		{"LF line over the limit", "\n", 1, 0, 1},
+		{"unterminated line over the limit", "", 1, 0, 1},
+	} {
+		line := head + strings.Repeat(" ", maxCaptureBytes-len(head)-1+tt.extra) + "}"
+		_, d := parseInChunks(t, "application/x-ndjson", []byte(line+tt.ending), 1<<20)
+		if d.documents != tt.documents || d.oversized != tt.oversized || d.invalid != 0 {
+			t.Errorf("%s: diag %+v, want %d document(s), %d oversized", tt.name, d, tt.documents, tt.oversized)
+		}
+	}
+
+	// The rest of an oversized line, arriving in later writes, is skipped
+	// too, and the next line counts.
+	body := strings.Repeat("x", 2*maxCaptureBytes) + "\n" + `{"model":"next"}` + "\n"
+	got, d := parseInChunks(t, "application/x-ndjson", []byte(body), 1<<20)
+	if got.ModelName != "next" || d.documents != 1 || d.oversized != 1 || d.invalid != 0 {
+		t.Errorf("line of twice the limit: model %q, diag %+v; want the next line only, 1 oversized", got.ModelName, d)
+	}
+}
+
+// After a large line or event, the captures don't keep its buffer for the
+// rest of the stream.
+func TestCaptureBuffersReleased(t *testing.T) {
+	if b := reuse(make([]byte, 10, reuseLimit)); b == nil || len(b) != 0 {
+		t.Errorf("reuse of a buffer within reuseLimit = %v, want it emptied", b)
+	}
+	if b := reuse(make([]byte, 10, reuseLimit+1)); b != nil {
+		t.Errorf("reuse of a larger buffer kept %d bytes", cap(b))
+	}
+	big := strings.Repeat(" ", reuseLimit)
+	c := &sseCapture{}
+	io.WriteString(c, "data: {\"model\":\"m\""+big+"}\n\n")
+	if cap(c.data) != 0 || cap(c.lines.line) != 0 {
+		t.Errorf("after a large event: data cap %d, line cap %d; want both released", cap(c.data), cap(c.lines.line))
+	}
+	io.WriteString(c, "data: "+strings.Repeat("x", maxCaptureBytes+2)+"\n")
+	if cap(c.data) != 0 || cap(c.lines.line) != 0 {
+		t.Errorf("after an oversized line: data cap %d, line cap %d; want both released", cap(c.data), cap(c.lines.line))
+	}
+}
+
 // Synthetic wrappers exercise hostile inputs not present in the real captures.
 func wrappedMetrics(payload string, depth int) string {
 	for i := range depth {
@@ -2962,6 +3031,8 @@ func TestPayloadHasOutput(t *testing.T) {
 		{`{"choices":[` + strings.Repeat(`{},`, maxOutputChoices-1) + `{"text":"Hi"}]}`, true},
 		{`{"choices":[` + strings.Repeat(`{},`, maxOutputChoices) + `{"text":"Hi"}]}`, false},
 		{`{"choices":[{"text":"Hi"}]}`, true},
+		{`{"choices":[{"text":"Hi"}],"choices":[]}`, true}, // only the first choices member is inspected
+		{`{"choices":[],"choices":[{"text":"Hi"}]}`, false},
 		{`{"choices":[],"usage":{"total_tokens":3}}`, false},
 		{`{"message":{"role":"assistant","content":""},"done":true}`, false},
 		{`{"message":{"role":"assistant","content":"1"}}`, true},
@@ -3054,6 +3125,106 @@ func TestReportedTTFTKeptForJSON(t *testing.T) {
 	srv, logs := startProxy(t, target)
 	postAndDrain(t, srv.URL+"/api/v1/chat")
 	waitForLog(t, logs, "| TTFT: 0.11s |")
+}
+
+// Repeated "choices" members each made json.Unmarshal call the decoder
+// again with a fresh allowance; only the first is inspected now.
+func TestRepeatedChoicesBounded(t *testing.T) {
+	const member = `"choices":[{}],`
+	n := (maxCaptureBytes - 64) / len(member)
+	doc := []byte(`{"model":"m",` + strings.Repeat(member, n) + `"choices":[{"text":"Hi"}]}`)
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	var d MetricsData
+	ok, output := d.mergeDocument(doc)
+	runtime.ReadMemStats(&after)
+	if !ok || output || d.ModelName != "m" {
+		t.Fatalf("valid %t, output %t, model %q; want the model, and no output (only the first choices member counts)", ok, output, d.ModelName)
+	}
+	// Each repeat's decoder allocated at least 512 bytes: about 590 MiB here.
+	if alloc := after.TotalAlloc - before.TotalAlloc; alloc > uint64(len(doc)) {
+		t.Errorf("allocated %d MiB for a %d MiB document", alloc>>20, len(doc)>>20)
+	}
+}
+
+// A model name up to maxCaptureBytes long is shown as a 30-rune preview
+// without escaping the whole name first.
+func TestEscapeTruncatedBoundedWork(t *testing.T) {
+	name := strings.Repeat("\x7f", maxCaptureBytes)
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	got := escapeTruncated(name, 30)
+	runtime.ReadMemStats(&after)
+	if want := strings.Repeat(`\x7f`, 6) + "..."; got != want {
+		t.Errorf("escapeTruncated = %q, want %q", got, want)
+	}
+	// Escaping the whole name first took 64 MiB plus a copy.
+	if alloc := after.TotalAlloc - before.TotalAlloc; alloc > 64<<10 {
+		t.Errorf("allocated %d KiB for a 30-rune preview", alloc>>10)
+	}
+}
+
+// Numbers beyond the plausibility limits count as unreported: they
+// overflowed sums and durations, and made averages +Inf.
+func TestMergeIgnoresImplausibleNumbers(t *testing.T) {
+	for _, doc := range []string{
+		`{"model":"m","usage":{"prompt_tokens":9223372036854775807,"completion_tokens":536870913,"total_tokens":1e18}}`,
+		`{"model":"m","stats":{"tokens_per_second":1e308,"time_to_first_token":1e12,"input_tokens":-5}}`,
+		`{"model":"m","stats":{"time_to_first_token_seconds":86401},"timings":{"predicted_per_second":1000001}}`,
+		`{"model":"m","eval_count":1073741825,"eval_duration":1000000000000}`,
+		`{"model":"m","stats":{"tokens_per_second":-3}}`,
+	} {
+		var d MetricsData
+		d.mergeJSON([]byte(doc))
+		if d != (MetricsData{ModelName: "m"}) {
+			t.Errorf("%s: got %+v, want only the model", doc, d)
+		}
+	}
+
+	// A plausible token count with an impossible rate: the count is kept.
+	var d MetricsData
+	d.mergeJSON([]byte(`{"model":"m","eval_count":1000,"eval_duration":1}`))
+	if d.CompletionTokens != 1000 || d.TokensPerSecond != 0 {
+		t.Errorf("1000 tokens in 1ns: got %+v, want the tokens and no rate", d)
+	}
+
+	d = MetricsData{}
+	d.mergeJSON([]byte(`{"usage":{"prompt_tokens":536870912},"stats":{"tokens_per_second":1000000,"time_to_first_token":86400}}`))
+	if d.PromptTokens != maxTokenCount || d.TokensPerSecond != maxTokensPerSecond || d.TimeToFirstToken != 24*time.Hour {
+		t.Errorf("values at the limits: got %+v, want them kept", d)
+	}
+
+	// A derived rate beyond the limit isn't estimated either.
+	d = MetricsData{CompletionTokens: maxTokenCount, Duration: time.Millisecond}
+	if basis := d.completeDerived(0); basis != "" || d.TokensPerSecond != 0 || d.TPSEstimated {
+		t.Errorf("derived TPS of %g tok/s kept (basis %q)", d.TokensPerSecond, basis)
+	}
+	if d.TotalTokens != maxTokenCount {
+		t.Errorf("TotalTokens = %d, want the completion tokens", d.TotalTokens)
+	}
+
+	// Prompt plus completion tokens at the limit fit in a 32-bit int.
+	d = MetricsData{PromptTokens: maxTokenCount, CompletionTokens: maxTokenCount}
+	d.completeDerived(0)
+	if d.TotalTokens != 2*maxTokenCount || int64(d.TotalTokens) > math.MaxInt32 {
+		t.Errorf("TotalTokens = %d, want %d, within a 32-bit int", d.TotalTokens, 2*maxTokenCount)
+	}
+}
+
+// The running total is an int64, so queries at the limit can't make it
+// overflow on 32-bit builds.
+func TestRunningTotalTokens(t *testing.T) {
+	cfg = Config{Metrics: MetricsConfig{HistoryPoints: 10}}
+	resetMetrics()
+	var snap metricsSnapshot
+	for range 3 {
+		snap = updateGlobalMetrics(MetricsData{ModelName: "m", TotalTokens: 2 * maxTokenCount, Duration: time.Second})
+	}
+	if want := int64(3) * 2 * maxTokenCount; snap.TotalTokens != want || want <= math.MaxInt32 {
+		t.Errorf("running total = %d, want %d (beyond a 32-bit int)", snap.TotalTokens, want)
+	}
 }
 
 // A choices array of millions of empty elements, within maxCaptureBytes, is

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 	"unicode"
+	"unicode/utf8"
 )
 
 // Fuzz targets for the parsers and security checks (AGENTS.md backlog item
@@ -103,6 +104,49 @@ func FuzzEscapeControls(f *testing.F) {
 			t.Fatalf("escapeControls(%q) = %q, unquotes to %q (%v)", in, got, back, err)
 		}
 	})
+}
+
+// FuzzEscapeTruncated checks that escapeTruncated, which stops reading once
+// it knows the result needs cutting, gives the same result as the simple
+// algorithm it replaced: escape all of s, and if that is longer than maxLen
+// runes, add whole escaped units while they fit in maxLen-3 runes.
+func FuzzEscapeTruncated(f *testing.F) {
+	for _, s := range []string{
+		"", "qwen3:4b", strings.Repeat("m", 30), strings.Repeat("m", 31), strings.Repeat("\x7f", 8),
+		"\x1b[2J\r\n[12:00:00] #9\u202e", "日本語\xff\u2028" + strings.Repeat("ä", 40),
+	} {
+		f.Add(s, 30)
+	}
+	f.Add("abcdef", 3)
+	f.Fuzz(func(t *testing.T, s string, maxLen int) {
+		maxLen = 3 + int(uint(maxLen)%60)
+		if got, want := escapeTruncated(s, maxLen), escapeTruncatedModel(s, maxLen); got != want {
+			t.Fatalf("escapeTruncated(%q, %d) = %q, want %q", s, maxLen, got, want)
+		}
+	})
+}
+
+// escapeTruncatedModel is escapeTruncated as it was before it stopped early.
+func escapeTruncatedModel(s string, maxLen int) string {
+	e := escapeControls(s)
+	if utf8.RuneCountInString(e) <= maxLen {
+		return e
+	}
+	var b []byte
+	width := 0
+	for i := 0; i < len(s); {
+		n, escape := escapeAt(s, i)
+		unit := []byte(s[i : i+n])
+		if escape {
+			unit = appendGoEscape(nil, s[i:i+n])
+		}
+		if width += utf8.RuneCount(unit); width > maxLen-3 {
+			break
+		}
+		b = append(b, unit...)
+		i += n
+	}
+	return string(append(b, "..."...))
 }
 
 // FuzzCSVText checks that csvText only ever prepends an apostrophe, that the
