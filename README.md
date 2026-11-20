@@ -339,7 +339,7 @@ numbers. That is useful when a value is missing or looks wrong:
 ```
 [DEBUG] req 2: POST /v1/chat/completions from [::1]:37316 (metered: true)
 [DEBUG] req 2: upstream http://192.0.2.20:1234/v1/chat/completions -> 200 after 0.00s, Content-Type "text/event-stream"
-[DEBUG] req 2: body ended at EOF, stream time 0.03s after 2797 bytes
+[DEBUG] req 2: body ended at EOF, stream time 0.03s from the first output after 2797 bytes
 [DEBUG] req 2: parsed as SSE: 10 JSON document(s), 0 invalid, 0 skipped as larger than 16 MiB
 [DEBUG] req 2: stream has no token usage; OpenAI-compatible clients must send "stream_options": {"include_usage": true}
 [03:52:45] #2 POST /v1/chat/completions 200 | Model: qwen2.5-coder-0.5b-instruct | Time: 0.04s | ...
