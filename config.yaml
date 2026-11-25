@@ -10,11 +10,10 @@
 # against formula interpretation with a leading apostrophe when needed.
 
 # Port the proxy server listens on (default: 11436, next to Ollama's 11434 and
-# a second instance's 11435; earlier versions used 8080)
+# a second instance's 11435)
 proxy_port: 11436
 
 # Upstream LLM server: LM Studio, Ollama or any OpenAI-compatible HTTP server.
-# (Called "lm_studio" in earlier versions.)
 server:
   # Host and port of the server (default: localhost:1234, LM Studio's default).
   # For Ollama use port 11434 and enable "/api/*" below.

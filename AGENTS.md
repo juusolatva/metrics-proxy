@@ -1,312 +1,293 @@
 # AGENTS.md
 
-This document serves as the guide for AI agents and developers working on the `metrics_proxy` codebase. It outlines the project's purpose, architecture, development workflows, configuration, conventions, and known limitations.
+Guide for AI agents and developers maintaining `metrics_proxy`. Usage and
+configuration for users are in `README.md`, runtime settings in `config.yaml`,
+manual tests (real servers, Windows) in `TESTING.md`, and the threat model and
+security invariants in `SECURITY.md`. `CLAUDE.md` includes this file.
 
----
+## 1. Overview
 
-## 1. Project Overview
+`metrics_proxy` is an HTTP reverse proxy in Go (1.26+) between LLM clients and
+one local LLM server (LM Studio, Ollama or another OpenAI-compatible server).
+It forwards requests, inspects responses for inference metrics (model,
+tokens, tokens/s, time to first token, duration), keeps aggregates in memory,
+prints one line per query and optionally appends rows to a CSV file.
 
-`metrics_proxy` is a lightweight HTTP reverse proxy written in Go (1.26+). It sits between an LLM client (such as an API client, IDE extension, or web UI) and a local LLM instance (primarily LM Studio; Ollama and other OpenAI-compatible HTTP backends are also targets, see `testdata/`).
-
-Its primary responsibilities are:
-- Forwarding matching API requests from clients to the local LLM server.
-- Inspecting response payloads to extract inference performance metrics (token counts, tokens per second, query duration, model name).
-- Maintaining aggregate query metrics in memory.
-- Displaying real-time query statistics in the terminal.
-
-The project currently consists of a single-file implementation (`main.go`) with minimal external dependencies (`go.yaml.in/yaml/v4`).
-
-Keep durable project guidance in this file. `README.md` covers usage and development commands, `config.yaml` documents runtime settings, and `docs/windows-testing.md` holds the Windows checklist. `CLAUDE.md` includes this guide via `@AGENTS.md`.
-
----
-
-## 2. Repository Structure
+All code is in `package main`: `main.go`, `main_test.go` and `fuzz_test.go`.
+The only dependency is `go.yaml.in/yaml/v4`.
 
 ```
-metrics_proxy/
-├── AGENTS.md          # Agent and developer guidelines (this file)
-├── config.yaml        # Runtime YAML configuration file
-├── go.mod             # Go module definition (metrics_proxy, Go 1.26)
-├── go.sum             # Checksums for external dependencies
-├── LICENSE            # MIT License
-├── main.go            # Complete application source (proxy, metrics, config)
-├── main_test.go       # httptest-based tests (proxying, streaming, parsing, concurrency)
-├── fuzz_test.go       # Fuzz targets for the captures, escaping, CSV and Host/path checks
-├── README.md          # Usage, configuration, limitations and development commands
-├── SECURITY.md        # Security policy: reporting, threat model, trust boundaries and invariants
-├── CLAUDE.md          # Includes this file (`@AGENTS.md`)
-├── .gitattributes     # Keeps testdata/ byte-exact (no CRLF conversion)
-├── .gitignore         # Build output, test binaries and coverage.out
-├── .golangci.yml      # golangci-lint v2 config (standard linters; errcheck off in tests)
-├── sonar-project.properties  # SonarQube Cloud analysis settings (CI-based analysis, coverage)
-├── .github/
-│   ├── dependabot.yml       # Weekly update PRs for GitHub Actions (SHA pins) and Go modules
-│   └── workflows/ci.yml     # CI: fmt, vet, tests + coverage, SonarQube Cloud, golangci-lint, govulncheck
-├── docs/
-│   └── windows-testing.md   # Checklist for testing on Windows 11
-└── testdata/          # Real response bodies captured from LM Studio (lm_*) and Ollama (ol_*)
-    ├── lm_v1_chat.json, lm_v1_chat_stream.sse          # LM Studio native /api/v1/chat
-    ├── lm_oai.json, lm_oai_stream.sse                  # LM Studio /v1/chat/completions (stream with include_usage)
-    ├── lm_oai_stream_nousage.sse                       #   … streamed without include_usage
-    ├── ol_chat.json, ol_chat_stream.ndjson             # Ollama native /api/chat
-    ├── ol_generate.json, ol_generate_stream.ndjson     # Ollama native /api/generate
-    ├── ol_oai.json, ol_oai_stream.sse                  # Ollama /v1/chat/completions (stream with include_usage)
-    ├── ol_oai_stream_nousage.sse                       #   … streamed without include_usage
-    └── fuzz/                                           # Inputs fuzzing found, replayed as seeds by go test
+main.go, main_test.go, fuzz_test.go
+config.yaml            # Default config, with comments for every setting
+testdata/              # Captured responses: lm_* (LM Studio), ol_* (Ollama)
+testdata/fuzz/         # Fuzz inputs that found bugs, replayed by go test
+.github/workflows/ci.yml, .github/dependabot.yml
+.golangci.yml, sonar-project.properties
+.gitattributes         # Keeps testdata/ byte-exact
 ```
 
-The current captures were taken on 2026-10-17. All of them used the prompt `Count from 1 to 5, separated by spaces.`, sent directly to the server (not through the proxy). Only response bodies were saved.
-- **LM Studio:** `qwen/qwen2.5-coder-14b` with speculative decoding (draft model Qwen2.5 Coder 0.5B). Its OpenAI-compatible `stats` contain only the draft counters (`draft_model`, `*_draft_tokens_count`) and no rate.
-- **Ollama:** `qwen3:4b-instruct-2507-q8_0`.
+## 2. Commands
 
----
+```bash
+go build -o metrics_proxy .
+go run . [--config file.yaml] [--csv stats.csv]
+go test -race ./...
+GOARCH=386 go test ./...       # 32-bit build (token limits must fit an int)
+gofmt -s -w .
+go vet ./...
+go mod tidy && go mod verify
+go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 run
+go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+go run github.com/uudashr/gocognit/cmd/gocognit@v1.1.3 -over 15 .
+go test -run '^$' -fuzz='^FuzzCaptureSplit$' -fuzztime=30s .   # one target per run
+```
 
-## 3. Development Workflow & Commands
+## 3. Testing
 
-### Build & Run
-- **Build binary**:
-  ```bash
-  go build -o metrics_proxy .
-  ```
-- **Run directly**:
-  ```bash
-  go run .
-  ```
-  *Note: Without `--config`, the application reads `config.yaml` from the current working directory.*
-- **Use another config file**:
-  ```bash
-  go run . --config /path/to/ollama.yaml
-  ```
-- **Save per-query statistics to CSV** (command-line flag, not a `config.yaml` setting):
-  ```bash
-  go run . --csv stats.csv
-  ```
-
-### Testing
-Tests live in `main_test.go`. They start a fake upstream and the proxy with `httptest`, and reset the global state (`cfg`, `metrics`, `proxy`, `out`, `csvLog`) per test via `startProxy()`. Graceful-shutdown tests run the proxy through `serve()` with their own contexts via `startServe()`. Metrics are recorded on the proxy's goroutine, so tests wait for them with `waitFor`/`waitForQueries` instead of asserting immediately. `QueryCount` advances before the status line is printed and the CSV row written, so wait for those with `waitForLog` or by polling `readCSV`, not with `waitForQueries`; debug-output checks wait for the status or `[Proxy]` line, which comes after a request's last `[DEBUG]` line. Poll the CSV file with `waitForCSVRows`, which treats a parse error (a row read while being written) as "not yet" instead of failing the test.
-
-Parser tests should use the captured payloads in `testdata/` (read with `readFixture()`) rather than hand-written JSON where possible. `TestCaptureFixtures` feeds every capture whole and in 1-byte chunks, to exercise chunk boundaries, and checks the model, tokens, TPS, TTFT and that no document was invalid. `TestProxyOllamaNativeNDJSON` sends a capture end to end through the proxy. When adding support for a new upstream or endpoint, capture a real response (JSON and streamed) with a `<upstream>_<api>[_stream][_variant].<ext>` name, using `curl -sN -o testdata/<file>` directly against the server, and add it to `TestCaptureFixtures`. Before sending capture requests to a real server, show the user the server, model, request body and what will be saved, and wait for approval. Captures are committed; check them for anything private before adding them.
-
-Under WSL2 a connection to a closed loopback port can hang instead of being refused. `TestUpstreamUnavailable` and `TestLogEscapesControlCharacters` then take ~30 s each (the transport's connect timeout), and the full suite ~70 s. Tests that wait for a listener to close dial it with a short timeout (`net.DialTimeout`) and count a timeout as closed.
-
-Fuzz targets live in `fuzz_test.go` (added 2026-11-19): `FuzzCaptureSplit` (a body written in arbitrary chunks gives the same `MetricsData` and `captureDiag` as the whole body; seeded from every capture in `testdata/`, also as the wrong kind), `FuzzEscapeControls` (nothing left to escape, clean text unchanged, lossless for input without `\` and `"`, which are kept as is), `FuzzEscapeTruncated` (added 2026-11-20: same result as `escapeTruncatedModel`, the simple algorithm that escaped the whole text first), `FuzzCSVText` (apostrophes added only at the start and right after a `;`, checked by `onlyGuardsAdded`; no `;`-separated part starts with a formula prefix; survives a CSV write and read), `FuzzHostName` (a second pass leaves a well-formed result alone; malformed Host values such as `[:` may change again, which is harmless since `hostName` runs once and browsers only send DNS names and IP literals), `FuzzPathChecks` (no path that a lenient router, modelled independently by `routerPath`, resolves to a management endpoint passes both `hasDotDotSegment` and `isManagementEndpoint`; ASCII case changes, doubled slashes, `\` separators and `cleanPath` don't change the result) and `FuzzRequestTarget` (added 2026-11-20: a request target, parsed as `net/http`'s server parses the request line, that `hasPathTarget` accepts reaches the upstream, after the proxy's own `Rewrite`, with the path the proxy checked, and without user info). A plain `go test` runs only their seeds and any failing inputs under `testdata/fuzz/<FuzzName>/`; commit such inputs when fixing what they found. To fuzz one target: `go test -run '^$' -fuzz='^FuzzCaptureSplit$' -fuzztime=30s .` (one target per run). CI fuzzes each target for 30 s in the weekly scheduled and manual runs only (the `fuzz` job) and uploads a failing input as an artifact. Huge inputs are out of the fuzzer's reach, so `maxCaptureBytes` limits stay covered by `TestCaptureOversizedInChunks`.
-
-Testing on Windows: see `docs/windows-testing.md`.
-- **Run tests**:
-  ```bash
-  go test -v ./...
-  ```
-- **Run tests with race detection**:
-  ```bash
-  go test -race -v ./...
-  ```
-
-Coverage (2026-11-21): 93.9% of statements. Security checks (`hasPathTarget`, `allowedHost`, `hostName`, `hasDotDotSegment`, `cleanPath`, `isManagementEndpoint`, `offersUpgrade`, `refuseManagement`, `escapeControls`, `csvText`, `startsFormula`) and the payload captures and parsers (including `hasOutput`, `outputChoices`, `nonEmptyArray` and the `outputTimer`) are at 100%; keep them there. `TestCaptureFirstOutput` pins which capture document counts as the first output. Deliberately uncovered: `main()`, `setupSignalHandling` (real signals would interfere with other tests), and the defensive no-`requestInfo` branch in `meterResponse`; one branch of `decodeConfig` is uncovered too.
+- Tests start a fake upstream and the proxy with `httptest`. `startProxy()`
+  resets the global state (`cfg`, `metrics`, `proxy`, `out`, `csvLog`);
+  shutdown tests run `serve()` with their own contexts via `startServe()`.
+- Metrics are recorded on the proxy's goroutine, so never assert right after a
+  request. `waitFor`/`waitForQueries` wait for metrics. `QueryCount` advances
+  before the status line and CSV row, so wait for those with `waitForLog` and
+  `waitForCSVRows` (which treats a half-written row as "not yet"). Debug
+  checks wait for the status or `[Proxy]` line, which follows a request's last
+  `[DEBUG]` line.
+- Parser tests use the captures in `testdata/` (`readFixture()`) rather than
+  hand-written JSON. `TestCaptureFixtures` feeds every capture whole and in
+  1-byte chunks. New upstreams or endpoints need a new capture; see
+  `TESTING.md` (requests to a real server need the user's approval first).
+- Fuzz targets (`fuzz_test.go`): `FuzzCaptureSplit`, `FuzzEscapeControls`,
+  `FuzzEscapeTruncated`, `FuzzCSVText`, `FuzzHostName`, `FuzzPathChecks`,
+  `FuzzRequestTarget`. `go test` runs their seeds and `testdata/fuzz/`; commit
+  a failing input with its fix. Huge inputs are out of the fuzzer's reach, so
+  `TestCaptureOversizedInChunks` covers `maxCaptureBytes`.
+- Keep the security checks (`hasPathTarget`, `allowedHost`, `hostName`,
+  `hasDotDotSegment`, `cleanPath`, `isManagementEndpoint`, `offersUpgrade`,
+  `refuseManagement`, `escapeControls`, `csvText`, `startsFormula`) and the
+  captures and parsers at 100% coverage. Deliberately uncovered: `main()`,
+  `setupSignalHandling` and the no-`requestInfo` branch in `meterResponse`.
+- Under WSL2, a connection to a closed loopback port can hang instead of being
+  refused, so `TestUpstreamUnavailable` and `TestLogEscapesControlCharacters`
+  take ~30 s each. Tests waiting for a listener to close use
+  `net.DialTimeout` and count a timeout as closed.
 
 ### Backlog
-Planned on 2026-10-26, not yet done. Remove an item from this list once it is done.
-1. **`testing/synctest` for timing tests** (Go 1.25): run the shutdown and streaming tests on a fake clock instead of `waitFor` polling and real timeouts. `t.Context()` (1.24) can replace hand-made test contexts where a test needs no cancel of its own.
-2. **Windows in CI**: a `windows-latest` job running `go test ./...` (without `-race` or the coverage upload). This automates the path, CSV file and refused-connection items of `docs/windows-testing.md`; Ctrl+C handling and Excel stay manual. Possibly `macos-latest` too.
-3. **More captures** in `testdata/`, each added to `TestCaptureFixtures`: OpenAI Responses API (`/v1/responses`, so far only hand-written `response` wrapper tests), error bodies (Ollama `{"error": …}` as JSON and mid-stream), embeddings (`/api/embed`, `/v1/embeddings`: they carry a model and prompt tokens, so they count as queries, as intended; pin that in the test), tool-call and reasoning-model streams, and legacy `/v1/completions`. Record the server versions (LM Studio, Ollama) alongside the capture date in §2. Capturing sends requests to a real server, so ask the user before sending any.
-4. Optional: `BenchmarkSSECapture` (with `b.Loop()`) over `lm_v1_chat_stream.sse` (parsing runs on every streamed chunk, so a slowdown delays tokens), and a one-off mutation-testing run to find assertions that check nothing.
 
-### Linting & Formatting
-- **Format code**:
-  ```bash
-  gofmt -s -w .
-  ```
-- **Check formatting without modifying**:
-  ```bash
-  gofmt -l .
-  ```
-- **Static analysis**:
-  ```bash
-  go vet ./...
-  ```
-- **Lint** (same version as CI, config in `.golangci.yml`):
-  ```bash
-  go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 run
-  ```
-- **Vulnerability check** (same version as CI):
-  ```bash
-  go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
-  ```
-- **CI** (`.github/workflows/ci.yml`, on pushes to `main`, on pull requests, weekly on Mondays and manually via `workflow_dispatch`): `gofmt -s -l`, `go mod verify`, `go vet` and `go test -race` with coverage on the Go version from `go.mod` and on `stable`; the `stable` run uploads `coverage.out` to SonarQube Cloud on pushes and on pull requests from this repository, except Dependabot's (forks and Dependabot get no `SONAR_TOKEN`; scheduled and manual runs skip the scan). golangci-lint and govulncheck run on `stable`. Jobs have `timeout-minutes`, and checkouts use `persist-credentials: false`. The concurrency group includes the event name and only pull request runs are canceled when superseded (`cancel-in-progress` was `true` for all events until 2026-11-21, so a push to `main` canceled a running weekly fuzz/govulncheck run). The fuzz job uploads only its own target's `testdata/fuzz/<target>/` directory. Actions are pinned by commit SHA with a version comment.
-- **Dependabot** (`.github/dependabot.yml`): weekly PRs for GitHub Actions (grouped) and Go modules, skipping releases younger than 7 days (`cooldown`). It doesn't update the golangci-lint and govulncheck versions in `ci.yml`; bump those by hand, together with the commands in this file and `README.md`.
-- **CodeQL** runs as GitHub's default setup (a repository setting, not a workflow file).
+Remove an item once done.
 
-### Dependencies
-- **Tidy dependencies**:
-  ```bash
-  go mod tidy
-  ```
-- **Verify dependencies**:
-  ```bash
-  go mod verify
-  ```
+1. **`testing/synctest`** for the shutdown and streaming tests instead of
+   `waitFor` polling and real timeouts; `t.Context()` where a test needs no
+   cancel of its own.
+2. **Windows in CI**: a `windows-latest` job running `go test ./...` (no
+   `-race`, no coverage upload), automating the path, CSV and
+   refused-connection items of `TESTING.md`. Possibly `macos-latest` too.
+3. **More captures**: OpenAI Responses API (`/v1/responses`), error bodies
+   (Ollama `{"error": …}` as JSON and mid-stream), embeddings (`/api/embed`,
+   `/v1/embeddings`; they count as queries, pin that in the test), tool-call
+   and reasoning-model streams, legacy `/v1/completions`.
+4. Optional: `BenchmarkSSECapture` with `b.Loop()` over
+   `lm_v1_chat_stream.sse`, and a one-off mutation-testing run.
 
----
+## 4. CI and tooling
 
-## 4. Configuration Reference (`config.yaml`)
+- **CI** (`ci.yml`; pushes to `main`, pull requests, weekly, manual): gofmt,
+  `go mod verify`, vet and `go test -race` with coverage on the Go version from
+  `go.mod` and on `stable`; golangci-lint and govulncheck on `stable`. The
+  `stable` test job uploads coverage to SonarQube Cloud, except for forks and
+  Dependabot (no `SONAR_TOKEN`) and scheduled/manual runs. The `fuzz` job
+  fuzzes each target for 30 s on scheduled and manual runs only and uploads
+  failing inputs. Only superseded pull request runs are canceled. Actions are
+  pinned by commit SHA.
+- **Dependabot** updates Actions and Go modules weekly (7-day cooldown). It
+  doesn't bump golangci-lint and govulncheck: change those by hand in
+  `ci.yml`, this file and `README.md`.
+- **SonarQube Cloud** (project `juusolatva_metrics_proxy`): Automatic Analysis
+  must stay disabled, or the CI scan fails. Rules hit so far:
+  - Cognitive complexity at most 15 per function, tests included (`go:S3776`);
+    move loop bodies and checks into named helpers.
+  - Defer a context's cancel in the function that creates it (`godre:S8188`).
+  - `defer resp.Body.Close()` right after the error check (`godre:S8208`).
+  - Derive contexts from an existing one (`go:S8239`). In `main`, `stop` is
+    derived from `force` on purpose: the reverse would let the first signal
+    skip the graceful wait.
+- **golangci-lint** must report 0 issues. Discard deliberately ignored errors
+  explicitly with a reason (`_ = f() // why`) instead of `//nolint`; the one
+  exception is `<-errc` in `serve()`, which keeps `//nolint:errcheck`.
+- **CodeQL** runs as GitHub's default setup (no workflow file).
 
-Configuration is read from the file given by `--config` (default `config.yaml`) and unmarshaled into the `Config` struct via `loadConfig(path)` / `parseConfig()`.
+## 5. Architecture
 
-```yaml
-# Port the proxy server listens on
-proxy_port: 11436
+### Startup (`main`)
 
-# Upstream LLM server (LM Studio, Ollama or OpenAI-compatible)
-server:
-  host: "localhost"
-  port: 1234
+1. `parseFlags()`: `--config` (default `config.yaml`, relative to the working
+   directory) and `--csv`. Positional arguments are an error. Document flags
+   GNU-style (`--name`).
+2. `loadConfig()` / `parseConfig()`: strict decoding (`decodeConfig()`: known
+   fields, unique keys, a single document), then defaults, then
+   `Config.validate()`, which returns the first problem. `forward_unmatched` is
+   a `*bool` so unset means `true`; read it via `cfg.forwardsUnmatched()`.
+   `TestParseConfigYAMLRules` pins the yaml behavior the config relies on; if
+   a yaml upgrade breaks it, update the error example in `README.md` too.
+3. `setupSignalHandling()`: the first `SIGINT`/`SIGTERM` cancels `stop`
+   (graceful), the second `force`; a third uses Go's default handling. It runs
+   before the probe below, so Ctrl+C can cancel that.
+4. `listen()` binds the port before the banner, so a port in use fails early.
+   Then `setupCSVLog()` opens the CSV (append, `0600`, header if empty), and
+   `detectBackend(stop, …)` probes `/api/version`, `/api/v1/models`,
+   `/v1/models` (2 s timeout, no redirects, checks for a known JSON key since
+   LM Studio answers unknown paths with `200`). The probe only affects the
+   banner.
+5. `runProxy()` → `serve()`. The server has only `ReadHeaderTimeout` and
+   `IdleTimeout`: generations can take minutes.
 
-# API endpoint patterns to meter (path prefixes; a trailing "*" is ignored)
-api_endpoints:
-  - "/api/v1/*"  # LM Studio native REST API
-  - "/v1/*"      # OpenAI-compatible API
+### Request routing (`handleRequest`)
 
-# Forward other paths unmetered (false: answer 404 without forwarding)
-forward_unmatched: true
+Checks in order; refusals never contact the upstream and print a `[Proxy]`
+line:
 
-# Forward model management and WebSocket requests (false: answer 403)
-forward_management: false
+1. `hasPathTarget()`: targets that aren't a path (`*`, `a:x:/api/delete`,
+   `http://host` without path) → `400`. The later checks only see `URL.Path`,
+   while Go would send `URL.Opaque` upstream as is.
+2. `allowedHost()` (DNS rebinding): accepts empty Host, IP literals,
+   `localhost`, `localSuffixes`, `os.Hostname()` and `allowed_hosts`; else
+   `403`. Needed in the proxy because `SetURL` replaces the Host header, so the
+   upstream's own check always sees `localhost`.
+3. `hasDotDotSegment()`: decoded `..` segments (`\` counts as separator) →
+   `400`. The later checks use cleaned paths, but the path is forwarded as
+   sent, so cleaning could hide a management prefix.
+4. Unless `forward_management`, `refuseManagement()` → `403` for
+   `managementEndpoints` (matched exactly or below, after `cleanPath()` and
+   lowercasing) and for any `Upgrade` offer other than `h2c` (an upgraded
+   connection is a tunnel whose later requests bypass every check). A
+   remaining `h2c` offer is deleted so `ReverseProxy` can't tunnel.
+5. `isAPIEndpoint()` matches the cleaned path (case kept) against
+   `api_endpoints`. Unmatched paths are forwarded unmetered, or `404` when
+   `forward_unmatched` is false.
+6. A `requestInfo` (ID, start, method, path, `metered`) goes into the context
+   and `proxy.ServeHTTP` runs.
 
-# Further Host header names to accept (IP addresses, localhost and this
-# machine's hostname always work); "*.example" = subdomains, "*" = any host
-allowed_hosts: []
+### Forwarding (`newReverseProxy`)
 
-# Metrics settings
-metrics:
-  history_points: 10        # Recent queries to average tokens/sec over
+- `Rewrite` sets the upstream URL, clears URL user info, sets `X-Forwarded-*`
+  and drops `Accept-Encoding` so bodies arrive uncompressed for inspection.
+- `upstreamTransport` (shared with `detectBackend()`): `Proxy: nil` (ignore
+  `HTTP_PROXY`), `MaxIdleConnsPerHost: 16`, `MaxResponseHeaderBytes` 64 KiB.
+- `FlushInterval: -1` so streamed tokens reach the client at once.
+- `proxyError` logs `[ERROR]` and answers `502`.
 
-# Logging settings
-logging:
-  debug: false              # Print [DEBUG] lines explaining each request's metrics
-```
+### Metering (`meterResponse`, `meteredBody`)
 
-### Configuration Notes
-- The config path comes from `--config` (`parseFlags()`), default `config.yaml`. Relative paths are resolved against the working directory, not the binary's location. A missing, unreadable or invalid file exits with status 1 and an error naming the file. Positional arguments (e.g. `metrics_proxy my.yaml`) are rejected with exit status 2 instead of being ignored.
-- `parseConfig()` applies defaults for unset fields: `proxy_port` 11436, `server` `localhost:1234`, `history_points` 10, and `api_endpoints` `["/api/v1/*", "/v1/*"]` (also when given as an empty list). `forward_unmatched` is a `*bool` so that unset means `true`; read it via `cfg.forwardsUnmatched()`, which also treats the `nil` of test-built `Config`s as `true`. The port was 8080 until 2026-10-17; it moved to stay clear of 8080 (llama.cpp's `llama-server` and many others), Ollama's 11434 and a second Ollama instance's 11435. An empty config file is valid (`io.EOF` from the loader is treated as "no settings").
-- `parseConfig()` decodes strictly via `decodeConfig()` (`yaml.NewLoader` with `yaml.WithKnownFields()` and `yaml.WithUniqueKeys()`; not the legacy `yaml.NewDecoder` shim): unknown keys, i.e. typos or removed settings, fail with `field <key> not found in type main.<Struct>` and the line number (`TestParseConfigRejectsUnknownKeys`). Duplicate keys fail too. A second YAML document, after `---` or after a `...` end marker, fails with `line N: a second YAML document starts here` (with yaml rc.6, content after `...` was a syntax error instead); until 2026-10-22 both were silently dropped. `metrics.mode` and `metrics.refresh_interval_ms` were removed (never implemented), so old files containing them now fail to load until the keys are deleted. Removing or renaming a key has the same effect, so mention it in README.md.
-- The yaml module has been stable since v4.0.0 (2026-11-04; adopted 2026-11-16 from rc.7, with no change in behavior or error wording). Its error wording changed between the release candidates (since rc.7: type errors on one line joined by `; `, syntax errors as `go-yaml load error in <stage> … at L<line>.C<column>`), and it may change again in a later 4.x release. `TestParseConfigYAMLRules` pins what the config relies on (YAML 1.1 booleans such as `no`/`on`, duplicate keys, single document, error positions); when a yaml bump fails it, update README.md's error examples along with the test.
-- `allowed_hosts` (`Config.AllowedHosts`, default empty) adds Host header names to those `allowedHost()` always accepts (see §5, "Request Routing"). Entries are names without port, matched case-insensitively; `"*.example"` matches subdomains of `example` (not `example` itself), and `"*"` accepts any Host, which turns the DNS rebinding check off (the behavior before 2026-10-24).
-- After defaults, `Config.validate()` rejects values that can't work (added 2026-11-18): ports outside 1–65535 (`proxy_port`, `server.port`; `0` still means the default), a `server.host` that isn't a bare name or IP (`checkServerHost`: scheme, port, IPv6 brackets, `/?#@`, whitespace or controls; `net.JoinHostPort` would otherwise build e.g. `[http://localhost]:1234`), and `api_endpoints` entries not starting with `/` (`""` or `"*"` matched every path; `"/*"` is the way to meter everything). Since 2026-11-20 it also rejects patterns that silently matched nothing (`checkAPIEndpoint`): `*` anywhere but at the end (`"/v1/**"`, `"/v1/*/chat"`), and prefixes that `cleanPath` changes (`//`, `.`/`..` segments, `\`; the error names the cleaned pattern), since requests are matched after cleaning. `allowed_hosts` entries are checked too (`checkAllowedHost`): no scheme, port, trailing dot, brackets, `/?#@`, whitespace or controls, not empty, and `*` only alone or as a leading `*.` with a name after it; `hostName()` strips ports, brackets and trailing dots from the Host header, so such entries never matched. `metrics.history_points` defaults only when `0` and must otherwise be at least 1 (negative values used to become 10 silently). These checks can make a config that loaded before fail; README.md says so. It returns the first problem only.
-- `logging.debug` enables `[DEBUG]` output (see §5, "Debug Logging").
-- `forward_management` (`Config.ForwardManagement`, plain `bool`, default `false`) controls whether management requests and protocol upgrades are forwarded (see §5, "Request Routing"). It was added on 2026-10-24 as a security fix: the proxy listens on all interfaces without authentication, and Ollama and LM Studio rely on listening only on localhost to keep their management APIs private. Until then, management requests and upgrades were forwarded like any other request.
-- The `server` key (`Config.Server`, `ServerConfig`) names the upstream regardless of server type; to front Ollama, point it at `localhost:11434` and add `"/api/*"` (Ollama native `/api/chat`, `/api/generate`) to `api_endpoints`. It was called `lm_studio` until 2026-10-17 and was renamed without an alias, since the project has a single user; old files fail with `field lm_studio not found`.
+- A `Content-Type` over `maxContentTypeBytes` (1 KiB) fails with `502`, also
+  for unmetered requests: `ReverseProxy` parses it with `mime.ParseMediaType`
+  after the hook, which allocates per parameter.
+- Unmetered responses get a `not metered` line at header time and an
+  unwrapped body. `101` upgrades are never metered.
+- Metered bodies are wrapped in `meteredBody`, which copies each chunk into a
+  `capture` chosen by `newCapture()`: `jsonCapture` (buffers, parses at EOF),
+  `sseCapture` (event by event) or `ndjsonCapture` (line by line), the last two
+  sharing a `lineSplitter`. Other content types aren't inspected.
+- Bounds: `maxCaptureBytes` (16 MiB) per body, line or SSE event; oversized
+  ones are forwarded but skipped (an oversized SSE event is skipped up to its
+  blank line so its later data lines aren't parsed as a fragment). Buffers
+  over `reuseLimit` (64 KiB) are released rather than reused.
+- `finish()` runs once on EOF or `Close`: takes `MetricsData` from the
+  capture, sets the duration, fills missing totals and TPS
+  (`completeDerived()`), then replaces the TTFT with the measured one when the
+  capture saw output (`firstOutput()`). The order matters: subtracting a
+  measured TTFT first would give huge rates for streams held back on the way.
+- **Measured TTFT**: request start to the first document with output
+  (`llmPayload.hasOutput()`) read from the upstream, so it includes model
+  loading but not slow client writes. It wins over a reported TTFT (the user
+  wants loading visible). JSON bodies are never timed. New output fields go
+  into `llmPayload`/`outputFields` and `TestPayloadHasOutput`. Array fields are
+  decoded through `outputChoices`/`nonEmptyArray`, one element at a time, so
+  millions of tiny elements can't allocate far beyond the capture limit; keep
+  new array fields on that pattern.
+- **Stream time** for derived TPS: from the first output (or first byte, when
+  no output field is recognized) to the last data read, used only if the body
+  arrived in bursts: at least `minStreamWaits` reads that waited `streamGap`
+  (1 ms) or more *on the upstream* (timed inside `meteredBody.Read`, so slow
+  clients and parsing don't count). Otherwise the request duration is used;
+  buffered bodies would otherwise get rates in the millions.
 
----
+### Parsing (`llmPayload`, `MetricsData.merge`)
 
-## 5. Architecture & Internal Components
+- One struct covers OpenAI-compatible (`usage`, Ollama's `timings`), Ollama
+  native (`eval_count`/`eval_duration` → TPS), LM Studio v0 (`stats`) and v1
+  (`stats.*`, `model_instance_id`) payloads. `result` and `response` wrappers
+  are merged by `mergeJSONBounded` (at most `maxWrapperDepth` hops and
+  `maxPayloadParseBytes` per document, root included).
+- Later SSE events/NDJSON lines override earlier fields. Non-objects are
+  ignored; a field of the wrong type is skipped without losing the others.
+- Implausible numbers count as unreported: tokens over `maxTokenCount` (2^29,
+  so sums fit a 32-bit `int`), rates over `maxTokensPerSecond`, TTFT over
+  `maxTTFTSeconds`.
 
-All application logic is currently contained in `main.go`:
+### Recording (`recordQuery`)
 
-### Global State
-- `cfg` (`Config`): Global configuration parsed once at startup.
-- `proxy` (`*httputil.ReverseProxy`): Reverse proxy to the upstream server, built by `newReverseProxy()`.
-- `metrics` (`Metrics`): Thread-safe in-memory metrics store protected by `metrics.mu` (`sync.RWMutex`).
-- `out` (`io.Writer`): Destination for per-request status lines (stdout; replaced in tests).
-- `csvLog` (`*csvRecorder`): Per-query CSV output opened by `openCSVLog()` when `--csv` is given; `nil` when disabled (reset by `startProxy()` in tests).
+- Responses without model, tokens or TPS are logged, not counted.
+- `updateGlobalMetrics()` updates `metrics` under `metrics.mu` and returns a
+  snapshot; `displayMetrics()` prints it without the lock.
+- `csvRecorder.record()` (own mutex) encodes each row with a fresh
+  `csv.Writer` and writes it in one `Write`, so one failed write doesn't stop
+  later rows. After a partial write, `dropPartial()` truncates those bytes
+  before the next row, and rows are refused until that succeeds. The file is
+  used through the `csvFile` interface so tests can fake failures. Rows after
+  `Close()` are dropped.
 
-### Execution Flow
-1. **Startup (`main`)**:
-   - Parses command-line flags with `parseFlags()` (own `flag.FlagSet`, `ContinueOnError`, testable): `--config <file>` and `--csv <file>`. Document and show flags GNU-style (`--name`). `flagUsage()` prints `--help` that way, and the `flag` package also accepts the single-dash form.
-   - Loads configuration via `loadConfig(opts.configPath)` / `parseConfig()` and prints which file was loaded.
-   - Builds `proxy` targeting `upstreamURL()`.
-   - Binds the port with `listen()` before printing `Proxy listening on port N` and probing the upstream, so a port in use fails before the banner and probe (exit status 1, `Error starting proxy: …`). Connections arriving during the probe wait in the listen backlog.
-   - With `--csv`, then opens the file via `openCSVLog()` (after `listen()` since 2026-11-20, so a port in use doesn't leave a new header-only file behind): append mode, created if missing with mode `0600` (owner only on POSIX, before the umask; rows show what was queried and when; on Windows the mode only controls the read-only flag, so the file gets its folder's access rules; an existing file keeps its mode). `main` calls it through `setupCSVLog()`, which also sets `csvLog` and prints `Writing statistics to …`, header (`csvHeader`) written only when the file is empty. An open error exits with status 1. The file is closed (deferred) after `runProxy()` returns.
-   - Names the upstream in the startup banner via `detectBackend()`: probes `/api/version` (Ollama), `/api/v1/models` (LM Studio), `/v1/models` (OpenAI-compatible) with a 2 s timeout, aborted when `stop` is done (Ctrl+C during the probes; `TestDetectBackendCanceled`), over `upstreamTransport` (like the proxy), checking the JSON body for a known key because LM Studio answers unknown endpoints with `200` and an error body. Redirects are not followed (`http.ErrUseLastResponse`; a 3xx counts as an unrecognized status). Falls back to "upstream … (server type not detected)" and stops probing on the first connection error. Only affects the banner.
-   - `main` creates two cancelable contexts, `stop` and `force`, with `defer cancel()`. `setupSignalHandling(stopNow, forceNow)` calls the first cancel on the first `SIGINT`/`SIGTERM` and the second on the next, then calls `signal.Stop`, so a third signal ends the process through Go's default handling, also during `serve()`'s last 2 s wait. The `config:` debug line prints the upstream with `net.JoinHostPort` (`[::1]:1234`). Keep context creation and `defer cancel()` in `main`: SonarCloud rule `godre:S8188` flags cancel functions that aren't deferred where they're created.
-   - `runProxy()` hands the listener and an `http.Server` (handler `handleRequest`) to `serve()`. No read/write timeouts (generations can take minutes; an expiring `ReadTimeout` cancels the request context), only `ReadHeaderTimeout`/`IdleTimeout`.
-2. **Request Routing (`handleRequest`)**:
-   - First, in every configuration, `hasPathTarget()` refuses request targets that aren't a path (`URL.Opaque` set, or `URL.Path` not starting with `/`: e.g. `a:x:/api/delete`, `*`, `http://host` without a path) with `400 Bad Request` and a `[Proxy] Rejected METHOD TARGET: request target is not a path` line (the target from `redactedTarget()`: without user info, query string or fragment, since the line is printed without debug too; escaped), without contacting the upstream. The checks below only look at `URL.Path`, which such targets leave empty or relative, while `SetURL` keeps `URL.Opaque` and Go writes it as the outgoing request target: until 2026-11-20, `DELETE a:x:/api/delete` passed every check as an unmetered empty path and went out as `DELETE x:/api/delete`, which a Go upstream (Ollama) routes to `/api/delete`. Absolute-form targets with a path (`http://host/v1/…`) are checked by their path as usual. `OPTIONS *` never reaches the handler (`net/http` answers it itself). `TestNonPathTargetNotForwarded` sends raw request lines; `http.Client` can't send such targets.
-   - Then checks the Host header against DNS rebinding: `hostName()` strips port, IPv6 brackets and a trailing dot and lowercases it; `allowedHost()` accepts an empty Host, any IP address (no DNS lookup to rebind), `localhost`, names ending in `localSuffixes` (`.localhost`, `.local`, `.internal`, `.home.arpa`: reserved for local use, so public DNS can't answer for them), this machine's `os.Hostname()` and `allowed_hosts` entries, mirroring Ollama's own `allowedHost` check (Ollama accepts only loopback, private and its own interfaces' IPs; any IP is accepted here, since no IP literal can be rebound). `.lan` is deliberately not built in: it is not reserved and could still be delegated; add `"*.lan"` to `allowed_hosts`. Other hosts get `403 Forbidden` and a `[Proxy] Rejected METHOD PATH: Host "…" not allowed (add "…" to allowed_hosts …)` line (Host printed with `%q`), without contacting the upstream. The check is needed in the proxy because `pr.SetURL` replaces the Host header, so the upstream's own Host check always sees `localhost:<port>`. `Origin` is not checked.
-   - Then, in every configuration, `hasDotDotSegment()` refuses decoded paths with a `..` segment (backslashes count as separators; `%2e%2e` and `%2F` are decoded first) with `400 Bad Request` and a `[Proxy] Rejected METHOD PATH: ".." segment in path` line, without contacting the upstream. The checks below run on `path.Clean`ed paths, but the proxy forwards the path as sent, so cleaning could remove a management prefix that the upstream still sees (`/api/blobs/..` was checked as `/api` and forwarded until 2026-10-26). Clients resolve dot segments before sending, so nothing legitimate is refused; dots inside a segment (`a..b`) are ordinary characters.
-   - Then, unless `cfg.ForwardManagement`, `refuseManagement()` answers `403 Forbidden` without contacting the upstream, with a `[Proxy] … not forwarded: METHOD PATH (forward_management: false)` line, for:
-     - management paths: `isManagementEndpoint()` matches the decoded path, after reading `\` as `/` (as WHATWG URL parsers do), `path.Clean` and lowercasing, against `managementEndpoints`, exactly or below (`e` or `e + "/"`). The list holds Ollama's `/api/pull`, `/api/push`, `/api/create`, `/api/copy`, `/api/delete`, `/api/blobs` and the ollama.com account endpoints `/api/me` (shows the signed-in account), `/api/signout`, `/api/user/keys`, plus LM Studio's `/api/v1/models/load`, `/unload` and `/download`. These are refused even when they match `api_endpoints` (Ollama's `"/api/*"`) or `forward_unmatched` is false. Ollama's `/api/web_search`, `/api/web_fetch` and `/api/experimental/*` variants are deliberately not listed: like cloud models through `/api/chat`, they run queries on the account but don't change models or the account.
-     - protocol upgrades: `offersUpgrade()` is true when an `Upgrade` header offers any protocol other than `h2c`, on any path. An upgraded connection is a tunnel whose later requests never reach `handleRequest`. LM Studio's SDK API (lmstudio-js/-python) runs over WebSocket on the server port (`/llm`, `/embedding`, `/system`, `/diagnostics`, `/files`, `/repository`, `/plugins`, `/runtime`; `/llm` loads models, `/repository` downloads them), so SDK clients need `forward_management: true`. Upgrades are refused in general rather than by namespace list, so namespaces added later are covered too. The proxy never metered upgraded connections anyway.
-     - Otherwise it deletes the request's `Upgrade` header, which at that point can only offer `h2c` (Java's `HttpClient` adds it to ordinary `http://` requests and stays on HTTP/1.1 when the server doesn't switch). Without that header `ReverseProxy` can't tunnel, so the request goes out as plain HTTP/1.1. With `forward_management: true` nothing is refused or removed.
-   - Validates incoming path against `cfg.APIEndpoints` using `isAPIEndpoint()` (prefix match, trailing `*` stripped). It matches the path after `cleanPath()` (`\` read as `/`, `path.Clean`; shared with `isManagementEndpoint()`), keeping a trailing slash, so `//v1/chat/completions` or `/./v1/…` are metered rather than forwarded unmetered. Case is kept: patterns are the user's.
-   - Paths that match are metered. Others are forwarded unmetered when `cfg.forwardsUnmatched()` (default), otherwise answered with `404 Not Found` and a `[Proxy] Non-API request` line, without contacting the upstream.
-   - Stores a `requestInfo` (request ID, start time, method, path, `metered`) in the request context and calls `proxy.ServeHTTP`.
-3. **Forwarding (`newReverseProxy`)**:
-   - `Rewrite` points the request at the upstream, clears user info from an absolute-form target (`pr.Out.URL.User`; it isn't sent, but must not reach logs), sets `X-Forwarded-*`, and drops `Accept-Encoding` so the transport decompresses bodies before they are inspected.
-   - `Transport` is `upstreamTransport` (`newUpstreamTransport()`, added 2026-11-20), shared with `detectBackend()`: a clone of `http.DefaultTransport` with `Proxy: nil` (an ambient `HTTP_PROXY` would otherwise route a LAN upstream through it; Go only exempts localhost), `MaxIdleConnsPerHost: 16` (default 2) and `MaxResponseHeaderBytes: maxResponseHeaderBytes` (64 KiB instead of 10 MiB; larger headers fail the request with `502`). `TestUpstreamResponseHeaderLimit` checks the limit for proxied requests and the probe, which shows the probe uses the same transport.
-   - `FlushInterval: -1` flushes every write, so streamed tokens reach the client immediately.
-   - `ErrorHandler` (`proxyError`) logs an `[ERROR]` line and returns `502 Bad Gateway` ("Failed to connect to the upstream LLM server").
-4. **Metrics Capture (`meterResponse` → `meteredBody`)**:
-   - `meterResponse` first refuses a `Content-Type` longer than `maxContentTypeBytes` (1 KiB) by returning an error, which `ReverseProxy` hands to `proxyError` (`502`, `[ERROR] METHOD PATH: upstream Content-Type header too long (N bytes, limit 1024)`). This runs for unmetered responses too, before debug output, because `ReverseProxy` parses the Content-Type with `mime.ParseMediaType` after the hook (to pick its flush interval), and that allocates a map per MIME parameter base name. `newCapture` itself only compares the media type (before `;`, trimmed, lowercased) without parsing parameters.
-   - For unmetered requests (`requestInfo.metered` false), `meterResponse` only prints `[Proxy] METHOD PATH STATUS (Ns, not metered)` when the headers arrive (time to headers, not the body) and leaves the body unwrapped; nothing is counted or written to CSV.
-   - Otherwise `ModifyResponse` wraps the upstream body in a `meteredBody` (except `101` upgrades, which get a `[Proxy] METHOD PATH 101 (Ns, protocol upgrade, not metered)` line, with or without debug). As the proxy copies the body to the client, each chunk is also written to a `capture` chosen by Content-Type (`newCapture`): `jsonCapture` (buffers, parses at end), `sseCapture` (`text/event-stream`, parses event by event) or `ndjsonCapture` (`application/x-ndjson`, Ollama native streaming, parses line by line). The streaming captures share a `lineSplitter`. Other content types are not inspected. Captures are bounded by `maxCaptureBytes` (16 MiB); oversized bodies/lines are proxied but not parsed. An SSE event with an oversized line, or whose `data:` lines together exceed the limit, is skipped up to its closing blank line (`sseCapture.skipEvent`), so its remaining data lines aren't parsed as a fragment; later events still count. The splitter drops an oversized line without emitting it, so `sseCapture.noteDropped()` checks `lineSplitter.oversized` before each line and again in `finish()` before the final dispatch (an oversized last line once let the data lines before it parse). SSE `diag().oversized` counts skipped events, once each. An event's size includes the `\n` joining its data lines (until 2026-11-20 an event could reach the limit plus one byte; `TestSSEEventSizeLimit`). A line may hold `maxCaptureBytes` plus the `\r` of a CRLF ending: the splitter buffers one byte more and `endLine` checks the length after trimming the `\r` (`TestLineSizeLimitCRLF`). After a line or event, buffers larger than `reuseLimit` (64 KiB) are dropped rather than kept for reuse (`reuse()`), and an oversized line or event drops its buffer at once, so one large event doesn't hold up to 16 MiB for the rest of a long stream (`TestCaptureBuffersReleased`).
-   - On EOF or `Close` (e.g. client disconnect), `finish()` runs once: gets `MetricsData` from the capture, sets the duration, fills totals/TPS the upstream didn't report (`completeDerived`, see below), and then replaces the TTFT with the measured one when the capture saw generated output (`capture.firstOutput()`; `TTFTMeasured`). Measured TTFT is the time from `requestInfo.start` to the moment the first document with output was written to the capture, i.e. read from the upstream just before it is forwarded, so it includes model loading (and the network to the upstream) but not a slow client's write time, which is deliberate: it times the server. The streaming captures record it with an `outputTimer` from `mergeDocument()`'s second result (`llmPayload.hasOutput()`: non-empty `choices[].delta.content`/`reasoning_content`/`reasoning`/`tool_calls`, `choices[].text`, Ollama `message.content`/`thinking`/`tool_calls`, `response` as a string, `thinking`, LM Studio v1 top-level `content`, Responses API `delta`; wrappers aren't inspected). `choices` and `tool_calls` are decoded through `outputChoices` (one element at a time, stopping at the first with output; only a document's first `choices` member is inspected, since every repeat of a key calls `UnmarshalJSON` again and each started a fresh decoder allowance, `TestRepeatedChoicesBounded`) and `nonEmptyArray` (no elements decoded), so a document of millions of tiny elements within `maxCaptureBytes` can't allocate far beyond it; keep new array-typed output fields on that pattern. Start events (LM Studio `chat.start`, `prompt_processing.*`, `message.start`; an OpenAI role-only chunk) don't count. JSON bodies are never timed (`firstOutput()` is zero), so their TTFT stays as reported. Measured wins over reported (decided 2026-11-19: the user wants model loading visible; LM Studio's own figure covers prompt processing only). `completeDerived` runs before the replacement on purpose: a measured TTFT subtracted from the duration would bring back huge rates for streams held back on the way. For streamed captures, `completeDerived` uses the stream time (`meteredBody.streamTime()`) as generation time: from the first generated output (`meteredBody.output`, the capture's `firstOutput()` noted in the read that found it) to the last read that returned data (`lastByte`). Since 2026-11-20; before, it ran from the first byte, so events sent before generation (a role-only chunk, Responses API `response.created`, keep-alive comments during model loading) added loading and prompt processing and understated the rate (`TestStreamTimeFromFirstOutput`). Streams whose output fields aren't recognized (no `firstOutput()`) still run from the first byte (`firstByte`). The time is used only if the body arrived in bursts: at least `minStreamWaits` (2) reads that waited `streamGap` (1 ms) or more for the upstream (timed inside `meteredBody.Read` around the upstream read since 2026-11-21; the time between reads also held the proxy's own parsing and the client's writes, so a slow client, or the race detector slowing the parsing, made a buffered body look streamed: `TestStreamWaitsCountUpstreamOnly`; this was why `TestStreamTimeNeedsPausesBetweenReads` failed under `-race` on a loaded machine), counting only waits after the read with the first output (`meteredBody.outWaits`; `meteredBody.waits` when timed from the first byte). The debug line says which (`stream time 0.04s from the first output`). Otherwise stream time is 0 and the request duration is used. A buffered body, read in one go or back to back from the transport's 4 KiB buffer, would otherwise be timed in microseconds; until 2026-11-18 the time from first byte to EOF was used, which gave such streams rates in the millions. Streams faster than about 1000 tok/s have shorter pauses and fall back too. A derived TPS sets `MetricsData.TPSEstimated`, and the status line shows it as `TPS: 40.98 (est.)`.
-5. **Payload Parsing (`llmPayload`, `MetricsData.merge`)**:
-   - `encoding/json` into a struct covering OpenAI-compatible responses (`model`, `usage.*`; Ollama adds `timings.predicted_per_second`), Ollama native (`prompt_eval_count`, `eval_count`, `eval_duration` in ns → TPS = `eval_count / eval_duration`), LM Studio API v0 (`usage`, `stats.tokens_per_second`, `stats.time_to_first_token`) and v1 (`model_instance_id`, `stats.input_tokens`, `stats.total_output_tokens`, `stats.tokens_per_second`, `stats.time_to_first_token_seconds`). Wrapped payloads in `result` (v1 `chat.end` SSE event) and `response` (OpenAI Responses API events) are merged by `mergeJSONBounded`: at most `maxWrapperDepth` (8) wrapper hops and `maxPayloadParseBytes` (32 MiB) cumulative decode bytes per document, including the root and shared across both branches. Checks happen before each decode; over-limit wrappers are skipped while already merged fields are kept. `merge` handles only the fields of one payload. Later SSE events / NDJSON lines override earlier fields and receive a fresh budget. Non-object payloads are ignored; a field of unexpected type (`json.UnmarshalTypeError`) is skipped without discarding the others. Numbers beyond the plausibility limits count as unreported (added 2026-11-20, `TestMergeIgnoresImplausibleNumbers`): token counts above `maxTokenCount` (2^29, so prompt plus completion tokens fit in a 32-bit `int`; the running `Metrics.TotalTokens` is an `int64`; `GOARCH=386 go test ./...` runs the suite as a 32-bit build, where the tests' `2 * maxTokenCount` wouldn't compile with a larger limit), rates above `maxTokensPerSecond` (1e6, also for Ollama's computed and the proxy's derived rate) and TTFTs above `maxTTFTSeconds` (24 h). JSON allows integers up to `math.MaxInt` and floats up to 1.8e308, which overflowed token sums and the TTFT's `time.Duration`, made the `Avg` rate `+Inf` and printed 300-digit numbers. The CSV's `optInt` also writes values `<= 0` as empty.
-6. **State Update & Display (`recordQuery`)**:
-   - Responses without inference data (no model, tokens or TPS, e.g. `/v1/models`, errors) are logged with a `[Proxy]` line and not counted.
-   - Otherwise `updateGlobalMetrics()` locks `metrics.mu`, updates count, cumulative tokens, running average time, latest model/TPS, appends to `History` (newest last, bounded to `cfg.Metrics.HistoryPoints`), and returns a `metricsSnapshot` (incl. average TPS over `History`).
-   - `displayMetrics()` prints one line per query from the snapshot without holding the lock.
-   - If `csvLog` is set, `csvRecorder.record()` appends the query as a CSV row. `writeRow()` encodes each row into a buffer with a fresh `csv.Writer` and writes it to the file with a single `Write`; the recorder is guarded by its own mutex, not `metrics.mu`. Until 2026-11-20 one shared `csv.Writer` was used, whose `bufio.Writer` keeps the first write error, so one failed write (Excel locking the file, a briefly full disk) stopped CSV recording until a restart (`TestCSVRecordsAgainAfterWriteError`). A write that fails after writing part of a row leaves `csvRecorder.partial` set; `dropPartial()` truncates those bytes off the end of the file (`Stat` size minus `partial`; the file is opened for appending) before the next row, and rows are refused rather than merged until that succeeds (`TestCSVDropsPartlyWrittenRow`, `TestCSVRefusesRowsUntilPartialRowDropped`). The file is used through the `csvFile` interface (`Write`, `Close`, `Stat`, `Truncate`) so tests can fake failures. Columns: `timestamp` (RFC 3339, ms, local zone), `method`, `path`, `status`, `model`, `prompt_tokens`, `completion_tokens`, `total_tokens`, `tokens_per_second`, `tps_estimated`, `ttft_seconds`, `duration_seconds`, `complete`, `ttft_measured` (added 2026-11-19). `csvText` protects method/path/model cells with a leading apostrophe for formula prefixes (`=`, `+`, `-`, `@`, including fullwidth variants) even behind leading whitespace, controls, Unicode format characters or double quotes (`startsFormula`); initial controls and invalid UTF-8 are protected too. The same check runs on the text after each `;`, which gets an apostrophe right after the `;` when needed (since 2026-11-20): Excel in locales whose list separator is `;` (Finnish, German) splits the comma-separated file at semicolons and ignores the CSV quoting, so `/x;=cmd` would put `=cmd` in a cell of its own. Other values remain unchanged; CSV quoting handles commas separately. Unknown tokens, TPS and TTFT are left empty, not written as `0`. Rows are per-query values only; aggregates (`Avg`, running totals) are not written. Write errors are logged as `[ERROR] writing CSV` and don't affect proxying; later rows are written again once the file accepts writes. Rows arriving after `Close()` (requests cut off by shutdown) are dropped.
-7. **Shutdown (`serve`)**:
-   - `serve()` wraps the handler with an in-flight request counter and runs `server.Serve` until `stop` is done.
-   - It then calls `server.Shutdown`, which closes the listener and waits for in-flight requests, streamed generations included, to finish normally and be recorded. The wait is bounded by `shutdownTimeout` (60 s, below systemd's default 90 s stop timeout) and aborted early by `force`.
-   - On timeout or force it calls `server.Close()`. That cancels the upstream requests, so their bodies end without EOF and are logged as `incomplete`. It waits up to 2 s for those handlers to record, then prints `Proxy stopped` and returns `nil` (exit status 0).
-   - Upgraded (`101`, hijacked) connections are not closed or awaited by `Shutdown` or `Close`; process exit drops them. `serve()` wraps the `ResponseWriter` in a `hijackNotifier`, whose `Hijack()` stops counting the request as in flight (`ReverseProxy` hijacks and flushes through `http.ResponseController`, which reaches the wrapped writer via `Unwrap`). Without it an open WebSocket showed as an in-flight request in the shutdown message and stretched a forced shutdown by the 2 s wait.
-8. **Debug Logging (`debugf`, `logging.debug`)**:
-   - `debugf()` prints `[DEBUG] …` lines to `out` only when `cfg.Logging.Debug` is set. Each forwarded request gets an ID from `requestSeq` (`requestInfo.id`), and its lines start with `req N:`.
-   - Startup: the effective config after defaults, and each `detectBackend()` probe's result (status, non-JSON body, missing or found key, connection error).
-   - `handleRequest`: method, path (not the query string, which may carry keys), client address and whether the path is metered.
-   - `meterResponse`: upstream scheme, host and path (again without the query string), status, time to response headers, Content-Type, and whether the body is inspected (not for unknown Content-Types or `101` upgrades).
-   - `meteredBody.debugSummary()` (from `finish()`): whether the body reached EOF (if not: `client disconnected or shutdown` when the proxy stopped reading or the read was canceled, otherwise `upstream read error: …` with the first read error, `meteredBody.readErr`), its byte count and stream time; the capture's `captureDiag` (parser name; JSON documents parsed, invalid, or skipped for exceeding `maxCaptureBytes`); for a measured TTFT, the number of the first document with output (`captureDiag.outputDoc`) and the TTFT; the basis of an estimated TPS (returned by `completeDerived()`); and hints when nothing counts as inference, or when an SSE stream that reached EOF has no usage. `usageHint()` adds the `include_usage` advice only for paths ending in `/completions` (OpenAI chat and legacy completions); a stream cut off before EOF gets no hint, since usage comes in the last events.
-   - The counters live in each capture (`captureDiag.count()` from `mergeJSON`'s/`mergeDocument`'s return value, `lineSplitter.oversized`). `mergeJSON` returns `false` for non-objects; a type error on the whole document (`UnmarshalTypeError.Field == ""`) counts as invalid, a field-level one doesn't. When adding a capture, implement `diag()` and `firstOutput()`.
+### Shutdown (`serve`)
 
----
+`serve()` counts in-flight requests, then on `stop` calls `server.Shutdown`
+(waits for running generations, bounded by `shutdownTimeout`, 60 s, and by
+`force`). On timeout or force it calls `server.Close()`, which cuts upstream
+requests (logged as `incomplete`), waits up to 2 s for them to record and
+returns `nil`. `hijackNotifier` stops counting hijacked (WebSocket)
+connections, which `Shutdown` doesn't wait for.
 
-## 6. Known Limitations & Gotchas
+### Debug logging (`debugf`)
 
-1. **Streamed OpenAI-compatible responses may lack token counts**:
-   - OpenAI-style SSE chunks only carry `usage` when the client requests it (`"stream_options": {"include_usage": true}`). Without it, the query is recorded with its model and duration but no tokens or TPS.
-2. **Derived TPS is an estimate**:
-   - When the upstream reports no `tokens_per_second`, `completeDerived()` computes completion tokens / generation time. For non-streamed responses without a reported time to first token, that time includes prompt processing, so TPS is understated.
-   - Estimated values are marked `(est.)` in the status line but still count towards the `Avg … tok/s` over `History`.
-   - The error grows as replies get shorter, since request overhead dominates: in a live test, a 6-token non-streamed LM Studio `/v1/chat/completions` reply showed ~41 tok/s against a real ~250. LM Studio's OpenAI-compatible API (`/v1/*`) never reports a rate, streamed or not: `stats` is empty, or with speculative decoding holds only the draft counters. So its TPS is always estimated; for streams the stream time is used, which is closer.
-3. **Time to first token is measured for streams, reported only for JSON bodies**:
-   - For streams the proxy measures TTFT (since 2026-11-19, see §5 item 4) and that replaces any reported value; it includes model loading and network time and is not marked in the status line (only the CSV's `ttft_measured` column tells them apart). Non-streamed responses show a TTFT only when the upstream reports it, which only the LM Studio native API (`/api/v1/*`) does. Streams whose output is only in fields `hasOutput()` doesn't know (e.g. LM Studio v1 `tool_call.*` events) get no measured TTFT and keep the reported one, if any. Add new output fields to `llmPayload`/`outputFields` and `TestPayloadHasOutput`.
-4. **Do not buffer response bodies before forwarding**:
-   - Bodies must stay streamed through `meteredBody`; reading the body in `ModifyResponse` would also hold back response headers and break SSE. `TestProxyStreamsSSEWithoutBuffering` guards this.
-5. **Debug logging is config-only and unstructured**:
-   - It is enabled only by `logging.debug: true` (there is no `--debug` flag). `[DEBUG]` lines go to `out` (stdout), interleaved with the status lines, and lines of concurrent requests interleave too (match them by `req N`).
-   - Bodies and headers other than Content-Type are never logged, only sizes and counts. Query strings and user info are not logged either (since 2026-11-20; `TestDebugLoggingOmitsQueryAndUserInfo`). Client addresses, paths and the upstream's address are logged.
-6. **Shutdown waits for in-flight requests**:
-   - The first signal waits up to `shutdownTimeout` (60 s, a constant, not configurable) for running generations; a second signal aborts them. Tests drive `serve()` directly with their own contexts and timeout (`startServe`), not real signals. Aggregates are in memory only and are lost on exit; with `--csv`, per-query rows are kept in the file.
-   - `--csv` does not check an existing file's header. Appending to a CSV with different columns (e.g. from a future version) mixes formats. Existing rows are not rewritten with formula protection: after upgrading, use a new file or import existing text columns explicitly as text. The protective apostrophe on new rows may be visible in some readers.
-7. **Go version**:
-   - `go.mod` declares Go 1.26 (raised from 1.21 on 2026-10-26; Go supports the two newest releases, 1.27 and 1.26 at that time). Avoid standard library APIs and language features newer than 1.26 unless the `go` directive is bumped. CI's "Test (Go from go.mod)" job tests the oldest version the directive allows, and the directive also selects language semantics (e.g. per-iteration loop variables since 1.22).
-   - When bumping, choose the oldest supported release, not the newest, and only when a feature is wanted, not every release. Steps: `go mod edit -go=1.N`, `go fix ./...` (review its rewrites), then update §1, §2, this item and `README.md`'s requirements. CI needs no change, since its jobs read the version from `go.mod`.
-8. **Single upstream, no auth/TLS options**:
-   - The upstream is always `http://host:port`; there is no HTTPS upstream, API key injection, or per-endpoint routing.
-   - Clients aren't authenticated, and the proxy listens on all interfaces (the user's LLM clients run on other LAN machines). Anyone who can reach `proxy_port` can query the upstream with the proxy's localhost identity. Only `managementEndpoints` and protocol upgrades are held back (`forward_management`). Queries can still load and unload models (a chat request loads its model; Ollama's `keep_alive: 0` unloads it), and the list must be extended by hand when an upstream adds management endpoints.
-   - With `forward_management: false`, LM Studio SDK clients (WebSocket) can't be used through the proxy.
-   - The Host check (`allowedHost()`) only stops web pages from reaching it through DNS rebinding; clients that address the proxy by a DNS name other than this machine's hostname or a local-use domain need that name in `allowed_hosts`, or they get `403`.
-9. **Not yet tested on Windows**:
-   - The binary and tests cross-compile (`GOOS=windows go build ./... && GOOS=windows go vet ./... && GOOS=windows go test -c -o /dev/null .`), but nothing has been run on Windows. `docs/windows-testing.md` lists what to check (Ctrl+C handling, Excel's CSV lock and separators, paths, firewall and reserved ports, slow refused connections in two tests).
+With `logging.debug`, startup prints `[DEBUG] config: …` and
+`[DEBUG] backend probe …` lines. Per-request lines start with
+`[DEBUG] req N:` and show the routing, upstream status and Content-Type, and
+`meteredBody.debugSummary()`: how the body ended, the capture's `captureDiag`
+counters, the measured TTFT, the TPS basis and hints such as `usageHint()`.
+Never log bodies, headers other than Content-Type, query strings or URL user
+info. New captures must implement `diag()` and `firstOutput()`.
 
----
+## 6. Rules for changes
 
-## 7. Guidelines for Modifying Code
-
-- **Standard Library First**: Prefer Go standard library packages (`net/http`, `net/http/httputil`, `sync`, `time`, `encoding/json`) over introducing new dependencies.
-- **Code Layout**: Splitting `main.go` into more files within `package main` is fine; keep a single Go module.
-- **Maintain Concurrency Safety**: Ensure `metrics.mu` write locks are held when updating state and read locks when reading state. Avoid holding locks across network I/O.
-- **Configuration Compatibility**: New options must be optional with sane defaults, so existing files keep working. Config parsing is strict: removing or renaming a key makes files that still use it fail with an "unknown field" error. The project has a single user so far, so renames and removals don't need aliases or deprecation periods (as with `metrics.mode` and `lm_studio` → `server`); note them in README.md and `config.yaml` comments.
-- **CSV Compatibility**: Existing files are appended to without checking their header. Add new columns at the end and document format changes so users can start a new file.
-- **Untrusted Text in Output** (the status line's model name goes through `escapeTruncated()`, which escapes before cutting to 30 runes so escapes stay whole and invalid bytes aren't turned into U+FFFD; it reads the name only until it knows a cut is needed, so its work is bounded by the 30 runes, not by the name's length, which may be up to `maxCaptureBytes`: `TestEscapeTruncatedBoundedWork`, and `FuzzEscapeTruncated` compares it with the old escape-everything-first algorithm): Paths, request URIs, URLs, model names and upstream error messages come from clients or the upstream. Pass them through `escapeControls()` before printing them to `out` (status, `[Proxy]`, `[ERROR]` and `[DEBUG]` lines): it writes control characters (C0, DEL, C1), invalid UTF-8, U+2028/U+2029 and the bidi controls (`unicode.Bidi_Control`) as Go escapes (`\x1b`, `\n`, `\u202e`, `\xff`) and keeps all other text byte-identical, so other format characters such as emoji joiners survive. Clean text is returned without copying. `debugf()` evaluates its arguments even when debug output is off, so wrap a call whose arguments escape client text in `if cfg.Logging.Debug { … }` (as in `handleRequest` and `meterResponse`). `%q` (used for Content-Type) is safe too. CSV uses `csvText` at the export sink to prevent formula interpretation; it preserves the original value after any protective apostrophe. Keep this separate from terminal escaping and from `encoding/csv` field quoting. Forwarded responses and in-memory metrics retain their original text.
-- **Testing**: Whenever fixing bugs or adding features, write corresponding unit tests using `net/http/httptest` to verify proxying, metrics parsing, and concurrent safety.
-- **SonarCloud**: Analyzed by the CI workflow (project `juusolatva_metrics_proxy`, public; settings in `sonar-project.properties`, token in the `SONAR_TOKEN` repository secret). Automatic Analysis must stay disabled in SonarQube Cloud, or the CI scan fails. Pull requests from forks and Dependabot skip the scan (no token). Rules hit so far:
-  - Keep each function's cognitive complexity at 15 or less, tests included (`go:S3776`). Move loop bodies, handlers and checks into named helpers. Check locally with `go run github.com/uudashr/gocognit/cmd/gocognit@v1.1.3 -over 15 .`, which scores function literals somewhat higher than Sonar.
-  - Defer a context's cancel function in the function that creates it (`godre:S8188`).
-  - Close response bodies with `defer resp.Body.Close()` right after the error check (`godre:S8208`).
-  - Derive contexts from an existing one instead of a second `context.Background()` (`go:S8239`). In `main`, `stop` is derived from `force`, not the reverse (as the rule suggests): a `force` derived from `stop` would be cancelled by the first signal and skip the graceful wait.
-- **golangci-lint**: Must report `0 issues` (CI fails otherwise; config in `.golangci.yml`). `errcheck` is on for non-test code, apart from the `std-error-handling` preset (unchecked `Close`, `fmt.Fprint*` etc.). Where an error is deliberately ignored, discard it explicitly with a reason, e.g. `_ = r.w.Write(row) // write errors are sticky; returned by r.w.Error()`, rather than adding `//nolint`. Exception: a discarded receive from a `chan error` (`<-errc` in `serve()`) is flagged by errcheck, and `_ = <-errc` by staticcheck S1005, so it keeps `//nolint:errcheck` with a reason.
-- **Git Hygiene**: Commits are allowed; opening a pull request from a branch is preferred over committing directly to `main`. Do not commit build artifacts (`metrics_proxy`, `.exe`) or temporary files.
-- **Merges**: Before committing a merge, run `git diff --check` and `go build ./... && go test -race ./...`; conflict markers have been committed to `main` before (merge `6a83ff7`, fixed afterwards).
-- **Keep docs in sync**: Update this file and the affected sections of `README.md`, `config.yaml` comments and `docs/windows-testing.md` when behavior, configuration, workflows or limitations change. Keep tool versions aligned with `.github/workflows/ci.yml` and the Go requirement aligned with `go.mod`.
+- **Standard library first**; keep a single module. Splitting `main.go` into
+  more files in `package main` is fine.
+- **Don't buffer response bodies** before forwarding: reading the body in
+  `ModifyResponse` would hold back headers and break SSE
+  (`TestProxyStreamsSSEWithoutBuffering`).
+- **Locks**: hold `metrics.mu` when touching `metrics`; never hold it across
+  network I/O.
+- **Security invariants** in `SECURITY.md` must keep holding; add tests for
+  every bypass you fix. The management list must be extended by hand when an
+  upstream adds management endpoints.
+- **Untrusted text** (paths, URLs, model names, upstream errors) goes through
+  `escapeControls()` before printing to `out`; the status line's model name
+  uses `escapeTruncated()`, whose work is bounded by the 30 runes it keeps.
+  `debugf()` evaluates its arguments even when debug is off, so wrap calls
+  that escape client text in `if cfg.Logging.Debug { … }`. CSV cells use
+  `csvText()` against formula injection; keep it separate from terminal
+  escaping and CSV quoting.
+- **Config**: new options must be optional with defaults. Parsing is strict,
+  so renaming or removing a key breaks files that use it; the project has a
+  single user, so no aliases are needed, but note it in `README.md` and
+  `config.yaml`.
+- **CSV**: files are appended to without checking the header, so add new
+  columns only at the end and document the change.
+- **Go version**: don't use APIs newer than the `go.mod` directive. Bump only
+  when a feature is needed, to the oldest supported release: `go mod edit
+  -go=1.N`, `go fix ./...` (review it), then update §1 and `README.md`.
+- **Tests**: every fix or feature gets an `httptest`-based test.
+- **Git**: open a pull request from a branch rather than committing to `main`;
+  don't commit build artifacts. Before committing a merge, run
+  `git diff --check` and `go build ./... && go test -race ./...`.
+- **Docs**: update this file, `README.md`, `config.yaml` comments and
+  `TESTING.md` when behavior, configuration or workflows change. Keep tool
+  versions in sync with `ci.yml` and the Go version with `go.mod`. Write
+  durable facts, not change history.

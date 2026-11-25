@@ -16,9 +16,9 @@ Supported upstreams:
 - **Ollama**: native API (`/api/chat`, `/api/generate`) and OpenAI-compatible API (`/v1/...`)
 - Other OpenAI-compatible HTTP servers
 
-Both regular JSON responses and streamed responses (SSE and NDJSON) are
-supported. Streams are passed through to the client as they arrive, while a
-bounded copy is inspected for metrics.
+Regular JSON responses and streamed responses (SSE and NDJSON) are both
+supported. Streams reach the client as they arrive; a bounded copy is
+inspected for metrics.
 
 ## Requirements
 
@@ -28,36 +28,16 @@ bounded copy is inspected for metrics.
 
 ```bash
 go build -o metrics_proxy .
-./metrics_proxy
-```
-
-By default the proxy reads `config.yaml` from the current working directory.
-Use `--config` to load another file, e.g. one per upstream server:
-
-```bash
+./metrics_proxy                                   # reads ./config.yaml
 ./metrics_proxy --config ~/metrics_proxy/ollama.yaml
+./metrics_proxy --help
 ```
-
-Run `./metrics_proxy --help` to list all options.
-
-The default port was 8080 before; it moved to 11436 to stay clear of the
-many programs using 8080 (llama.cpp's `llama-server` among them) and of
-Ollama's 11434 and a second Ollama instance's 11435. Set `proxy_port: 8080`
-to keep the old port.
 
 ### Connecting clients
 
-The proxy listens on its own port (`proxy_port`, default 11436) and forwards
-each request to the server with the same path. Clients need the proxy's host
-and port, **plus the same path suffix (such as `/v1`) they would use with the
-server directly**:
-
-1. Find the URL the client uses for the server directly, e.g.
-   `http://localhost:11434/v1`.
-2. Replace only the host and port with the proxy's, e.g. `localhost:11436`
-   (or the address of the machine running the proxy; host names other than
-   its hostname may need [`allowed_hosts`](#host-names)).
-3. Keep the path at the end exactly as it was, e.g. `/v1`.
+The proxy listens on `proxy_port` (default 11436) and forwards each request to
+the server with the same path. In the client, replace only the server's host
+and port with the proxy's, and **keep the path suffix (such as `/v1`)**:
 
 | Client / API | URL directly to the server | URL through the proxy |
 |---|---|---|
@@ -66,59 +46,46 @@ server directly**:
 | Ollama-native client (Ollama libraries, `OLLAMA_HOST`) | `http://localhost:11434` | `http://localhost:11436` |
 | LM Studio native REST API | `http://localhost:1234/api/v1` | `http://localhost:11436/api/v1` |
 
-Ollama-native requests (`/api/chat`, `/api/generate`) are only metered when
-`"/api/*"` is in `api_endpoints` (see [Configuration](#configuration)).
+Without the `/v1`, OpenAI-compatible clients request `/models` instead of
+`/v1/models`, the server answers `404`, and the proxy logs
+`[Proxy] GET /models 404 (…, not metered)`. Ollama-native requests
+(`/api/chat`, `/api/generate`) are metered only when `"/api/*"` is in
+`api_endpoints` (see [Configuration](#configuration)).
 
-> **Don't forget the `/v1`.** OpenAI-compatible clients append paths such as
-> `/models` and `/chat/completions` to the base URL. With
-> `http://localhost:11436` as the base URL they request `/models` instead of
-> `/v1/models`, the server answers `404`, and the proxy logs
-> `[Proxy] GET /models 404 (…, not metered)`.
+Check the connection with `curl http://localhost:11436/v1/models`: it should
+return the server's model list and log `[Proxy] GET /v1/models 200`.
 
-Check the connection with `curl http://localhost:11436/v1/models`. It should
-return the server's model list, and the proxy should log a
-`[Proxy] GET /v1/models 200` line.
-
-One proxy forwards to one server. To meter several servers (e.g. Ollama and
-LM Studio), run one proxy per server, each with its own config file
-(`--config`) and `proxy_port`.
+From other machines, use the proxy machine's IP address or hostname; other
+names need [`allowed_hosts`](#host-names). One proxy forwards to one server;
+to meter several, run one proxy per server with its own `--config` and
+`proxy_port`.
 
 ### Output
 
-On startup the proxy probes the upstream and names it in the banner
-(`Forwarding to Ollama at localhost:11434`). If the server is unreachable or
-not recognized, it prints `upstream … (server type not detected)` and proxies
-as usual.
-
-Each completed query prints a line like this:
+At startup the proxy names the upstream it detected
+(`Forwarding to Ollama at localhost:11434`, or `(server type not detected)`).
+Each completed query then prints a line like this:
 
 ```
 [14:02:31] #3 POST /api/v1/chat 200 | Model: qwen3-8b | Tokens: 42 in / 311 out | TPS: 48.12 | TTFT: 0.21s | Time: 6.68s | Avg: 5.90s @ 47.80 tok/s | Total tokens: 1024
 ```
 
-`Avg` is the average query duration over all queries and the average tokens
-per second over the last `history_points` queries, excluding queries without
-a rate from the TPS average. Requests without inference data (such as
-`/v1/models` or errors) are logged as `[Proxy]` lines and not
-counted. If the upstream can't be reached, or answers with response headers
-larger than 64 KiB or a `Content-Type` longer than 1 KiB, the client gets
-`502 Bad Gateway` and the proxy logs an `[ERROR]` line. Requests to the
-upstream ignore `HTTP_PROXY` and similar environment variables.
+- `TPS` is the rate the server reports. When it reports none, the proxy
+  estimates it and shows `(est.)`.
+- `TTFT` (time to first token) is measured by the proxy for streams, from
+  receiving the request to receiving the first generated output, so it
+  includes model loading. For non-streamed responses it is shown only when
+  the server reports it.
+- `Avg` is the average duration over all queries and the average tokens per
+  second over the last `history_points` queries.
 
-Paths, model names and error messages come from clients and the server, so
-characters in them that could control the terminal or start a fake line are
-printed as Go escapes: control characters (e.g. `\x1b`, `\n`), invalid UTF-8
-(`\xff`), the Unicode line and paragraph separators and bidirectional text
-controls (e.g. `\u202e`). Other text, including non-ASCII, is printed as is.
-
-`TPS` is the rate reported by the server. When the server doesn't report one,
-the proxy estimates it and marks it `(est.)`, e.g. `TPS: 40.98 (est.)`. `TTFT`
-(time to first token) is measured by the proxy for streamed responses: the
-time from receiving the request to receiving the first generated text,
-reasoning or tool call from the server, so it includes loading the model. Non-streamed
-responses show it only when the server reports it (LM Studio's native API,
-whose value covers prompt processing, not loading; see
-[Limitations](#limitations)).
+Requests without inference data (model lists, errors) are logged as
+`[Proxy]` lines and not counted. If the upstream can't be reached or sends
+oversized headers, the client gets `502 Bad Gateway` and the proxy logs an
+`[ERROR]` line. Requests to the upstream ignore `HTTP_PROXY` and similar
+environment variables. Control characters, invalid UTF-8 and bidirectional text
+controls in paths, model names and error messages are printed as Go escapes
+(`\x1b`, `\xff`, `\u202e`).
 
 ### Saving statistics to CSV
 
@@ -126,17 +93,8 @@ whose value covers prompt processing, not loading; see
 ./metrics_proxy --csv stats.csv
 ```
 
-Each recorded query is appended to the file as one row, as soon as it
-finishes. A header is written when the file is new or empty; existing files
-are appended to, so restarts keep adding to the same file. The header of an
-existing file is not checked; start a new file if the column format changes.
-Requests without inference data (such as `/v1/models`) are not written.
-On Linux and macOS a new file is readable by its owner only (mode `0600`,
-before the umask); on Windows it gets the access rules of its folder. An
-existing file keeps its permissions. If a row can't be written (for example
-while Excel has the file open on Windows), an `[ERROR] writing CSV` line is
-printed and later rows are written again once the file accepts writes. Part
-of a row written before a failure is removed first, so rows aren't merged.
+Each recorded query is appended as one row when it finishes. A header is
+written when the file is new or empty:
 
 ```csv
 timestamp,method,path,status,model,prompt_tokens,completion_tokens,total_tokens,tokens_per_second,tps_estimated,ttft_seconds,duration_seconds,complete,ttft_measured
@@ -144,44 +102,39 @@ timestamp,method,path,status,model,prompt_tokens,completion_tokens,total_tokens,
 2026-10-17T03:28:30.447+03:00,POST,/v1/chat/completions,200,qwen2.5-coder-0.5b-instruct,32,10,42,234.45,true,0.021,0.043,true,true
 ```
 
-Values that are neither reported nor derived (tokens, TPS, TTFT) are left empty.
-`tps_estimated` is `true` when the TPS was estimated by the proxy (shown as
-`(est.)` in the terminal), `complete` is `false` for responses that were
-cut off, and `ttft_measured` is `true` when the TTFT was measured by the proxy
-(streams, including model loading) rather than reported by the server. The
-`ttft_measured` column was added on 2026-11-19; files started before that
-have one column less in their header, so start a new file. Only per-query values are saved; the running averages are not.
-Method, path and model cells receive a leading apostrophe when they could be
-interpreted as spreadsheet formulas: `=`, `+`, `-`, `@` (including fullwidth
-variants), also behind leading whitespace, controls, Unicode format characters
-or double quotes. The same goes for the text after each `;`, which gets the
-apostrophe right after the `;`: Excel in locales that use `;` as list
-separator (such as Finnish or German) splits cells at semicolons even inside
-quoted CSV fields. Text starting with a control character, or containing invalid UTF-8, is protected
-too. Other values are unchanged. The apostrophe may be visible in some readers;
-CSV quoting still handles commas, quotes and line breaks separately.
-Existing rows are not rewritten: after upgrading, use a new CSV file or import
-existing text columns explicitly as text. Control characters are otherwise kept,
-so view the file in a spreadsheet or with `cat -v` rather than printing it raw
-to a terminal.
+- Unknown tokens, TPS and TTFT are left empty. `tps_estimated` and
+  `ttft_measured` tell estimated and measured values from reported ones;
+  `complete` is `false` for cut-off responses. Running averages are not saved.
+- An existing file's header is not checked; start a new file when the
+  columns change.
+- Method, path and model cells that a spreadsheet could read as a formula
+  (starting with `=`, `+`, `-` or `@`) get a leading apostrophe. Text after a
+  `;` gets one right after the `;` (`/x;'=1+1`), since Excel in locales that
+  use `;` as list separator splits cells there. Otherwise text is written as
+  received, control characters included, so view the file with `cat -v`
+  rather than printing it raw.
+- A new file is readable by its owner only on Linux and macOS (mode `0600`);
+  on Windows it gets its folder's access rules.
+- If a row can't be written (e.g. Excel has the file locked), an
+  `[ERROR] writing CSV` line is printed and later rows are written once the
+  file accepts writes again.
 
 ### Stopping
 
 Press Ctrl+C (or send `SIGTERM`). The proxy stops accepting connections and
-waits up to 60 seconds for in-flight requests, including streamed
-generations, to finish and be recorded. Press Ctrl+C again to stop at once.
-Requests cut off this way are logged as `incomplete`. Open WebSocket
-connections (with `forward_management: true`) are not waited for; they end
-when the proxy exits.
+waits up to 60 seconds for running requests, streams included, to finish and
+be recorded. Press Ctrl+C again to stop at once; cut-off requests are logged
+as `incomplete`. Open WebSocket connections are not waited for.
 
 ## Configuration
 
-`config.yaml` (or the file given with `--config`):
+`config.yaml` (or the file given with `--config`); every key is optional and
+an empty file works for LM Studio on `localhost:1234`:
 
 ```yaml
 proxy_port: 11436         # port the proxy listens on
 
-server:                   # upstream LLM server (any supported server type)
+server:                   # upstream LLM server
   host: "localhost"
   port: 1234
 
@@ -190,136 +143,80 @@ api_endpoints:            # path prefixes to meter
   - "/v1/*"               # OpenAI-compatible API
 
 forward_unmatched: true   # forward other paths unmetered (false: answer 404)
-
 forward_management: false # forward model management and WebSocket requests (false: answer 403)
-allowed_hosts: []         # further host names clients use, see "Host names" below
+allowed_hosts: []         # further host names clients use, see "Host names"
 
 metrics:
   history_points: 10      # recent queries to average tokens/sec over
 
 logging:
-  debug: false            # see "Debug output" below
+  debug: false            # see "Debug output"
 ```
 
-To front Ollama, set the upstream to `localhost:11434` and add `"/api/*"` to
+To front Ollama, set the server to `localhost:11434` and add `"/api/*"` to
 `api_endpoints`.
 
-Requests to paths outside `api_endpoints` (model lists such as Ollama's
-`/api/tags`, or a client's `/models`) are forwarded unchanged, so the client
-gets the upstream's own answer, and logged without metrics:
+Requests outside `api_endpoints` (such as `/api/tags`) are forwarded unchanged
+and logged without metrics, e.g. `[Proxy] GET /models 404 (0.01s, not
+metered)`, where the time is until the response headers arrived.
 
-```
-[Proxy] GET /models 404 (0.01s, not metered)
-```
-
-The time is until the response headers arrived. A `404` there comes from the
-upstream and usually means the client's base URL lacks a path such as `/v1`.
-Set `forward_unmatched: false` to answer such requests with `404` without
-forwarding them, as earlier versions did.
+The config is checked strictly. Unknown keys, duplicate keys and a second
+YAML document are errors naming the line, e.g.
+`line 3: field histroy_points not found in type main.MetricsConfig`. Values
+that can't work are errors naming the setting, e.g. ports outside 1–65535, a
+`server.host` with a scheme or port, `api_endpoints` not starting with `/` or
+with `*` anywhere but at the end, malformed `allowed_hosts` entries, or a
+`history_points` below 1.
 
 ### Management requests
 
-The proxy listens on all network interfaces and has no authentication, so
-anyone who can reach `proxy_port` can use the server through it, even when the
-server itself only accepts connections from localhost (the default for Ollama
-and LM Studio). Restrict access to the port with a firewall if needed.
+The proxy listens on all network interfaces and has no authentication: anyone
+who can reach `proxy_port` can use the server, even when the server itself
+only accepts connections from localhost. Restrict access with a firewall if
+needed.
 
-Requests that manage the server instead of querying it are therefore not
-forwarded by default. They are answered with `403 Forbidden`, even when they
-match `api_endpoints` (such as Ollama's `"/api/*"`), and logged:
+With `forward_management: false` (the default), requests that manage the
+server are answered with `403 Forbidden` without forwarding, even when they
+match `api_endpoints`:
+
+- Ollama: `/api/pull`, `/api/push`, `/api/create`, `/api/copy`, `/api/delete`,
+  `/api/blobs`, and the ollama.com account endpoints `/api/me`,
+  `/api/signout`, `/api/user/keys`. Queries that use the account (cloud
+  models, `/api/web_search`, `/api/web_fetch`) are forwarded; sign the server
+  out of ollama.com if clients shouldn't use it.
+- LM Studio: `/api/v1/models/load`, `/api/v1/models/unload`,
+  `/api/v1/models/download`.
+- WebSocket and other protocol upgrades on any path. LM Studio's SDK
+  (`lmstudio-js`, `lmstudio-python`) uses WebSocket, so it needs
+  `forward_management: true`. An `Upgrade: h2c` offer (sent by Java's
+  `HttpClient`) is dropped and the request forwarded as plain HTTP/1.1.
 
 ```
 [Proxy] Management request not forwarded: DELETE /api/delete (forward_management: false)
 ```
 
-- Ollama: `/api/pull`, `/api/push`, `/api/create`, `/api/copy`, `/api/delete`
-  and `/api/blobs`, and the ollama.com account endpoints `/api/me`,
-  `/api/signout` and `/api/user/keys`. Queries that use the account (cloud
-  models, `/api/web_search`, `/api/web_fetch`) are forwarded like other
-  queries; sign the server out of ollama.com if clients shouldn't use it.
-- LM Studio: `/api/v1/models/load`, `/api/v1/models/unload` and
-  `/api/v1/models/download`.
-- WebSocket connections and other protocol upgrades, on any path
-  (`[Proxy] Protocol upgrade not forwarded: …`). LM Studio's SDK
-  (`lmstudio-js`, `lmstudio-python`) talks to the server over WebSocket and
-  loads and downloads models that way, so SDK clients only work through the
-  proxy with `forward_management: true`. An `Upgrade: h2c` offer, which Java's
-  `HttpClient` adds to ordinary requests, is dropped instead, and the request
-  is forwarded as plain HTTP/1.1.
-
-Request paths with a `..` segment, such as `/api/blobs/..` (also
-percent-encoded, or with `\` as separator), are answered with
-`400 Bad Request` in every configuration, since the server could resolve them
-to a management endpoint. Clients resolve such segments before sending, so
-ordinary requests aren't affected:
-
-```
-[Proxy] Rejected POST /api/blobs/..: ".." segment in path
-```
-
-Request targets that aren't a path, such as `a:x:/api/delete` or `*`, are
-refused with `400 Bad Request` in every configuration too: the proxy's checks
-look at the path, while the server could read such a target as a management
-endpoint. Clients send a path (or a full URL with a path), so they aren't
-affected:
-
-```
-[Proxy] Rejected DELETE a:x:/api/delete: request target is not a path
-```
-
-Model lists (`/api/tags`, `/api/ps`, `/api/v1/models`, `/v1/models`) and
-model details (`/api/show`) are forwarded as before. Set
-`forward_management: true` to forward management requests too.
-
-Unset values fall back to the defaults shown above; an empty file is a valid
-config for LM Studio on `localhost:1234`. Unknown or misspelled keys are an
-error naming the key and line, e.g.
-`line 3: field histroy_points not found in type main.MetricsConfig`. This
-includes the removed `metrics.mode` and `metrics.refresh_interval_ms`
-settings, so delete them from older config files. Older files also need
-`lm_studio:` renamed to `server:`.
-
-Values that can't work are rejected too: ports outside 1–65535, a
-`server.host` with a scheme or port (`http://localhost`, `localhost:1234`:
-give the bare name and put the port in `server.port`), `api_endpoints`
-entries that don't start with `/` (use `"/*"` to meter every path), have `*`
-anywhere but at the end, or contain `//`, `.` or `..` segments or `\` (request
-paths are cleaned before matching, so such patterns never matched; the error
-names the pattern to use), `allowed_hosts` entries with a scheme, port,
-trailing dot or a `*` other than a leading `*.`, and a `history_points` below
-1. A config file with such values loaded before 2026-11-20 but now fails to
-load; fix the value the error names.
-
-Duplicate keys are an error too. A config file holds a single YAML
-document: settings after a `---` separator, which earlier versions silently
-ignored, now fail with `line 2: a second YAML document starts here`. Wrong
-value types are listed on one line, separated by `; `, e.g.
-``line 1: cannot construct !!str `x` into int; line 3: …``. Syntax errors give
-the position as `L<line>.C<column>`; tab indentation, for example, gives
-`go-yaml load error in scanner (while scanning for the next token) at L3.C1: found character that cannot start any token`.
+In every configuration, paths with a `..` segment (also percent-encoded or
+with `\`) and request targets that aren't a path (such as `*`) get
+`400 Bad Request`, since the server could resolve them to a management
+endpoint. Clients never send these.
 
 ### Host names
 
-The proxy only forwards requests whose `Host` header (the host name in the
-URL the client uses) can't come from a DNS rebinding attack, in which a web
-page you visit points its own domain at the proxy and reads your server's
-API. These always work:
+To stop DNS rebinding (a web page pointing its own domain at the proxy), only
+these `Host` names are accepted:
 
 - IP addresses, e.g. `http://192.0.2.10:11436` or `http://[::1]:11436`
 - `localhost` and names ending in `.localhost`
 - this machine's hostname (as printed by `hostname`)
-- names ending in `.local`, `.internal` or `.home.arpa`, which are reserved
-  for local networks
+- names ending in `.local`, `.internal` or `.home.arpa`
 
-Requests naming any other host get `403 Forbidden` and are logged without
-being forwarded:
+Other names get `403 Forbidden`:
 
 ```
 [Proxy] Rejected GET /api/tags: Host "homelab.lan:11436" not allowed (add "homelab.lan" to allowed_hosts if clients use this name)
 ```
 
-If clients reach the proxy by another name, e.g. from your own DNS or your
-router (`.lan` is not reserved, so it isn't built in), list it:
+List further names clients use, without port:
 
 ```yaml
 allowed_hosts:
@@ -327,14 +224,13 @@ allowed_hosts:
   - "*.lan"               # all names ending in .lan
 ```
 
-`"*"` allows any host and turns the check off, as before this check was
-added. The proxy has no authentication, so this doesn't protect it from
-clients that can reach its port directly.
+`"*"` allows any host and turns the check off. This check is not
+authentication: it doesn't stop clients that reach the port directly.
 
 ### Debug output
 
-Set `logging.debug: true` to see how the proxy arrived at each query's
-numbers. That is useful when a value is missing or looks wrong:
+Set `logging.debug: true` to see how each query's numbers were derived, e.g.
+when a value is missing or looks wrong:
 
 ```
 [DEBUG] req 2: POST /v1/chat/completions from [::1]:37316 (metered: true)
@@ -345,50 +241,33 @@ numbers. That is useful when a value is missing or looks wrong:
 [03:52:45] #2 POST /v1/chat/completions 200 | Model: qwen2.5-coder-0.5b-instruct | Time: 0.04s | ...
 ```
 
-At startup it also prints the effective configuration and what the backend
-probe found. Lines are tagged `req N` so concurrent requests can be told
-apart. Request and response bodies are never logged, and neither are query
-strings or user names and passwords in request URLs.
+It also prints the effective configuration and the backend probe at startup.
+Bodies, query strings and credentials in URLs are never logged.
 
 ## Limitations
 
-- Metrics inspection follows at most eight `result`/`response` wrapper hops and
-  decodes at most 32 MiB cumulatively per JSON body, SSE event or NDJSON line.
-  The budget is shared across both wrapper branches and includes the outer
-  document. Fields already read are kept; deeper or over-budget wrappers are
-  ignored. Response forwarding is unaffected. The separate 16 MiB capture
-  limit still applies to bodies, lines and assembled events.
-- Numbers the server reports beyond plausible values are ignored, as if not
-  reported: token counts above 2^29 (about 537 million), rates above a million
-  tokens per second and times to first token above 24 hours.
-- Streamed OpenAI-compatible responses only include token counts when the
-  client sends `"stream_options": {"include_usage": true}`. Without it, the
-  query is recorded with model and duration only.
-- When the upstream doesn't report tokens per second, it is estimated from the
-  completion tokens and generation time and marked `(est.)`. For non-streamed
-  responses this includes prompt processing and request overhead, so the
-  value is understated, badly so for short replies; for streams the time
-  between the first and last chunk is used, which is closer, unless the
-  stream arrived all at once (short, or buffered on the way) or faster than
-  about 1000 tokens/s: then the request duration is used as for a
-  non-streamed response. LM Studio's
-  OpenAI-compatible API (`/v1/...`) never reports TPS, streamed or not.
-- Time to first token for non-streamed responses is only shown when the
-  server reports it, which only LM Studio's native API (`/api/v1/...`) does.
-  For streams the proxy measures it instead, so the value includes model
-  loading and the network to the server, and with LM Studio's native API it
-  differs from the server's own figure. A stream whose generated output is in
-  fields the proxy doesn't know (e.g. LM Studio's native tool call events
-  without text) gets no measured TTFT. A stream held back by something
-  between the server and the proxy is measured as it arrives at the proxy.
-- One upstream over plain HTTP; no HTTPS upstream or API key injection.
-- No client authentication: anyone who can reach the proxy can run queries on
-  the server (see [Management requests](#management-requests)). Queries can
-  also load and unload models, e.g. a chat request loads its model.
-- Running totals and averages are kept in memory only and are lost when the
-  proxy stops. Use `--csv` to keep per-query statistics.
-- Not yet tested on Windows. It builds for Windows, and
-  [docs/windows-testing.md](docs/windows-testing.md) lists what to check.
+- **Streamed OpenAI-compatible responses** include token counts only when the
+  client sends `"stream_options": {"include_usage": true}`; otherwise only the
+  model and duration are recorded.
+- **Estimated TPS** (`(est.)`) is completion tokens divided by generation
+  time. For non-streamed responses that time includes prompt processing and
+  overhead, so short replies are badly understated. For streams the time from
+  the first output to the last chunk is used, unless the stream arrived all
+  at once or faster than about 1000 tokens/s. LM Studio's OpenAI-compatible
+  API never reports TPS.
+- **TTFT** for non-streamed responses is reported only by LM Studio's native
+  API. Measured stream TTFT includes model loading and network time, and is
+  missing when the output is in fields the proxy doesn't know (e.g. LM
+  Studio's native tool call events).
+- **Inspection limits:** 16 MiB per body, SSE event or NDJSON line, eight
+  `result`/`response` wrapper levels and 32 MiB of JSON decoding per
+  document. Larger input is forwarded but not metered. Implausible reported
+  numbers (over 2^29 tokens, a million tokens/s or 24 h TTFT) are ignored.
+- **One plain-HTTP upstream**; no HTTPS upstream or API key injection.
+- **No client authentication**: queries can also load and unload models
+  (see [Management requests](#management-requests)).
+- **Totals are in memory only**; use `--csv` to keep per-query statistics.
+- **Not yet tested on Windows**; see [TESTING.md](TESTING.md#windows-11).
 
 ## Development
 
@@ -399,24 +278,13 @@ gofmt -s -l .
 go mod verify
 go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 run
 go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
-go test -run '^$' -fuzz='^FuzzCaptureSplit$' -fuzztime=30s .  # fuzz one target (see fuzz_test.go)
+go test -run '^$' -fuzz='^FuzzCaptureSplit$' -fuzztime=30s .  # fuzz one target
 ```
 
-The parser tests use real responses captured from LM Studio and Ollama in
-`testdata/`. GitHub Actions (`.github/workflows/ci.yml`) runs these checks on
-pushes to `main`, on pull requests, weekly and on manual runs, with tests on the Go
-version from `go.mod` and the latest stable Go. The stable Go job uploads test
-coverage to SonarQube Cloud on pushes and pull requests from this repository,
-except Dependabot's. Fork and Dependabot pull requests cannot use the token;
-scheduled and manual runs also skip the scan. Dependabot
-(`.github/dependabot.yml`) proposes weekly updates to the GitHub Actions and
-Go modules; the golangci-lint and govulncheck versions are bumped by hand.
-
-Project guidance lives in [AGENTS.md](AGENTS.md), including architecture,
-contribution guidelines and the testing backlog. [CLAUDE.md](CLAUDE.md)
-includes the project guide for Claude. The
-[Windows checklist](docs/windows-testing.md) covers the remaining manual
-platform checks.
+GitHub Actions runs these checks on pushes to `main`, pull requests, weekly
+and on demand. [AGENTS.md](AGENTS.md) describes the architecture and how to
+maintain the code, [TESTING.md](TESTING.md) the manual tests, and
+[SECURITY.md](SECURITY.md) how to report vulnerabilities.
 
 ## License
 
